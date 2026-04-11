@@ -63,6 +63,7 @@ Battle-testedness assessment (as of 2026-04-11):
 10. **Packet ingress carries explicit arrival timing.** The core API accepts packet arrival time as metadata so NetEq's jitter estimate reflects transport arrival, not Godot main-thread scheduling jitter.
 11. **Backlog behavior is bounded and drop-oriented.** The packet queue is bounded; overflow drops stale voice packets instead of letting `_mix` inherit unbounded catch-up work.
 12. **Single-talker invariant is enforced, not just documented.** `AudioStreamNetwork` owns one stream identity / sequence space and must reject or reset on mismatched stream identity rather than accidentally multiplexing.
+13. **Receive audio stays mono until spatialization.** `AudioStreamNetwork` should present a mono voice source; stereoization belongs to Godot or Steam Audio, not the voice transport layer.
 
 ## Repo layout
 
@@ -272,15 +273,86 @@ For iroh specifically, the likely v0.1 path is:
 - Expose optional arrival timestamps from the iroh receive task into `push_packet_with_meta`.
 - Later add an iroh-specific helper/example that reads `rtt()`, `datagram_send_buffer_space()`, and `max_datagram_size()` for sender policy.
 
+## Automated evaluation
+
+We do not need a giant media-lab harness for v0, but we do want better regression checks than "listen to yourself once." Use a two-layer approach:
+
+- **Small implementation-time harness**: deterministic sans-IO test that feeds recorded speech through encoder → impairment model → receiver, then checks both output audio and NetEq stats. This is intended for coding agents and CI.
+- **Heavier evaluation sweep**: offline corpus run with broader impairment profiles, objective speech metrics, wav dumps, and a small human-listening canary set. This is for milestone validation, not every edit.
+
+### Small implementation-time harness
+
+This should land early, alongside the basic sine test, and should be cheap enough to run in normal development:
+
+- Input: a short checked-in mono speech clip, around 5 to 10 seconds, 48 kHz wav.
+- Impairments: deterministic seeded jitter, random loss, and short burst loss. Start with one "mild WAN" profile:
+  - 20 ms base one-way jitter window
+  - 2% random packet loss
+  - one short burst loss event of 3 to 5 packets
+- Output:
+  - dumped wav for manual spot-checks when the test fails locally
+  - JSON or struct summary of `NetEqStats`
+- Assertions:
+  - no panics / no receiver hard failure
+  - bounded concealment and expand rates
+  - bounded target-delay growth
+  - output length stays within a sane tolerance of expected playout length
+  - objective score above a floor once we add one
+
+Keep this harness transport-free. It should inject impairments by transforming `(VoicePacket, PacketArrival)` events directly, because that is faster, deterministic, and avoids needing sockets just to validate NetEq integration.
+
+### Heavier evaluation sweep
+
+Once the basic loopback path works, add a separate offline tool or test-only binary that runs a small corpus of speech clips through a matrix of impairment profiles:
+
+- clean
+- jitter only
+- mild random loss
+- moderate random loss
+- burst loss
+- reorder + jitter
+- bandwidth clamp / stale-packet-drop scenario
+
+For scoring:
+
+- First use `NetEqStats` counters as the cheap always-on guardrails.
+- Add one lightweight objective intelligibility / quality metric next. STOI is a practical first choice.
+- Add ViSQOL later if the extra dependency/build complexity feels acceptable; it is a better speech-quality metric for codec / VoIP style degradation than RMS-style comparisons.
+- Optional later backstop: ASR word error rate on fixed phrases using local `whisper.cpp`. Useful, but secondary to the simpler metrics above.
+
+The important point is not to chase perfect perceptual scoring in v0. The goal is a repeatable "this change made voice materially worse under realistic impairments" signal.
+
+### Real network emulation
+
+For end-to-end transport testing later, use Linux `tc netem` first. It already covers delay, jitter, loss, reorder, duplication, corruption, and rate shaping well enough for voice-path validation. If we eventually want trace-driven or mobile-network replay, Mahimahi is the next tool to consider, but it is not required for the first useful test suite.
+
+## Steam Audio notes
+
+The current plan is compatible with `godot-steam-audio` because that plugin wraps an inner `AudioStream` and spatializes whatever the inner stream produces. `AudioStreamNetwork` should therefore slot in as the inner stream for a `SteamAudioPlayer`.
+
+Implementation guidance:
+
+- Keep the voice library output mono-first. That matches positional voice as a point source and keeps the transport / jitter-buffer layer independent of any specific spatializer.
+- Treat Steam Audio as a downstream spatialization layer, not as part of the receive pipeline.
+- Prefer a 48 kHz project mix rate for the prototype to minimize sample-rate mismatches between Opus / NetEq and the plugin.
+
+Known integration concerns from the local plugin code:
+
+- `SteamAudioStreamPlayback::_mix` takes a lock on the audio callback path.
+- The plugin currently uses stereo intermediate buffers in places where a mono voice-source path would be cleaner.
+- The plugin derives its Steam Audio config from project settings rather than querying runtime mix settings directly.
+
+None of that blocks v0, but it does make an early fork or patch series reasonable for the prototype goal of "Steam Audio spatialized voice chat over p2p in Godot on Linux/Windows."
+
 ## Milestones
 
 1. **Skeleton**: workspace, `voice-core` compiles with `neteq = "=0.8.3"` (exact pin) and `audiopus`, plus `OpusAudioDecoder` impl. Unit test: encode 1 s sine → decode through receiver → assert RMS within tolerance of input.
-2. **Sans-IO loopback stress test**: round-trip 10 s of recorded speech through encoder → receiver with simulated 5% loss + 20 ms jitter. Dump output wav and listen. **This is the go/no-go for the neteq bet** — if it sounds bad on realistic profiles, reassess before writing any gdext code.
+2. **Sans-IO loopback stress test**: round-trip recorded speech through encoder → deterministic impairment harness → receiver. Keep one cheap seeded profile in normal test runs, dump output wav on failure, and record `NetEqStats`. Manual listening is still useful here, but not the only gate.
 3. **gdext scaffolding**: godot-rust crate builds a .so, registers `NetworkAudioSender` and `AudioStreamNetwork`, installs into `addons/`. Verify the pinned neteq version still builds cleanly on the current Rust toolchain before doing integration work on top of it.
 4. **Mic wire-up**: sender node pulls from `AudioServer.get_input_frames()` and emits `packet_ready`. Linux verified.
 5. **Playback wire-up**: `AudioStreamNetwork._mix` drains the packet queue with a bounded budget, pulls from its private `VoiceReceiver`, and resamples to the driver mix rate before filling `dst`. Loopback demo scene: one `NetworkAudioSender`, `packet_ready` signal connected directly in GDScript to `AudioStreamNetwork.push_packet`. Hearing your own voice through the full pipeline = v0 done.
 6. **Stats UI** in example: buffer size, expand events, packet loss, VAD state. Useful for debugging and as a template for game HUDs.
-7. **README**: loopback setup, the "bring your own networking" story, pointers to godot-iroh and HLMP as next steps.
+7. **README**: loopback setup, the "bring your own networking" story, pointers to godot-iroh and HLMP as next stepsthruth from .
 8. **iroh example**: after the in-memory loopback is solid, add a focused example that sends voice over iroh datagrams in a direct peer-to-peer setup. This is the first concrete post-v0 networking milestone, ahead of any HLMP helper.
 
 Past v0: HLMP router helper, iroh example, rnnoise, mute/deafen, tag/team routing, convenience "drop one node" wrapper. Order depends on what falls out of actually integrating HLMP and iroh with the v0 primitives.
@@ -291,3 +363,4 @@ Past v0: HLMP router helper, iroh example, rnnoise, mute/deafen, tag/team routin
 - **Input backend abstraction**: if `AudioServer.get_input_frames()` proves awkward on some platform, add a second backend using `AudioEffectCapture` rather than contorting the primary path.
 - **Whether to vendor neteq** vs keep it as a git/crates dep. Decide after milestone 2: if the stress test passes and upstream looks healthy, stay on a pinned crates.io version; if the stress test reveals bugs we need to fix, vendor into `third_party/neteq/` and patch.
 - **rnnoise**: `nnnoiseless` (pure Rust port) vs `rnnoise-sys` (C FFI). Both exist. Defer to when we actually want denoise.
+- **Steam Audio fork scope**: once the basic voice path works, decide whether to patch `godot-steam-audio` for a cleaner mono-source path, lower audio-thread overhead, and runtime mix-rate handling, or keep voice-specific workarounds on our side.
