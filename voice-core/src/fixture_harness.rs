@@ -172,6 +172,7 @@ pub fn run_impairment_harness_with_config(
     let mut t = 0_u64;
     let mut measurement_started = false;
     let mut concealed_start = 0_u64;
+    let mut concealed_end = 0_u64;
     let mut measured_samples = Vec::new();
     let mut measured_frames = 0_usize;
     let mut sum_preferred_buffer_size_ms = 0.0_f32;
@@ -205,6 +206,7 @@ pub fn run_impairment_harness_with_config(
                 concealed_start = stats.concealed_samples;
                 measurement_started = true;
             }
+            concealed_end = stats.concealed_samples;
 
             measured_samples.extend_from_slice(&frame);
             measured_frames += 1;
@@ -230,9 +232,7 @@ pub fn run_impairment_harness_with_config(
         tail_trim_ms: config.tail_trim_ms,
         measured_frames,
         measured_output_rms,
-        concealed_samples_delta: final_stats
-            .concealed_samples
-            .saturating_sub(concealed_start),
+        concealed_samples_delta: concealed_end.saturating_sub(concealed_start),
         avg_preferred_buffer_size_ms: sum_preferred_buffer_size_ms / denom,
         avg_current_buffer_size_ms: sum_current_buffer_size_ms / denom,
         avg_target_delay_ms: sum_target_delay_ms / denom,
