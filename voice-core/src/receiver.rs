@@ -32,12 +32,20 @@ pub struct VoiceReceiver {
 
 impl VoiceReceiver {
     pub fn new(sample_rate: u32) -> Result<Self> {
+        Self::new_with_delay_bounds(sample_rate, 20, 250)
+    }
+
+    pub fn new_with_delay_bounds(
+        sample_rate: u32,
+        min_delay_ms: u32,
+        max_delay_ms: u32,
+    ) -> Result<Self> {
         let channels = 1;
         let mut inner = NetEq::new(NetEqConfig {
             sample_rate,
             channels,
-            min_delay_ms: 20,
-            max_delay_ms: 250,
+            min_delay_ms,
+            max_delay_ms,
             ..Default::default()
         })?;
         inner.register_decoder(

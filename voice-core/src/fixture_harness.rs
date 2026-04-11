@@ -77,10 +77,20 @@ pub fn run_impairment_harness(
     input_48k_mono: &[f32],
     profile: &ImpairmentProfile,
 ) -> Result<HarnessOutput> {
+    run_impairment_harness_with_delay_bounds(input_48k_mono, profile, 20, 250)
+}
+
+pub fn run_impairment_harness_with_delay_bounds(
+    input_48k_mono: &[f32],
+    profile: &ImpairmentProfile,
+    min_delay_ms: u32,
+    max_delay_ms: u32,
+) -> Result<HarnessOutput> {
     let packets = encode_packets(input_48k_mono)?;
     let events = impair_packets(&packets, profile);
 
-    let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+    let mut receiver =
+        VoiceReceiver::new_with_delay_bounds(SAMPLE_RATE, min_delay_ms, max_delay_ms)?;
     let mut output = Vec::new();
     let mut next_event = 0_usize;
     let last_arrival_us = events.last().map(|event| event.arrival_us).unwrap_or(0);
