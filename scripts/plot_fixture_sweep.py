@@ -34,9 +34,9 @@ def main() -> int:
     for profile, entries in grouped.items():
         entries.sort(key=lambda row: int(row["max_delay_ms"]))
         x = [int(row["max_delay_ms"]) for row in entries]
-        y_buffer = [int(row["preferred_buffer_size_ms"]) for row in entries]
-        y_conceal = [int(row["concealed_samples"]) for row in entries]
-        y_expand = [int(row["expand_rate_q14"]) / 16384.0 for row in entries]
+        y_buffer = [float(row["avg_preferred_buffer_size_ms"]) for row in entries]
+        y_conceal = [int(row["concealed_samples_delta"]) for row in entries]
+        y_expand = [float(row["avg_expand_rate_q14"]) / 16384.0 for row in entries]
         ax_buffer.plot(x, y_buffer, marker="o", label=profile)
         ax_conceal.plot(x, y_conceal, marker="o", label=profile)
         ax_expand.plot(x, y_expand, marker="o", label=profile)

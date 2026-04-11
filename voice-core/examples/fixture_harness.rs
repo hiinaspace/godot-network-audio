@@ -38,22 +38,46 @@ fn main() -> Result<()> {
     println!("output_samples: {}", run.output_samples.len());
     println!("input_rms: {:.6}", rms(&run.input_samples));
     println!("output_rms: {:.6}", rms(&run.output_samples));
-    println!("target_delay_ms: {}", run.stats.target_delay_ms);
     println!(
-        "current_buffer_size_ms: {}",
-        run.stats.current_buffer_size_ms
+        "measured_output_rms: {:.6}",
+        run.metrics.measured_output_rms
     );
     println!(
-        "packets_awaiting_decode: {}",
-        run.stats.packets_awaiting_decode
+        "avg_preferred_buffer_size_ms: {:.2}",
+        run.metrics.avg_preferred_buffer_size_ms
     );
-    println!("expand_rate_q14: {}", run.stats.expand_rate);
-    println!("accelerate_rate_q14: {}", run.stats.accelerate_rate);
-    println!("concealed_samples: {}", run.stats.concealed_samples);
-    println!("consecutive_failures: {}", run.stats.consecutive_failures);
+    println!(
+        "avg_target_delay_ms: {:.2}",
+        run.metrics.avg_target_delay_ms
+    );
+    println!(
+        "avg_current_buffer_size_ms: {:.2}",
+        run.metrics.avg_current_buffer_size_ms
+    );
+    println!(
+        "avg_expand_rate_q14: {:.2}",
+        run.metrics.avg_expand_rate_q14
+    );
+    println!(
+        "avg_accelerate_rate_q14: {:.2}",
+        run.metrics.avg_accelerate_rate_q14
+    );
+    println!(
+        "concealed_samples_delta: {}",
+        run.metrics.concealed_samples_delta
+    );
+    println!("measured_frames: {}", run.metrics.measured_frames);
+    println!(
+        "final_packets_awaiting_decode: {}",
+        run.final_stats.packets_awaiting_decode
+    );
+    println!(
+        "consecutive_failures: {}",
+        run.final_stats.consecutive_failures
+    );
     println!(
         "sticky_error: {}",
-        run.stats.sticky_error.as_deref().unwrap_or("<none>")
+        run.final_stats.sticky_error.as_deref().unwrap_or("<none>")
     );
 
     Ok(())

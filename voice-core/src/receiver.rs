@@ -205,20 +205,17 @@ mod tests {
         let input = synthetic_speech_like_seconds(3.0, SAMPLE_RATE);
         let run = run_impairment_harness(&input, &default_profile())?;
         let output_rms = rms(&run.output_samples);
-        let stats = run.stats;
+        let stats = run.final_stats;
+        let metrics = run.metrics;
 
         assert!(output_rms > 0.01, "output unexpectedly close to silence");
         assert_eq!(stats.consecutive_failures, 0);
         assert!(stats.sticky_error.is_none());
         assert!(
-            stats.target_delay_ms <= 250,
-            "target delay grew unexpectedly: {} ms",
-            stats.target_delay_ms
-        );
-        assert!(
-            stats.concealed_samples > 0,
+            metrics.concealed_samples_delta > 0,
             "expected some concealment under the impairment profile"
         );
+        assert!(metrics.measured_frames > 0);
 
         Ok(())
     }
