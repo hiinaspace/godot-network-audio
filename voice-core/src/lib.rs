@@ -1,6 +1,7 @@
 pub mod decoder;
 pub mod encoder;
 pub mod error;
+pub mod fixture_harness;
 pub mod packet;
 pub mod receiver;
 pub mod resample;

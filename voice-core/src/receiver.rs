@@ -125,10 +125,10 @@ mod tests {
 
     use super::*;
     use crate::encoder::{VoiceEncoder, VoiceEncoderConfig};
-
-    const ENCODE_FRAME_SAMPLES: usize = 960;
-    const PULL_FRAME_SAMPLES: usize = 480;
-    const SAMPLE_RATE: u32 = 48_000;
+    use crate::fixture_harness::{
+        default_profile, rms, run_impairment_harness, ENCODE_FRAME_SAMPLES, PULL_FRAME_SAMPLES,
+        SAMPLE_RATE,
+    };
 
     #[test]
     fn encode_decode_sine_through_receiver_keeps_rms_reasonable() -> AnyResult<()> {
@@ -177,36 +177,9 @@ mod tests {
     #[test]
     fn deterministic_impairment_profile_stays_alive() -> AnyResult<()> {
         let input = synthetic_speech_like_seconds(3.0, SAMPLE_RATE);
-        let packets = encode_packets(&input)?;
-        let events = impair_packets(&packets);
-
-        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
-        let mut output = Vec::new();
-        let mut next_event = 0_usize;
-        let last_arrival_us = events.last().map(|event| event.arrival_us).unwrap_or(0);
-        let end_time_us = last_arrival_us + 200_000;
-        let mut t = 0_u64;
-
-        while t <= end_time_us {
-            while next_event < events.len() && events[next_event].arrival_us <= t {
-                let event = &events[next_event];
-                receiver.push_packet(
-                    event.packet.clone(),
-                    PacketArrival {
-                        received_at_mono_us: event.arrival_us,
-                    },
-                )?;
-                next_event += 1;
-            }
-
-            let mut frame = vec![0.0; PULL_FRAME_SAMPLES];
-            receiver.pull_frame(&mut frame);
-            output.extend_from_slice(&frame);
-            t += 10_000;
-        }
-
-        let output_rms = rms(&output);
-        let stats = receiver.stats();
+        let run = run_impairment_harness(&input, &default_profile())?;
+        let output_rms = rms(&run.output_samples);
+        let stats = run.stats;
 
         assert!(output_rms > 0.01, "output unexpectedly close to silence");
         assert_eq!(stats.consecutive_failures, 0);
@@ -222,47 +195,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[derive(Debug, Clone)]
-    struct ScheduledPacket {
-        packet: VoicePacket,
-        arrival_us: u64,
-    }
-
-    fn encode_packets(input: &[f32]) -> AnyResult<Vec<VoicePacket>> {
-        let mut encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
-        let mut packets = Vec::new();
-
-        for chunk in input.chunks(ENCODE_FRAME_SAMPLES) {
-            encoder.push_pcm(chunk);
-            if let Some(packet) = encoder.poll_packet()? {
-                packets.push(packet);
-            }
-        }
-
-        Ok(packets)
-    }
-
-    fn impair_packets(packets: &[VoicePacket]) -> Vec<ScheduledPacket> {
-        let jitter_pattern_us = [0_u64, 7_000, 2_000, 16_000, 4_000, 11_000, 1_000, 9_000];
-        let mut events = Vec::new();
-
-        for (i, packet) in packets.iter().enumerate() {
-            // Mild random-ish loss plus one short burst loss.
-            if i % 37 == 11 || (60..=63).contains(&i) {
-                continue;
-            }
-
-            let arrival_us = i as u64 * 20_000 + jitter_pattern_us[i % jitter_pattern_us.len()];
-            events.push(ScheduledPacket {
-                packet: packet.clone(),
-                arrival_us,
-            });
-        }
-
-        events.sort_by_key(|event| event.arrival_us);
-        events
     }
 
     fn sine_wave_seconds(seconds: f32, hz: f32, sample_rate: u32, amplitude: f32) -> Vec<f32> {
@@ -297,10 +229,5 @@ mod tests {
                 (0.07 * voiced + 0.015 * fricative) * syllable_env
             })
             .collect()
-    }
-
-    fn rms(samples: &[f32]) -> f32 {
-        let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-        (sum_sq / samples.len() as f32).sqrt()
     }
 }
