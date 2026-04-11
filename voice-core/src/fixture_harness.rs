@@ -194,18 +194,20 @@ pub fn run_impairment_harness_with_config(
             next_event += 1;
         }
 
+        let in_measurement_window = t >= measure_start_us && t <= measure_end_us;
+        if in_measurement_window && !measurement_started {
+            concealed_start = receiver.stats().concealed_samples;
+            measurement_started = true;
+        }
+
         let mut frame = vec![0.0; PULL_FRAME_SAMPLES];
         if t >= playout_start_us {
             receiver.pull_frame(&mut frame);
         }
         output.extend_from_slice(&frame);
 
-        if t >= measure_start_us && t <= measure_end_us {
+        if in_measurement_window {
             let stats = receiver.stats();
-            if !measurement_started {
-                concealed_start = stats.concealed_samples;
-                measurement_started = true;
-            }
             concealed_end = stats.concealed_samples;
 
             measured_samples.extend_from_slice(&frame);
