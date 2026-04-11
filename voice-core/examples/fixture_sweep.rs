@@ -16,6 +16,7 @@ struct SweepRow {
     input_rms: f32,
     output_rms: f32,
     rms_ratio: f32,
+    preferred_buffer_size_ms: u32,
     target_delay_ms: u32,
     current_buffer_size_ms: u32,
     expand_rate_q14: u16,
@@ -85,6 +86,7 @@ fn make_row(profile: &ImpairmentProfile, max_delay_ms: u32, run: &HarnessOutput)
         } else {
             0.0
         },
+        preferred_buffer_size_ms: run.stats.preferred_buffer_size_ms,
         target_delay_ms: run.stats.target_delay_ms,
         current_buffer_size_ms: run.stats.current_buffer_size_ms,
         expand_rate_q14: run.stats.expand_rate,
@@ -96,16 +98,17 @@ fn make_row(profile: &ImpairmentProfile, max_delay_ms: u32, run: &HarnessOutput)
 
 fn write_csv(path: &PathBuf, rows: &[SweepRow]) -> Result<()> {
     let mut out = String::from(
-        "profile,max_delay_ms,input_rms,output_rms,rms_ratio,target_delay_ms,current_buffer_size_ms,expand_rate_q14,accelerate_rate_q14,concealed_samples,packets_awaiting_decode\n",
+        "profile,max_delay_ms,input_rms,output_rms,rms_ratio,preferred_buffer_size_ms,target_delay_ms,current_buffer_size_ms,expand_rate_q14,accelerate_rate_q14,concealed_samples,packets_awaiting_decode\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{}\n",
+            "{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{}\n",
             row.profile_name,
             row.max_delay_ms,
             row.input_rms,
             row.output_rms,
             row.rms_ratio,
+            row.preferred_buffer_size_ms,
             row.target_delay_ms,
             row.current_buffer_size_ms,
             row.expand_rate_q14,

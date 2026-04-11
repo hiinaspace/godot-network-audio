@@ -28,26 +28,32 @@ def main() -> int:
     for row in rows:
         grouped[row["profile"]].append(row)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True, constrained_layout=True)
-    ax_delay, ax_conceal = axes
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True, constrained_layout=True)
+    ax_buffer, ax_conceal, ax_expand = axes
 
     for profile, entries in grouped.items():
         entries.sort(key=lambda row: int(row["max_delay_ms"]))
         x = [int(row["max_delay_ms"]) for row in entries]
-        y_delay = [int(row["target_delay_ms"]) for row in entries]
+        y_buffer = [int(row["preferred_buffer_size_ms"]) for row in entries]
         y_conceal = [int(row["concealed_samples"]) for row in entries]
-        ax_delay.plot(x, y_delay, marker="o", label=profile)
+        y_expand = [int(row["expand_rate_q14"]) / 16384.0 for row in entries]
+        ax_buffer.plot(x, y_buffer, marker="o", label=profile)
         ax_conceal.plot(x, y_conceal, marker="o", label=profile)
+        ax_expand.plot(x, y_expand, marker="o", label=profile)
 
-    ax_delay.set_title("NetEq target delay vs configured max delay")
-    ax_delay.set_ylabel("target delay (ms)")
-    ax_delay.grid(True, alpha=0.3)
-    ax_delay.legend()
+    ax_buffer.set_title("NetEq preferred buffer size vs configured max delay")
+    ax_buffer.set_ylabel("preferred buffer (ms)")
+    ax_buffer.grid(True, alpha=0.3)
+    ax_buffer.legend()
 
     ax_conceal.set_title("Concealed samples vs configured max delay")
-    ax_conceal.set_xlabel("configured max delay (ms)")
     ax_conceal.set_ylabel("concealed samples")
     ax_conceal.grid(True, alpha=0.3)
+
+    ax_expand.set_title("Expand rate vs configured max delay")
+    ax_expand.set_xlabel("configured max delay (ms)")
+    ax_expand.set_ylabel("expand rate")
+    ax_expand.grid(True, alpha=0.3)
 
     output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_png, dpi=160)

@@ -12,6 +12,7 @@ const SSRC_FIXED: u32 = 0x474e_6175;
 pub struct ReceiverStats {
     pub current_buffer_size_ms: u32,
     pub target_delay_ms: u32,
+    pub preferred_buffer_size_ms: u32,
     pub packets_awaiting_decode: usize,
     pub expand_rate: u16,
     pub accelerate_rate: u16,
@@ -24,8 +25,6 @@ pub struct VoiceReceiver {
     inner: NetEq,
     sample_rate: u32,
     channels: u8,
-    arrival_epoch_mono_us: Option<u64>,
-    arrival_epoch_instant: Option<Instant>,
     consecutive_failures: u32,
     sticky_error: Option<String>,
 }
@@ -57,21 +56,29 @@ impl VoiceReceiver {
             inner,
             sample_rate,
             channels,
-            arrival_epoch_mono_us: None,
-            arrival_epoch_instant: None,
             consecutive_failures: 0,
             sticky_error: None,
         })
     }
 
     pub fn push_packet(&mut self, pkt: VoicePacket, arrival: PacketArrival) -> Result<()> {
+        self.push_packet_with_simulated_now(pkt, arrival, arrival.received_at_mono_us)
+    }
+
+    pub(crate) fn push_packet_with_simulated_now(
+        &mut self,
+        pkt: VoicePacket,
+        arrival: PacketArrival,
+        simulated_now_mono_us: u64,
+    ) -> Result<()> {
         if pkt.payload.is_empty() {
             return Ok(());
         }
 
         let header = RtpHeader::new(pkt.seq, pkt.timestamp, SSRC_FIXED, PAYLOAD_TYPE_OPUS, false);
         let mut packet = AudioPacket::new(header, pkt.payload, self.sample_rate, self.channels, 20);
-        packet.arrival_time = self.instant_for_arrival(arrival.received_at_mono_us);
+        packet.arrival_time =
+            self.instant_for_arrival(arrival.received_at_mono_us, simulated_now_mono_us);
 
         self.inner.insert_packet(packet).map_err(|err| {
             self.record_failure(format!("insert_packet: {err}"));
@@ -101,6 +108,7 @@ impl VoiceReceiver {
         ReceiverStats {
             current_buffer_size_ms: stats.current_buffer_size_ms,
             target_delay_ms: stats.target_delay_ms,
+            preferred_buffer_size_ms: stats.network.preferred_buffer_size_ms as u32,
             packets_awaiting_decode: stats.packets_awaiting_decode,
             expand_rate: stats.network.expand_rate,
             accelerate_rate: stats.network.accelerate_rate,
@@ -110,13 +118,23 @@ impl VoiceReceiver {
         }
     }
 
-    fn instant_for_arrival(&mut self, received_at_mono_us: u64) -> Instant {
-        let epoch_us = *self
-            .arrival_epoch_mono_us
-            .get_or_insert(received_at_mono_us);
-        let epoch_instant = *self.arrival_epoch_instant.get_or_insert_with(Instant::now);
-        let delta_us = received_at_mono_us.saturating_sub(epoch_us);
-        epoch_instant + Duration::from_micros(delta_us)
+    fn instant_for_arrival(
+        &mut self,
+        received_at_mono_us: u64,
+        simulated_now_mono_us: u64,
+    ) -> Instant {
+        let now = Instant::now();
+        if received_at_mono_us <= simulated_now_mono_us {
+            now.checked_sub(Duration::from_micros(
+                simulated_now_mono_us - received_at_mono_us,
+            ))
+            .unwrap_or(now)
+        } else {
+            now.checked_add(Duration::from_micros(
+                received_at_mono_us - simulated_now_mono_us,
+            ))
+            .unwrap_or(now)
+        }
     }
 
     fn record_failure(&mut self, message: String) {
