@@ -1,0 +1,16 @@
+[workspace]
+members = ["voice-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+audiopus = "0.3.0-rc.0"
+hound = "3.5.1"
+neteq = "=0.8.3"
+thiserror = "2.0.17"
+web-time = "1.1.0"
