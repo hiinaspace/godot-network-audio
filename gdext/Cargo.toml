@@ -8,6 +8,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow.workspace = true
 crossbeam-queue.workspace = true
 godot.workspace = true
 voice-core = { path = "../voice-core" }
