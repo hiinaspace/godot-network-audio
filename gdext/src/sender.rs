@@ -85,6 +85,7 @@ impl PipelineState {
 #[class(base=Node)]
 pub struct NetworkAudioSender {
     base: Base<Node>,
+    clock_origin: Instant,
     #[export]
     bitrate_bps: i32,
     #[export]
@@ -109,6 +110,12 @@ pub struct NetworkAudioSender {
     max_chunk_frames: i32,
     last_available_frames: i32,
     last_chunk_frames: i32,
+    last_capture_pull_us: u64,
+    capture_pull_count: i64,
+    capture_pull_interval_sum_us: u64,
+    capture_pull_interval_max_us: u64,
+    current_empty_input_poll_streak: i64,
+    max_empty_input_poll_streak: i64,
     packets_sent: i64,
     worker_pcm_dropped: i64,
     worker_packets_dropped: i64,
@@ -119,6 +126,7 @@ impl INode for NetworkAudioSender {
     fn init(base: Base<Node>) -> Self {
         Self {
             base,
+            clock_origin: Instant::now(),
             bitrate_bps: 16_000,
             input_sample_rate_hz: 48_000,
             enable_dtx: true,
@@ -137,6 +145,12 @@ impl INode for NetworkAudioSender {
             max_chunk_frames: 0,
             last_available_frames: 0,
             last_chunk_frames: 0,
+            last_capture_pull_us: 0,
+            capture_pull_count: 0,
+            capture_pull_interval_sum_us: 0,
+            capture_pull_interval_max_us: 0,
+            current_empty_input_poll_streak: 0,
+            max_empty_input_poll_streak: 0,
             packets_sent: 0,
             worker_pcm_dropped: 0,
             worker_packets_dropped: 0,
@@ -251,6 +265,26 @@ impl NetworkAudioSender {
         dict.set("max_chunk_frames", self.max_chunk_frames);
         dict.set("last_available_frames", self.last_available_frames);
         dict.set("last_chunk_frames", self.last_chunk_frames);
+        dict.set(
+            "avg_capture_pull_interval_ms",
+            if self.capture_pull_count > 0 {
+                self.capture_pull_interval_sum_us as f64 / self.capture_pull_count as f64 / 1000.0
+            } else {
+                0.0
+            },
+        );
+        dict.set(
+            "max_capture_pull_interval_ms",
+            self.capture_pull_interval_max_us as f64 / 1000.0,
+        );
+        dict.set(
+            "current_empty_input_poll_streak",
+            self.current_empty_input_poll_streak,
+        );
+        dict.set(
+            "max_empty_input_poll_streak",
+            self.max_empty_input_poll_streak,
+        );
         dict.set(
             "capture_audio_server_input",
             self.capture_audio_server_input,
@@ -382,11 +416,24 @@ impl NetworkAudioSender {
         let mut available = audio_server.get_input_frames_available();
         if available <= 0 {
             self.empty_input_polls += 1;
+            self.current_empty_input_poll_streak += 1;
+            self.max_empty_input_poll_streak = self
+                .max_empty_input_poll_streak
+                .max(self.current_empty_input_poll_streak);
             return;
         }
 
+        self.current_empty_input_poll_streak = 0;
         self.last_available_frames = available;
         self.max_available_frames = self.max_available_frames.max(available);
+        let now_us = self.clock_origin.elapsed().as_micros() as u64;
+        if self.last_capture_pull_us != 0 {
+            let interval_us = now_us.saturating_sub(self.last_capture_pull_us);
+            self.capture_pull_count += 1;
+            self.capture_pull_interval_sum_us += interval_us;
+            self.capture_pull_interval_max_us = self.capture_pull_interval_max_us.max(interval_us);
+        }
+        self.last_capture_pull_us = now_us;
         let frame_budget = self.microphone_frame_budget.max(1);
         while available > 0 {
             let chunk_frames = available.min(frame_budget);

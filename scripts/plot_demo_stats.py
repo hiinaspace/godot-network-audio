@@ -151,6 +151,11 @@ def main() -> int:
         100.0 * (captured_delta[i] / dt[i]) / expected_frames_per_sec
         for i in range(len(captured_delta))
     ]
+    avg_capture_pull_ms = [row["s"].get("avg_capture_pull_interval_ms", 0.0) for row in rows]
+    max_capture_pull_ms = [row["s"].get("max_capture_pull_interval_ms", 0.0) for row in rows]
+    max_empty_poll_streak = [
+        row["s"].get("max_empty_input_poll_streak", 0) for row in rows
+    ]
 
     # --- receiver series ---
     conc_cumul = [row["r"].get("concealed_samples", 0) for row in rows]
@@ -230,12 +235,46 @@ def main() -> int:
 
     # Panel 3: input capture throughput
     ax = axes[2]
-    ax.set_title("Sender: mic input capture throughput (% of input sample rate)")
+    ax.set_title("Sender: mic input capture throughput and pull cadence")
     ax.bar(t, capture_pct, color="steelblue", label="frames captured / sec %")
     ax.axhline(100, color="gray", lw=1, ls="--", label="100% = continuous input")
     ax.set_ylabel("% of input rate")
     ax.set_ylim(0, max(115, max(capture_pct) * 1.1 if capture_pct else 115))
-    ax.legend(fontsize=8)
+    ax2 = ax.twinx()
+    ax2.plot(
+        t,
+        avg_capture_pull_ms,
+        color="seagreen",
+        lw=1.5,
+        marker="o",
+        ms=3,
+        label="avg capture pull interval (ms)",
+    )
+    ax2.plot(
+        t,
+        max_capture_pull_ms,
+        color="black",
+        lw=1.2,
+        ls=":",
+        marker="x",
+        ms=4,
+        label="max capture pull interval (ms)",
+    )
+    ax2.plot(
+        t,
+        max_empty_poll_streak,
+        color="purple",
+        lw=1.2,
+        ls="--",
+        marker="^",
+        ms=3,
+        label="max empty poll streak",
+    )
+    ax2.set_ylabel("ms / polls")
+    ax2.set_ylim(0)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right")
 
     # Panel 4: receiver NetEq rates (cumulative %)
     ax = axes[3]
