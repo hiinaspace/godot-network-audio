@@ -184,7 +184,7 @@ pub fn run_impairment_harness_with_config(
     while t <= end_time_us {
         while next_event < events.len() && events[next_event].arrival_us <= t {
             let event = &events[next_event];
-            receiver.push_packet_with_simulated_now(
+            receiver.push_packet_with_now_mono(
                 event.packet.clone(),
                 PacketArrival {
                     received_at_mono_us: event.arrival_us,

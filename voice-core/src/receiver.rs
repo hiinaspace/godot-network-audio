@@ -65,7 +65,16 @@ impl VoiceReceiver {
         self.push_packet_with_simulated_now(pkt, arrival, arrival.received_at_mono_us)
     }
 
-    pub(crate) fn push_packet_with_simulated_now(
+    pub fn push_packet_with_now_mono(
+        &mut self,
+        pkt: VoicePacket,
+        arrival: PacketArrival,
+        now_mono_us: u64,
+    ) -> Result<()> {
+        self.push_packet_with_simulated_now(pkt, arrival, now_mono_us)
+    }
+
+    fn push_packet_with_simulated_now(
         &mut self,
         pkt: VoicePacket,
         arrival: PacketArrival,

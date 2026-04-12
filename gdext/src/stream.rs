@@ -1,19 +1,23 @@
 use std::slice;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_queue::ArrayQueue;
 use godot::builtin::{GString, PackedByteArray, VarDictionary};
 use godot::classes::native::AudioFrame;
-use godot::classes::{AudioStream, AudioStreamPlayback, IAudioStream, IAudioStreamPlayback, Time};
+use godot::classes::{AudioStream, AudioStreamPlayback, IAudioStream, IAudioStreamPlayback};
 use godot::obj::Gd;
 use godot::prelude::*;
-use voice_core::{PacketArrival, VoicePacket};
+use voice_core::{PacketArrival, ReceiverStats, VoicePacket, VoiceReceiver};
 
 use crate::packet_bytes::decode_packet_bytes;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const PLAYBACK_DRAIN_BUDGET: usize = 32;
+const RECEIVER_SAMPLE_RATE_HZ: u32 = 48_000;
+const RECEIVER_MIN_DELAY_MS: u32 = 20;
+const RECEIVER_FRAME_SAMPLES: usize = 480;
 
 #[derive(Debug)]
 struct QueuedPacket {
@@ -24,6 +28,7 @@ struct QueuedPacket {
 #[derive(Debug)]
 struct SharedStreamState {
     queue: ArrayQueue<QueuedPacket>,
+    mono_epoch: Instant,
     dropped_packets: AtomicU64,
     current_buffer_size_ms: AtomicU32,
     target_delay_ms: AtomicU32,
@@ -33,13 +38,14 @@ struct SharedStreamState {
     accelerate_rate: AtomicU32,
     concealed_samples: AtomicU64,
     consecutive_failures: AtomicU32,
-    playing: AtomicI32,
+    playing: AtomicBool,
 }
 
 impl SharedStreamState {
     fn new() -> Self {
         Self {
             queue: ArrayQueue::new(DEFAULT_QUEUE_CAPACITY),
+            mono_epoch: Instant::now(),
             dropped_packets: AtomicU64::new(0),
             current_buffer_size_ms: AtomicU32::new(0),
             target_delay_ms: AtomicU32::new(0),
@@ -49,8 +55,12 @@ impl SharedStreamState {
             accelerate_rate: AtomicU32::new(0),
             concealed_samples: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
-            playing: AtomicI32::new(0),
+            playing: AtomicBool::new(false),
         }
+    }
+
+    fn now_mono_us(&self) -> u64 {
+        self.mono_epoch.elapsed().as_micros() as u64
     }
 
     fn reset_runtime_stats(&self) {
@@ -62,6 +72,25 @@ impl SharedStreamState {
         self.accelerate_rate.store(0, Ordering::Relaxed);
         self.concealed_samples.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn publish_stats(&self, stats: &ReceiverStats) {
+        self.current_buffer_size_ms
+            .store(stats.current_buffer_size_ms, Ordering::Relaxed);
+        self.target_delay_ms
+            .store(stats.target_delay_ms, Ordering::Relaxed);
+        self.preferred_buffer_size_ms
+            .store(stats.preferred_buffer_size_ms, Ordering::Relaxed);
+        self.packets_awaiting_decode
+            .store(stats.packets_awaiting_decode as u32, Ordering::Relaxed);
+        self.expand_rate
+            .store(stats.expand_rate as u32, Ordering::Relaxed);
+        self.accelerate_rate
+            .store(stats.accelerate_rate as u32, Ordering::Relaxed);
+        self.concealed_samples
+            .store(stats.concealed_samples, Ordering::Relaxed);
+        self.consecutive_failures
+            .store(stats.consecutive_failures, Ordering::Relaxed);
     }
 }
 
@@ -79,7 +108,12 @@ pub struct AudioStreamNetwork {
 struct AudioStreamNetworkPlayback {
     base: Base<AudioStreamPlayback>,
     shared: Arc<SharedStreamState>,
+    receiver: Option<VoiceReceiver>,
+    pending_mono: Vec<f32>,
+    pending_cursor: usize,
     playback_position_frames: u64,
+    detached_init: bool,
+    warned_detached_init: bool,
 }
 
 #[godot_api]
@@ -94,10 +128,16 @@ impl IAudioStream for AudioStreamNetwork {
 
     fn instantiate_playback(&self) -> Option<Gd<AudioStreamPlayback>> {
         let shared = Arc::clone(&self.shared);
+        let max_delay_ms = self.max_delay_ms.max(RECEIVER_MIN_DELAY_MS as i32) as u32;
         let playback = Gd::from_init_fn(move |base| AudioStreamNetworkPlayback {
             base,
             shared,
+            receiver: build_receiver(max_delay_ms),
+            pending_mono: Vec::new(),
+            pending_cursor: 0,
             playback_position_frames: 0,
+            detached_init: false,
+            warned_detached_init: false,
         });
         Some(playback.upcast())
     }
@@ -119,7 +159,7 @@ impl IAudioStream for AudioStreamNetwork {
 impl AudioStreamNetwork {
     #[func]
     fn push_packet(&mut self, bytes: PackedByteArray) -> bool {
-        self.push_packet_with_meta(bytes, mono_time_now_us() as i64)
+        self.push_packet_with_meta(bytes, self.shared.now_mono_us() as i64)
     }
 
     #[func]
@@ -192,10 +232,7 @@ impl AudioStreamNetwork {
             self.shared.dropped_packets.load(Ordering::Relaxed) as i64,
         );
         dict.set("configured_max_delay_ms", self.max_delay_ms);
-        dict.set(
-            "is_playing",
-            self.shared.playing.load(Ordering::Relaxed) != 0,
-        );
+        dict.set("is_playing", self.shared.playing.load(Ordering::Relaxed));
         dict
     }
 }
@@ -220,52 +257,67 @@ impl IAudioStreamPlayback for AudioStreamNetworkPlayback {
         Self {
             base,
             shared: Arc::new(SharedStreamState::new()),
+            receiver: build_receiver(120),
+            pending_mono: Vec::new(),
+            pending_cursor: 0,
             playback_position_frames: 0,
+            detached_init: true,
+            warned_detached_init: false,
         }
     }
 
     fn start(&mut self, _from_pos: f64) {
         self.playback_position_frames = 0;
+        self.pending_mono.clear();
+        self.pending_cursor = 0;
         self.shared.reset_runtime_stats();
-        self.shared.playing.store(1, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Relaxed);
     }
 
     fn stop(&mut self) {
+        self.pending_mono.clear();
+        self.pending_cursor = 0;
         self.shared.reset_runtime_stats();
-        self.shared.playing.store(0, Ordering::Relaxed);
+        self.shared.playing.store(false, Ordering::Relaxed);
     }
 
     fn is_playing(&self) -> bool {
-        self.shared.playing.load(Ordering::Relaxed) != 0
+        self.shared.playing.load(Ordering::Relaxed)
     }
 
     fn get_playback_position(&self) -> f64 {
-        self.playback_position_frames as f64 / 48_000.0
+        self.playback_position_frames as f64 / RECEIVER_SAMPLE_RATE_HZ as f64
     }
 
     unsafe fn mix_rawptr(&mut self, buffer: *mut AudioFrame, _rate_scale: f32, frames: i32) -> i32 {
-        if buffer.is_null() || frames <= 0 || !self.is_playing() {
+        if buffer.is_null() || frames <= 0 {
             return 0;
         }
 
         let frame_count = frames as usize;
         let out = unsafe { slice::from_raw_parts_mut(buffer, frame_count) };
+        zero_frames(out);
 
-        let mut drained = 0;
-        while drained < PLAYBACK_DRAIN_BUDGET {
-            match self.shared.queue.pop() {
-                Some(queued) => {
-                    let _ = queued.packet;
-                    let _ = queued.arrival;
-                    drained += 1;
-                }
-                None => break,
-            }
+        if !self.is_playing() {
+            return frames;
         }
 
-        for frame in out.iter_mut() {
-            frame.left = 0.0;
-            frame.right = 0.0;
+        if self.detached_init {
+            if !self.warned_detached_init {
+                godot_warn!(
+                    "AudioStreamNetworkPlayback was initialized without shared stream state; output will stay silent"
+                );
+                self.warned_detached_init = true;
+            }
+            return frames;
+        }
+
+        self.drain_packets_into_receiver();
+        self.fill_output_frames(out);
+
+        if let Some(receiver) = self.receiver.as_ref() {
+            let stats = receiver.stats();
+            self.shared.publish_stats(&stats);
         }
 
         self.shared
@@ -279,6 +331,64 @@ impl IAudioStreamPlayback for AudioStreamNetworkPlayback {
     }
 }
 
-fn mono_time_now_us() -> u64 {
-    Time::singleton().get_ticks_usec()
+impl AudioStreamNetworkPlayback {
+    fn drain_packets_into_receiver(&mut self) {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return;
+        };
+
+        let now_mono_us = self.shared.now_mono_us();
+        for _ in 0..PLAYBACK_DRAIN_BUDGET {
+            let Some(queued) = self.shared.queue.pop() else {
+                break;
+            };
+
+            let _ = receiver.push_packet_with_now_mono(queued.packet, queued.arrival, now_mono_us);
+        }
+    }
+
+    fn fill_output_frames(&mut self, out: &mut [AudioFrame]) {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return;
+        };
+
+        let mut written = 0;
+        while written < out.len() {
+            if self.pending_cursor >= self.pending_mono.len() {
+                self.pending_mono.resize(RECEIVER_FRAME_SAMPLES, 0.0);
+                receiver.pull_frame(&mut self.pending_mono);
+                self.pending_cursor = 0;
+            }
+
+            let available = self.pending_mono.len().saturating_sub(self.pending_cursor);
+            if available == 0 {
+                break;
+            }
+
+            let copy_count = available.min(out.len() - written);
+            for frame in &mut out[written..written + copy_count] {
+                let sample = self.pending_mono[self.pending_cursor];
+                frame.left = sample;
+                frame.right = sample;
+                self.pending_cursor += 1;
+            }
+            written += copy_count;
+        }
+    }
+}
+
+fn build_receiver(max_delay_ms: u32) -> Option<VoiceReceiver> {
+    VoiceReceiver::new_with_delay_bounds(
+        RECEIVER_SAMPLE_RATE_HZ,
+        RECEIVER_MIN_DELAY_MS,
+        max_delay_ms.max(RECEIVER_MIN_DELAY_MS),
+    )
+    .ok()
+}
+
+fn zero_frames(frames: &mut [AudioFrame]) {
+    for frame in frames {
+        frame.left = 0.0;
+        frame.right = 0.0;
+    }
 }
