@@ -111,13 +111,35 @@ def main() -> int:
     ]
     sent_rate = [sent_delta[i] / dt[i] for i in range(len(sent_delta))]
     max_pkt_ms = [row["s"].get("max_packet_interval_ms", 0.0) for row in rows]
+    max_tick_lag_ms = [row["s"].get("max_tick_lag_ms", 0.0) for row in rows]
+    avg_tick_lag_ms = [row["s"].get("avg_tick_lag_ms", 0.0) for row in rows]
+    worker_ticks = [row["s"].get("worker_ticks", 0) for row in rows]
+    empty_ticks = [row["s"].get("worker_empty_pcm_ticks", 0) for row in rows]
+    partial_ticks = [row["s"].get("worker_partial_pcm_ticks", 0) for row in rows]
+    silent_ticks = [row["s"].get("silent_ticks", 0) for row in rows]
+    with_packets_ticks = [row["s"].get("worker_ticks_with_packets", 0) for row in rows]
+
+    def cumulative_delta(values: list[float]) -> list[float]:
+        if not values:
+            return []
+        return [values[0]] + [
+            max(0, values[i] - values[i - 1]) for i in range(1, len(values))
+        ]
+
+    empty_tick_rate = [d / dt[i] for i, d in enumerate(cumulative_delta(empty_ticks))]
+    partial_tick_rate = [d / dt[i] for i, d in enumerate(cumulative_delta(partial_ticks))]
+    silent_tick_rate = [d / dt[i] for i, d in enumerate(cumulative_delta(silent_ticks))]
+    with_packets_rate = [
+        d / dt[i] for i, d in enumerate(cumulative_delta(with_packets_ticks))
+    ]
 
     captured_cumul = [row["s"].get("captured_input_frames", 0) for row in rows]
     captured_delta = [captured_cumul[0]] + [
         max(0, captured_cumul[i] - captured_cumul[i - 1])
         for i in range(1, len(captured_cumul))
     ]
-    expected_frames_per_sec = 48_000
+    input_rate_hz = rows[-1]["s"].get("input_sample_rate_hz", 48_000) if rows else 48_000
+    expected_frames_per_sec = max(1, float(input_rate_hz))
     capture_pct = [
         100.0 * (captured_delta[i] / dt[i]) / expected_frames_per_sec
         for i in range(len(captured_delta))
@@ -143,12 +165,12 @@ def main() -> int:
 
     # ------------------------------------------------------------------ plot --
     fig, axes = plt.subplots(
-        4, 1, figsize=(13, 14), sharex=True, constrained_layout=True
+        5, 1, figsize=(13, 17), sharex=True, constrained_layout=True
     )
 
-    # Panel 1: sender packet rate + stall indicator
+    # Panel 1: sender packet rate + gap indicator
     ax = axes[0]
-    ax.set_title("Sender: packet emission rate and stalls")
+    ax.set_title("Sender: packet emission rate and packet-gap indicator")
     bar_color = [
         "#d62728" if ms > 100 else "#1f77b4" for ms in max_pkt_ms
     ]
@@ -174,17 +196,42 @@ def main() -> int:
         transform=ax.transAxes, fontsize=7, va="top", color="dimgray"
     )
 
-    # Panel 2: input capture throughput
+    # Panel 2: worker timing and starvation indicators
     ax = axes[1]
-    ax.set_title("Sender: mic input capture throughput (% of 48 kHz)")
+    ax.set_title("Sender: worker timing and PCM availability")
+    ax.plot(t, with_packets_rate, color="#1f77b4", lw=2, marker="o", ms=3,
+            label="ticks with packets / sec")
+    ax.plot(t, empty_tick_rate, color="#d62728", lw=1.5, marker="x", ms=4,
+            label="empty PCM ticks / sec")
+    ax.plot(t, partial_tick_rate, color="darkorange", lw=1.5, marker="s", ms=3,
+            label="partial PCM ticks / sec")
+    ax.plot(t, silent_tick_rate, color="purple", lw=1.5, marker="^", ms=3,
+            label="silent/VAD ticks / sec")
+    ax.axhline(50, color="gray", lw=1, ls="--", label="target 50 pacing ticks/s")
+    ax.set_ylabel("ticks / sec")
+    ax.set_ylim(0, max(with_packets_rate + empty_tick_rate + partial_tick_rate + silent_tick_rate + [50]) * 1.15 + 2)
+    ax2 = ax.twinx()
+    ax2.plot(t, avg_tick_lag_ms, color="seagreen", lw=1.5, ls="--",
+             label="avg tick lag (ms)")
+    ax2.plot(t, max_tick_lag_ms, color="black", lw=1.5, ls=":",
+             label="max tick lag (ms)")
+    ax2.set_ylabel("tick lag (ms)")
+    ax2.set_ylim(0)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right")
+
+    # Panel 3: input capture throughput
+    ax = axes[2]
+    ax.set_title("Sender: mic input capture throughput (% of input sample rate)")
     ax.bar(t, capture_pct, color="steelblue", label="frames captured / sec %")
-    ax.axhline(100, color="gray", lw=1, ls="--", label="100% = 48 kHz continuous")
-    ax.set_ylabel("% of 48 kHz")
-    ax.set_ylim(0, 115)
+    ax.axhline(100, color="gray", lw=1, ls="--", label="100% = continuous input")
+    ax.set_ylabel("% of input rate")
+    ax.set_ylim(0, max(115, max(capture_pct) * 1.1 if capture_pct else 115))
     ax.legend(fontsize=8)
 
-    # Panel 3: receiver NetEq rates (cumulative %)
-    ax = axes[2]
+    # Panel 4: receiver NetEq rates (cumulative %)
+    ax = axes[3]
     ax.set_title(
         "Receiver: NetEq operation rates (cumulative Q14 fractions, lower is better)"
     )
@@ -202,8 +249,8 @@ def main() -> int:
         transform=ax.transAxes, fontsize=7, va="top", color="dimgray"
     )
 
-    # Panel 4: receiver jitter buffer state
-    ax = axes[3]
+    # Panel 5: receiver jitter buffer state
+    ax = axes[4]
     ax.set_title("Receiver: jitter buffer state")
     ax.fill_between(t, buf_ms, alpha=0.25, color="steelblue", label="current_buffer_ms")
     ax.plot(t, buf_ms, color="steelblue", lw=1.5, marker="o", ms=3)

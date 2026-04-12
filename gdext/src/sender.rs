@@ -29,11 +29,21 @@ struct WorkerQueues {
 
 #[derive(Debug, Default)]
 struct WorkerStats {
+    worker_ticks: AtomicI64,
+    worker_ticks_with_pcm: AtomicI64,
+    worker_empty_pcm_ticks: AtomicI64,
+    worker_partial_pcm_ticks: AtomicI64,
+    worker_ticks_with_packets: AtomicI64,
+    worker_ticks_without_packets: AtomicI64,
+    silent_ticks: AtomicI64,
     packets_emitted: AtomicI64,
     packets_dropped: AtomicI64,
     pcm_samples_dropped: AtomicI64,
     queued_pcm_samples: AtomicI64,
     queued_packets: AtomicI64,
+    tick_lag_count: AtomicI64,
+    tick_lag_sum_us: AtomicU64,
+    tick_lag_max_us: AtomicU64,
     last_packet_emit_us: AtomicU64,
     packet_interval_count: AtomicI64,
     packet_interval_sum_us: AtomicU64,
@@ -236,6 +246,8 @@ impl NetworkAudioSender {
     fn get_stats(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
         dict.set("captured_input_frames", self.captured_input_frames);
+        dict.set("input_sample_rate_hz", self.input_sample_rate_hz);
+        dict.set("bitrate_bps", self.bitrate_bps);
         dict.set("process_ticks", self.process_ticks);
         dict.set("empty_input_polls", self.empty_input_polls);
         dict.set("chunk_count", self.chunk_count);
@@ -252,10 +264,33 @@ impl NetworkAudioSender {
         if let Some(sender) = self.sender.as_ref() {
             let stats = &sender.state.stats;
             let interval_count = stats.packet_interval_count.load(Ordering::Relaxed);
+            let tick_lag_count = stats.tick_lag_count.load(Ordering::Relaxed);
             dict.set(
                 "emitted_packets",
                 stats.packets_emitted.load(Ordering::Relaxed),
             );
+            dict.set("worker_ticks", stats.worker_ticks.load(Ordering::Relaxed));
+            dict.set(
+                "worker_ticks_with_pcm",
+                stats.worker_ticks_with_pcm.load(Ordering::Relaxed),
+            );
+            dict.set(
+                "worker_empty_pcm_ticks",
+                stats.worker_empty_pcm_ticks.load(Ordering::Relaxed),
+            );
+            dict.set(
+                "worker_partial_pcm_ticks",
+                stats.worker_partial_pcm_ticks.load(Ordering::Relaxed),
+            );
+            dict.set(
+                "worker_ticks_with_packets",
+                stats.worker_ticks_with_packets.load(Ordering::Relaxed),
+            );
+            dict.set(
+                "worker_ticks_without_packets",
+                stats.worker_ticks_without_packets.load(Ordering::Relaxed),
+            );
+            dict.set("silent_ticks", stats.silent_ticks.load(Ordering::Relaxed));
             dict.set(
                 "queued_packets",
                 stats.queued_packets.load(Ordering::Relaxed),
@@ -273,6 +308,20 @@ impl NetworkAudioSender {
                 stats.packets_dropped.load(Ordering::Relaxed),
             );
             dict.set(
+                "avg_tick_lag_ms",
+                if tick_lag_count > 0 {
+                    stats.tick_lag_sum_us.load(Ordering::Relaxed) as f64
+                        / tick_lag_count as f64
+                        / 1000.0
+                } else {
+                    0.0
+                },
+            );
+            dict.set(
+                "max_tick_lag_ms",
+                stats.tick_lag_max_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            );
+            dict.set(
                 "avg_packet_interval_ms",
                 if interval_count > 0 {
                     stats.packet_interval_sum_us.load(Ordering::Relaxed) as f64
@@ -288,10 +337,19 @@ impl NetworkAudioSender {
             );
         } else {
             dict.set("emitted_packets", 0_i64);
+            dict.set("worker_ticks", 0_i64);
+            dict.set("worker_ticks_with_pcm", 0_i64);
+            dict.set("worker_empty_pcm_ticks", 0_i64);
+            dict.set("worker_partial_pcm_ticks", 0_i64);
+            dict.set("worker_ticks_with_packets", 0_i64);
+            dict.set("worker_ticks_without_packets", 0_i64);
+            dict.set("silent_ticks", 0_i64);
             dict.set("queued_packets", 0_i64);
             dict.set("queued_pcm_samples", 0_i64);
             dict.set("worker_pcm_samples_dropped", self.worker_pcm_dropped);
             dict.set("worker_packets_dropped", self.worker_packets_dropped);
+            dict.set("avg_tick_lag_ms", 0.0_f64);
+            dict.set("max_tick_lag_ms", 0.0_f64);
             dict.set("avg_packet_interval_ms", 0.0_f64);
             dict.set("max_packet_interval_ms", 0.0_f64);
         }
@@ -558,6 +616,18 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
             continue;
         }
 
+        state.stats.worker_ticks.fetch_add(1, Ordering::Relaxed);
+        let tick_lag_us = now.saturating_duration_since(next_tick).as_micros() as u64;
+        state.stats.tick_lag_count.fetch_add(1, Ordering::Relaxed);
+        state
+            .stats
+            .tick_lag_sum_us
+            .fetch_add(tick_lag_us, Ordering::Relaxed);
+        state
+            .stats
+            .tick_lag_max_us
+            .fetch_max(tick_lag_us, Ordering::Relaxed);
+
         let force_transmit = state.force_transmit.load(Ordering::Relaxed);
         let frame = {
             let mut guard = state.queues.lock().expect("worker queue mutex poisoned");
@@ -575,7 +645,18 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
             frame
         };
 
+        let mut emitted_this_tick = 0_i64;
         if !frame.is_empty() {
+            state
+                .stats
+                .worker_ticks_with_pcm
+                .fetch_add(1, Ordering::Relaxed);
+            if frame.len() < 960 {
+                state
+                    .stats
+                    .worker_partial_pcm_ticks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             encoder.set_force_transmit(force_transmit);
             encoder.push_pcm(&frame);
             loop {
@@ -619,6 +700,7 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
                                 .fetch_max(delta, Ordering::Relaxed);
                         }
                         state.stats.packets_emitted.fetch_add(1, Ordering::Relaxed);
+                        emitted_this_tick += 1;
                     }
                     Ok(None) => break,
                     Err(err) => {
@@ -626,6 +708,26 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
                         break;
                     }
                 }
+            }
+        } else {
+            state
+                .stats
+                .worker_empty_pcm_ticks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        if emitted_this_tick > 0 {
+            state
+                .stats
+                .worker_ticks_with_packets
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            state
+                .stats
+                .worker_ticks_without_packets
+                .fetch_add(1, Ordering::Relaxed);
+            if !frame.is_empty() {
+                state.stats.silent_ticks.fetch_add(1, Ordering::Relaxed);
             }
         }
 
