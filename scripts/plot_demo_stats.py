@@ -5,10 +5,10 @@
 # ]
 # ///
 """
-Plot per-second sender/receiver stats from a godot_demo.log file.
+Plot sender/receiver stats from a JSONL trace or fallback godot_demo.log file.
 
 Usage:
-  plot_demo_stats.py LOGFILE [OUTPUT_PNG]
+  plot_demo_stats.py INPUT [OUTPUT_PNG]
 
 If OUTPUT_PNG is omitted the PNG is written next to the log file as
 demo_stats.png.
@@ -43,33 +43,74 @@ def parse_log(path: Path) -> list[dict]:
     return rows
 
 
+def parse_trace_jsonl(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        rows.append(
+            {
+                "t_sec": max(0.0, row.get("mono_usec", 0)) / 1_000_000.0,
+                "delta_sec": float(row.get("delta_sec", 0.0)),
+                "r": row.get("receiver", {}),
+                "s": row.get("sender", {}),
+                "mode": row.get("input_mode", "unknown"),
+            }
+        )
+    if rows:
+        t0 = rows[0]["t_sec"]
+        for row in rows:
+            row["t_sec"] -= t0
+    return rows
+
+
+def load_rows(path: Path) -> list[dict]:
+    if path.suffix == ".jsonl":
+        return parse_trace_jsonl(path)
+    rows = parse_log(path)
+    if rows:
+        for i, row in enumerate(rows, start=1):
+            row["t_sec"] = float(i)
+            row["delta_sec"] = 1.0
+        return rows
+    jsonl_candidate = path.with_name("demo_trace.jsonl")
+    if jsonl_candidate.exists():
+        return parse_trace_jsonl(jsonl_candidate)
+    return []
+
+
 def main() -> int:
     if len(sys.argv) not in (2, 3):
         print("usage: plot_demo_stats.py LOGFILE [OUTPUT_PNG]", file=sys.stderr)
         return 2
 
-    log_path = Path(sys.argv[1])
+    input_path = Path(sys.argv[1])
     out_png = (
         Path(sys.argv[2])
         if len(sys.argv) == 3
-        else log_path.parent / "demo_stats.png"
+        else input_path.parent / "demo_stats.png"
     )
 
-    rows = parse_log(log_path)
+    rows = load_rows(input_path)
     if not rows:
-        print(f"no 'demo: stats' lines found in {log_path}", file=sys.stderr)
+        print(f"no demo stats found in {input_path}", file=sys.stderr)
         return 1
 
-    t = list(range(1, len(rows) + 1))
+    t = [row.get("t_sec", float(i)) for i, row in enumerate(rows, start=1)]
+    dt = [
+        max(1e-6, row.get("delta_sec", 0.0) or 0.0)
+        for row in rows
+    ]
 
     # --- sender series ---
     sent_cumul = [row["s"].get("packets_sent", 0) for row in rows]
     sent_delta = [sent_cumul[0]] + [
         max(0, sent_cumul[i] - sent_cumul[i - 1]) for i in range(1, len(sent_cumul))
     ]
+    sent_rate = [sent_delta[i] / dt[i] for i in range(len(sent_delta))]
     max_pkt_ms = [row["s"].get("max_packet_interval_ms", 0.0) for row in rows]
-    # running avg in ms (cumulative stat, not per-second)
-    avg_pkt_ms = [row["s"].get("avg_packet_interval_ms", 0.0) for row in rows]
 
     captured_cumul = [row["s"].get("captured_input_frames", 0) for row in rows]
     captured_delta = [captured_cumul[0]] + [
@@ -77,16 +118,18 @@ def main() -> int:
         for i in range(1, len(captured_cumul))
     ]
     expected_frames_per_sec = 48_000
-    capture_pct = [100.0 * d / expected_frames_per_sec for d in captured_delta]
+    capture_pct = [
+        100.0 * (captured_delta[i] / dt[i]) / expected_frames_per_sec
+        for i in range(len(captured_delta))
+    ]
 
     # --- receiver series ---
     conc_cumul = [row["r"].get("concealed_samples", 0) for row in rows]
-    conc_delta_ms = [
-        conc_cumul[0] / 48.0  # samples → ms
-    ] + [
+    conc_delta_ms = [conc_cumul[0] / 48.0] + [
         max(0, conc_cumul[i] - conc_cumul[i - 1]) / 48.0
         for i in range(1, len(conc_cumul))
     ]
+    conc_rate_ms = [conc_delta_ms[i] / dt[i] for i in range(len(conc_delta_ms))]
 
     # expand_rate / accelerate_rate are Q14 cumulative fractions (0–16384 = 0–100%)
     expand_pct = [100.0 * row["r"].get("expand_rate", 0) / Q14_SCALE for row in rows]
@@ -109,10 +152,11 @@ def main() -> int:
     bar_color = [
         "#d62728" if ms > 100 else "#1f77b4" for ms in max_pkt_ms
     ]
-    ax.bar(t, sent_delta, color=bar_color, label="packets sent / sec", zorder=2)
+    bar_width = max(0.01, (max(t) / max(1, len(t))) * 0.85) if t else 0.1
+    ax.bar(t, sent_rate, width=bar_width, color=bar_color, label="packets sent / sec", zorder=2)
     ax.axhline(50, color="gray", lw=1, ls="--", label="target 50 pkt/s")
     ax.set_ylabel("packets / sec")
-    ax.set_ylim(0, max(sent_delta) * 1.15 + 5)
+    ax.set_ylim(0, max(sent_rate) * 1.15 + 5)
     ax2 = ax.twinx()
     ax2.plot(t, max_pkt_ms, color="tomato", lw=1.5, marker="o", ms=4,
              label="max_pkt_interval (ms)")
@@ -167,9 +211,9 @@ def main() -> int:
             label="target_delay_ms")
     ax.plot(t, preferred_ms, color="purple", lw=1, ls=":", marker="v", ms=4,
             label="preferred_buffer_ms")
-    ax.plot(t, [ms / 1000.0 * 48.0 for ms in conc_delta_ms],
+    ax.plot(t, conc_rate_ms,
             color="red", lw=1, ls="-.", marker="x", ms=5,
-            label="concealment ms/sec ÷ 48")
+            label="concealment ms/sec")
     ax.set_ylabel("milliseconds")
     ax.set_xlabel("seconds into run")
     ax.set_ylim(0)
@@ -177,14 +221,14 @@ def main() -> int:
 
     # summary annotation
     total_conc_s = conc_cumul[-1] / 48_000.0
-    total_run_s = len(rows)
+    total_run_s = t[-1] if t else 0.0
     final_expand_pct = expand_pct[-1]
     stall_ticks = sum(1 for ms in max_pkt_ms if ms > 100)
     fig.suptitle(
-        f"{log_path.name}  —  "
+        f"{input_path.name}  —  "
         f"{total_run_s}s run,  "
         f"stall ticks (>100ms gap): {stall_ticks},  "
-        f"total concealment: {total_conc_s:.1f}s ({100*total_conc_s/total_run_s:.0f}% of run),  "
+        f"total concealment: {total_conc_s:.1f}s ({100*total_conc_s/max(total_run_s, 1e-6):.0f}% of run),  "
         f"final expand_rate: {final_expand_pct:.0f}%",
         fontsize=10,
     )

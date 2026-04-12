@@ -10,6 +10,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_WAV="$(realpath "$1")"
 OUTPUT_DIR="$(realpath -m "$2")"
 RUN_SECONDS="${3:-6}"
+GODOT_GRACE_SECONDS="${GNA_DEMO_GODOT_GRACE_SECONDS:-8}"
 
 if [[ ! -f "$INPUT_WAV" ]]; then
   echo "input wav not found: $INPUT_WAV" >&2
@@ -87,44 +88,86 @@ pactl set-default-sink "$OUTPUT_SINK"
 INPUT_CAPTURE_WAV="$OUTPUT_DIR/input_virtual_mic.wav"
 OUTPUT_CAPTURE_WAV="$OUTPUT_DIR/output_godot_sink.wav"
 LOG_PATH="$OUTPUT_DIR/godot_demo.log"
+TRACE_JSONL_PATH="$OUTPUT_DIR/demo_trace.jsonl"
+STATS_PNG_PATH="$OUTPUT_DIR/demo_stats.png"
 
 ffmpeg -hide_banner -loglevel error -nostdin \
   -stream_loop -1 -re -i "$INPUT_WAV" \
+  -t "$((RUN_SECONDS + GODOT_GRACE_SECONDS + 2))" \
   -ac 2 -ar 48000 -f pulse -device "$INPUT_SINK" "$INPUT_SINK" \
   >"$OUTPUT_DIR/input_player.log" 2>&1 &
 PLAYER_PID=$!
 
-ffmpeg -hide_banner -loglevel error -nostdin -y \
-  -f pulse -i "$INPUT_SINK.monitor" -t "$RUN_SECONDS" \
-  -ac 2 -ar 48000 "$INPUT_CAPTURE_WAV" \
-  >"$OUTPUT_DIR/input_capture.log" 2>&1 &
-INPUT_RECORDER_PID=$!
+if command -v pw-record >/dev/null 2>&1; then
+  pw-record --target "$INPUT_SINK.monitor" --latency 20ms "$INPUT_CAPTURE_WAV" \
+    >"$OUTPUT_DIR/input_capture.log" 2>&1 &
+  INPUT_RECORDER_PID=$!
+else
+  ffmpeg -hide_banner -loglevel error -nostdin -y \
+    -f pulse -i "$INPUT_SINK.monitor" -t "$RUN_SECONDS" \
+    -ac 2 -ar 48000 "$INPUT_CAPTURE_WAV" \
+    >"$OUTPUT_DIR/input_capture.log" 2>&1 &
+  INPUT_RECORDER_PID=$!
+fi
 
-ffmpeg -hide_banner -loglevel error -nostdin -y \
-  -f pulse -i "$OUTPUT_SINK.monitor" -t "$RUN_SECONDS" \
-  -ac 2 -ar 48000 "$OUTPUT_CAPTURE_WAV" \
-  >"$OUTPUT_DIR/output_capture.log" 2>&1 &
-RECORDER_PID=$!
+if command -v pw-record >/dev/null 2>&1; then
+  pw-record --target "$OUTPUT_SINK.monitor" --latency 20ms "$OUTPUT_CAPTURE_WAV" \
+    >"$OUTPUT_DIR/output_capture.log" 2>&1 &
+  RECORDER_PID=$!
+else
+  ffmpeg -hide_banner -loglevel error -nostdin -y \
+    -f pulse -i "$OUTPUT_SINK.monitor" -t "$RUN_SECONDS" \
+    -ac 2 -ar 48000 "$OUTPUT_CAPTURE_WAV" \
+    >"$OUTPUT_DIR/output_capture.log" 2>&1 &
+  RECORDER_PID=$!
+fi
 
 sleep 0.5
 
-GODOT_BIN=~/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64
+if command -v fgvm >/dev/null 2>&1; then
+  GODOT_BIN="$(fgvm which | tail -n 1)"
+elif [[ -x "$HOME/bin/fgvm" ]]; then
+  GODOT_BIN="$("$HOME/bin/fgvm" which | tail -n 1)"
+else
+  GODOT_BIN="$HOME/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64"
+fi
+
+set +e
 PULSE_SOURCE="$INPUT_SOURCE" \
 PULSE_SINK="$OUTPUT_SINK" \
 GNA_DEMO_INPUT_DEVICE="$INPUT_SOURCE" \
 GNA_DEMO_OUTPUT_DEVICE="$OUTPUT_SINK" \
 GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
-GNA_DEMO_QUIT_SECONDS="$RUN_SECONDS" \
+GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$RUN_SECONDS}" \
+GNA_DEMO_TRACE_JSONL="$TRACE_JSONL_PATH" \
+timeout --signal=TERM --kill-after=5s "$((RUN_SECONDS + GODOT_GRACE_SECONDS))" \
   "$GODOT_BIN" --path "$ROOT_DIR/example" --scene res://main.tscn --verbose \
   >"$LOG_PATH" 2>&1
+GODOT_STATUS=$?
+set -e
 
-wait "$RECORDER_PID"
+if [[ "$GODOT_STATUS" -ne 0 && "$GODOT_STATUS" -ne 124 && "$GODOT_STATUS" -ne 143 ]]; then
+  echo "godot exited with status $GODOT_STATUS" >&2
+  exit "$GODOT_STATUS"
+fi
+
+sleep 0.5
+kill_pid "$RECORDER_PID"
+kill_pid "$INPUT_RECORDER_PID"
+
+wait "$RECORDER_PID" || true
 RECORDER_PID=""
 
-wait "$INPUT_RECORDER_PID"
+wait "$INPUT_RECORDER_PID" || true
 INPUT_RECORDER_PID=""
 
 kill_pid "$PLAYER_PID"
 PLAYER_PID=""
 
-printf '%s\n' "$INPUT_CAPTURE_WAV" "$OUTPUT_CAPTURE_WAV" "$LOG_PATH"
+if [[ -f "$TRACE_JSONL_PATH" ]]; then
+  uv run "$ROOT_DIR/scripts/plot_demo_stats.py" "$TRACE_JSONL_PATH" "$STATS_PNG_PATH" >/dev/null
+elif [[ -f "$LOG_PATH" ]]; then
+  uv run "$ROOT_DIR/scripts/plot_demo_stats.py" "$LOG_PATH" "$STATS_PNG_PATH" >/dev/null
+fi
+
+printf '%s\n' "$INPUT_CAPTURE_WAV" "$OUTPUT_CAPTURE_WAV" "$LOG_PATH" "$TRACE_JSONL_PATH" "$STATS_PNG_PATH"

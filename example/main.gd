@@ -26,11 +26,15 @@ var selected_output_device := ""
 var allow_synthetic_fallback := true
 var force_synthetic := false
 var quit_after_seconds := DEFAULT_QUIT_SECONDS
+var trace_jsonl_path := ""
+var trace_file: FileAccess = null
+var trace_frame := 0
 
 
 func _ready() -> void:
 	demo_start_msec = Time.get_ticks_msec()
 	_load_env_config()
+	_open_trace_file()
 	print("demo: ready")
 	print("demo: class exists sender=", ClassDB.class_exists("NetworkAudioSender"))
 	print("demo: class exists stream=", ClassDB.class_exists("AudioStreamNetwork"))
@@ -100,6 +104,8 @@ func _process(delta: float) -> void:
 			send_accumulator -= FRAME_SECONDS
 			_push_synthetic_frame()
 
+	_write_trace_row(delta)
+
 
 func _push_synthetic_frame() -> void:
 	var samples := PackedFloat32Array()
@@ -150,6 +156,7 @@ func _print_stats() -> void:
 
 func _shutdown_demo() -> void:
 	print("demo: shutting down")
+	_close_trace_file()
 	if is_instance_valid(stats_timer):
 		stats_timer.stop()
 	# Disconnect before stopping playback so no in-flight packet_ready fires
@@ -165,6 +172,39 @@ func _shutdown_demo() -> void:
 	# zero before the tree does its ObjectDB cleanup.
 	stream = null
 	get_tree().quit()
+
+
+func _open_trace_file() -> void:
+	if trace_jsonl_path == "":
+		return
+	trace_file = FileAccess.open(trace_jsonl_path, FileAccess.WRITE)
+	if trace_file == null:
+		push_error("demo: failed to open trace file: %s" % trace_jsonl_path)
+		return
+	print("demo: trace jsonl=", trace_jsonl_path)
+
+
+func _close_trace_file() -> void:
+	if trace_file != null:
+		trace_file.flush()
+		trace_file = null
+
+
+func _write_trace_row(delta: float) -> void:
+	if trace_file == null or sender == null or stream == null:
+		return
+	var receiver_stats: Dictionary = stream.get_stats()
+	var sender_stats: Dictionary = sender.get_stats()
+	var row := {
+		"frame": trace_frame,
+		"mono_usec": Time.get_ticks_usec(),
+		"delta_sec": delta,
+		"input_mode": input_mode,
+		"receiver": receiver_stats,
+		"sender": sender_stats,
+	}
+	trace_file.store_line(JSON.stringify(row))
+	trace_frame += 1
 
 
 func _select_input_device() -> void:
@@ -231,6 +271,7 @@ func _load_env_config() -> void:
 	var synthetic_env := OS.get_environment("GNA_DEMO_FORCE_SYNTHETIC").to_lower()
 	if synthetic_env in ["1", "true", "yes"]:
 		force_synthetic = true
+	trace_jsonl_path = OS.get_environment("GNA_DEMO_TRACE_JSONL")
 	var quit_env := OS.get_environment("GNA_DEMO_QUIT_SECONDS")
 	if quit_env != "":
 		var parsed := quit_env.to_float()
