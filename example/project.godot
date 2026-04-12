@@ -11,6 +11,7 @@ run/main_scene="res://main.tscn"
 [audio]
 
 driver/enable_input=true
+driver/mix_rate=48000
 
 [rendering]
 

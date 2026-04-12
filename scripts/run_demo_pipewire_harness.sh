@@ -78,9 +78,9 @@ bash "$ROOT_DIR/scripts/sync_demo_extension.sh" >/dev/null
 ORIGINAL_DEFAULT_SINK="$(pactl info | sed -n 's/^Default Sink: //p' | head -n 1)"
 ORIGINAL_DEFAULT_SOURCE="$(pactl info | sed -n 's/^Default Source: //p' | head -n 1)"
 
-INPUT_MODULE_ID="$(pactl load-module module-null-sink sink_name="$INPUT_SINK" sink_properties=device.description="$INPUT_SINK")"
+INPUT_MODULE_ID="$(pactl load-module module-null-sink sink_name="$INPUT_SINK" rate=48000 sink_properties=device.description="$INPUT_SINK")"
 INPUT_SOURCE_MODULE_ID="$(pactl load-module module-remap-source source_name="$INPUT_SOURCE" master="$INPUT_SINK.monitor" source_properties=device.description="$INPUT_SOURCE")"
-OUTPUT_MODULE_ID="$(pactl load-module module-null-sink sink_name="$OUTPUT_SINK" sink_properties=device.description="$OUTPUT_SINK")"
+OUTPUT_MODULE_ID="$(pactl load-module module-null-sink sink_name="$OUTPUT_SINK" rate=48000 sink_properties=device.description="$OUTPUT_SINK")"
 pactl set-default-source "$INPUT_SOURCE"
 pactl set-default-sink "$OUTPUT_SINK"
 
@@ -108,12 +108,12 @@ RECORDER_PID=$!
 
 sleep 0.5
 
-GODOT_BIN="$("$HOME/bin/fgvm" which | tail -n 1)"
+GODOT_BIN=~/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64
 PULSE_SOURCE="$INPUT_SOURCE" \
 PULSE_SINK="$OUTPUT_SINK" \
 GNA_DEMO_INPUT_DEVICE="$INPUT_SOURCE" \
 GNA_DEMO_OUTPUT_DEVICE="$OUTPUT_SINK" \
-GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK=0 \
+GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
 GNA_DEMO_QUIT_SECONDS="$RUN_SECONDS" \
   "$GODOT_BIN" --path "$ROOT_DIR/example" --scene res://main.tscn --verbose \
   >"$LOG_PATH" 2>&1

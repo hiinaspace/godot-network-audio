@@ -5,7 +5,7 @@ const FRAME_SAMPLES := 960
 const FRAME_SECONDS := float(FRAME_SAMPLES) / float(SAMPLE_RATE)
 const INPUT_MODE_MICROPHONE := "microphone"
 const INPUT_MODE_SYNTHETIC := "synthetic"
-const STARTUP_PREBUFFER_PACKETS := 6
+const STARTUP_PREBUFFER_PACKETS := 0
 const DEFAULT_QUIT_SECONDS := 4.0
 
 var sender
@@ -24,6 +24,7 @@ var prebuffer_remaining_packets := STARTUP_PREBUFFER_PACKETS
 var selected_input_device := ""
 var selected_output_device := ""
 var allow_synthetic_fallback := true
+var force_synthetic := false
 var quit_after_seconds := DEFAULT_QUIT_SECONDS
 
 
@@ -48,9 +49,12 @@ func _ready() -> void:
 
 	sender.name = "Sender"
 	sender.input_sample_rate_hz = int(AudioServer.get_mix_rate())
-	sender.capture_audio_server_input = true
+	sender.capture_audio_server_input = not force_synthetic
 	sender.microphone_frame_budget = FRAME_SAMPLES
 	add_child(sender)
+	if force_synthetic:
+		input_mode = INPUT_MODE_SYNTHETIC
+		print("demo: forced synthetic input mode")
 
 	player = AudioStreamPlayer.new()
 	player.name = "Player"
@@ -133,15 +137,33 @@ func _on_encoder_error(message: String) -> void:
 
 func _print_stats() -> void:
 	var stats: Dictionary = stream.get_stats()
-	print("demo: stats ", JSON.stringify(stats), " input_mode=", input_mode)
+	var sender_stats: Dictionary = sender.get_stats()
+	print(
+		"demo: stats receiver=",
+		JSON.stringify(stats),
+		" sender=",
+		JSON.stringify(sender_stats),
+		" input_mode=",
+		input_mode
+	)
 
 
 func _shutdown_demo() -> void:
 	print("demo: shutting down")
-	if is_instance_valid(player):
-		player.stop()
 	if is_instance_valid(stats_timer):
 		stats_timer.stop()
+	# Disconnect before stopping playback so no in-flight packet_ready fires
+	# into a partially-torn-down stream.
+	if is_instance_valid(sender):
+		sender.packet_ready.disconnect(_on_packet_ready)
+	if is_instance_valid(player):
+		player.stop()
+		# Null the stream reference so the audio thread stops calling _mix()
+		# on the playback object before the tree frees everything.
+		player.stream = null
+	# Release the GDScript-side stream ref so the RefCounted object reaches
+	# zero before the tree does its ObjectDB cleanup.
+	stream = null
 	get_tree().quit()
 
 
@@ -206,6 +228,9 @@ func _load_env_config() -> void:
 	var fallback_env := OS.get_environment("GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK").to_lower()
 	if fallback_env in ["0", "false", "no"]:
 		allow_synthetic_fallback = false
+	var synthetic_env := OS.get_environment("GNA_DEMO_FORCE_SYNTHETIC").to_lower()
+	if synthetic_env in ["1", "true", "yes"]:
+		force_synthetic = true
 	var quit_env := OS.get_environment("GNA_DEMO_QUIT_SECONDS")
 	if quit_env != "":
 		var parsed := quit_env.to_float()
