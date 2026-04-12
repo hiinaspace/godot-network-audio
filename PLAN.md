@@ -58,12 +58,16 @@ Battle-testedness assessment (as of 2026-04-11):
 5. **Godot 4.6+** target. Leverages `AudioServer.get_input_frames()` for mic reliability.
 6. **Our own minimal packet format**, not RTP. Start/end-of-talkspurt flags that RTP doesn't carry; no padding/CSRC baggage; no interop ambition. Internally we synthesize a `neteq::RtpHeader` with fixed SSRC/PT at the boundary before handing to NetEq.
 7. **`VoiceReceiver::pull_frame` never errors to callers.** Any internal NetEq failure → silence + logged stat. Isolates Godot playback from neteq's unwrap density.
-8. **Sender is a `Node`** that reads microphone input via `AudioServer.get_input_frames()`, not via `AudioEffectCapture`. This follows Godot 4.6's more direct input path, avoids bus-capture drift quirks, and keeps encode off the audio thread.
+8. **Sender capture uses `AudioServer.get_input_frames()`**, not `AudioEffectCapture`. This follows Godot 4.6's more direct input path and avoids bus-capture drift quirks, but capture cadence is distinct from packet-send cadence.
 9. **The audio thread owns NetEq.** `push_packet()` only enqueues packet metadata into a lock-free queue; `_mix` drains that queue and calls NetEq. No mutex shared between the main thread and the audio callback.
 10. **Packet ingress carries explicit arrival timing.** The core API accepts packet arrival time as metadata so NetEq's jitter estimate reflects transport arrival, not Godot main-thread scheduling jitter.
 11. **Backlog behavior is bounded and drop-oriented.** The packet queue is bounded; overflow drops stale voice packets instead of letting `_mix` inherit unbounded catch-up work.
 12. **Single-talker invariant is enforced, not just documented.** `AudioStreamNetwork` owns one stream identity / sequence space and must reject or reset on mismatched stream identity rather than accidentally multiplexing.
 13. **Receive audio stays mono until spatialization.** `AudioStreamNetwork` should present a mono voice source; stereoization belongs to Godot or Steam Audio, not the voice transport layer. This is also the intended integration model for Steam Audio.
+14. **Send pacing is owned by a dedicated worker, not `process()`.** Godot-side mic polling may be bursty; a separate monotonic 20 ms send clock must pull canonical PCM frames from a queue and drive encoding/packet emission.
+15. **The local send path is shared across peers.** For the intended iroh full-mesh use case, one local mic capture + pacing + encode pipeline fans out packets to all peers by default; per-peer encoding lanes are a future extension for adaptation, not the baseline.
+16. **Input and output sample rates are treated independently.** Query `AudioServer.get_input_mix_rate()` at runtime for capture, not `get_mix_rate()` and not a static exported default. Encode remains canonically 48 kHz mono Opus; playback should rely on Godot's `AudioStreamPlaybackResampled` rather than requiring the project mix rate to be forced to 48 kHz.
+17. **Startup and shutdown are explicit state transitions.** The sender side should have a clear start/stop/join order for any worker thread and input-device activation, rather than relying on `exit_tree()` timing and implicit destruction order.
 
 ## Repo layout
 
@@ -86,7 +90,7 @@ godot-network-audio/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                  # ExtensionLibrary entry point
-│       ├── sender.rs               # NetworkAudioSender
+│       ├── sender.rs               # NetworkAudioSender / shared send service
 │       ├── stream.rs               # AudioStreamNetwork + playback
 │       └── packet_bytes.rs         # PackedByteArray <-> VoicePacket
 ├── addons/godot_network_audio/
@@ -142,6 +146,25 @@ impl VoiceEncoder {
     pub fn flush(&mut self); // reset opus encoder state on gap
 }
 
+pub struct PacingConfig {
+    pub frame_duration_ms: u32, // 20
+    pub max_pcm_queue_ms: u32,  // bounded raw-PCM backlog
+}
+
+pub struct LocalSendPipeline {
+    // Owns canonical 48 kHz mono PCM buffering and the paced send clock.
+}
+
+impl LocalSendPipeline {
+    /// Called from the Godot/main-thread capture side with raw mic PCM
+    /// in the actual input-device rate domain.
+    pub fn push_input_pcm(&mut self, samples: &[f32]);
+    /// Worker-thread entry: every 20 ms, pull exactly one paced frame,
+    /// encode it, and hand the encoded packet to the transport fan-out layer.
+    pub fn run_pacer(&mut self, on_packet: impl FnMut(&VoicePacket));
+    pub fn stop(&mut self);
+}
+
 // decoder.rs
 pub struct OpusAudioDecoder { /* audiopus::Decoder */ }
 impl neteq::codec::AudioDecoder for OpusAudioDecoder { /* ... */ }
@@ -175,14 +198,15 @@ pub struct NetworkAudioSender {
     #[export] vad_threshold_db: f32,    // -45
     #[export] push_to_talk: bool,       // bypass VAD when true
     #[export] denoise: bool,
-    encoder: Option<VoiceEncoder>,
+    sender: Option<LocalSendPipeline>,  // shared local-user send path
 }
 
 #[godot_api]
 impl INode for NetworkAudioSender {
     fn process(&mut self, _delta: f64) {
-        // 1. Drain AudioServer.get_input_frames() → encoder.push_pcm
-        // 2. while let Some(pkt) = encoder.poll_packet() → emit signal
+        // 1. Drain AudioServer.get_input_frames() at the input-device rate
+        // 2. Push raw mono PCM into the sender's bounded PCM queue
+        // 3. A dedicated worker thread owns paced 20 ms encode/send cadence
     }
 }
 
@@ -190,6 +214,8 @@ impl INode for NetworkAudioSender {
 impl NetworkAudioSender {
     #[signal] fn packet_ready(bytes: PackedByteArray);
     #[func] fn is_speaking(&self) -> bool { /* ... */ }
+    #[func] fn start_capture(&mut self) { /* enable input + start worker */ }
+    #[func] fn stop_capture(&mut self) { /* stop worker + disable input */ }
 }
 
 #[derive(GodotClass)]
@@ -208,9 +234,12 @@ impl AudioStreamNetwork {
     #[func] fn get_stats(&self) -> Dictionary { /* ... */ }
 }
 
-// AudioStreamNetworkPlayback owns VoiceReceiver privately.
-// _mix drains PacketQueue up to a fixed budget, feeds NetEq, resamples to the
-// current Godot mix rate if needed, and writes dst frames.
+// AudioStreamNetworkPlayback owns VoiceReceiver privately and should inherit
+// AudioStreamPlaybackResampled rather than raw AudioStreamPlayback.
+// _start must call begin_resample() before the first mix.
+// _mix_resampled drains PacketQueue up to a fixed budget, feeds NetEq, and
+// reports a 48 kHz stream sampling rate so Godot performs output-device
+// resampling internally.
 // Main/network threads never lock or call into NetEq directly.
 ```
 
@@ -218,13 +247,13 @@ impl AudioStreamNetwork {
 
 Godot's `AudioStreamPlayback::_mix` is called with a frame count from the audio driver — you must fill exactly that many, no preferred chunk size. NetEq produces fixed 10 ms frames (480 samples at 48 kHz). Standard pattern: the playback class keeps a small leftover buffer, each `_mix` drains leftover first, then pulls 10 ms frames until `dst` is full, stashes the tail. `two-voip-godot-4`'s `AudioStreamPlaybackOpusChunked::_mix_resampled` does exactly this — read it when implementing ours.
 
-On output: NetEq runs at 48 kHz internally, but Godot's driver mix rate may differ. The playback object therefore needs an explicit output-side resampling step unless the stream sampling rate is guaranteed to match the driver. Make this resampler part of the playback implementation, not an accidental property of the project audio settings.
+On output: NetEq runs at 48 kHz internally, but Godot's driver mix rate may differ. The playback object should therefore use `AudioStreamPlaybackResampled`, call `begin_resample()` on start, and report its stream sampling rate explicitly so Godot performs output-device resampling with its built-in cubic interpolation. Do not make correct playback depend on forcing the whole project to 48 kHz.
 
-On input: `AudioServer.get_input_frames(frames)` returns microphone frames from the engine's input buffer. Use `get_input_frames_available()` / `get_input_buffer_length_frames()` to size fetch cadence conservatively, then resample to 48 kHz inside `VoiceEncoder`, accumulate to 960-sample frames, encode.
+On input: `AudioServer.get_input_frames(frames)` returns microphone frames from the engine's input buffer at `AudioServer.get_input_mix_rate()`, which may differ from `AudioServer.get_mix_rate()`. Capture code must use the input rate, resample to canonical 48 kHz mono, and feed a bounded PCM queue. The paced send worker then consumes that queue in exact 20 ms increments; it must not depend on `Node.process()` timing.
 
 ### Threading detail
 
-Do not share `VoiceReceiver` behind a mutex between `push_packet()` and `_mix`. Godot's audio callback path should not block on the main thread. The intended shape is:
+Do not share `VoiceReceiver` behind a mutex between `push_packet()` and `_mix`. Godot's audio callback path should not block on the main thread. The intended receive shape is:
 
 - Main thread or network thread decodes `PackedByteArray` into `VoicePacket` metadata and enqueues `(VoicePacket, PacketArrival)` into an SPSC queue.
 - Audio playback object owns `VoiceReceiver` and drains that queue inside `_mix`, but only up to a fixed per-call budget.
@@ -232,6 +261,15 @@ Do not share `VoiceReceiver` behind a mutex between `push_packet()` and `_mix`. 
 - Queue capacity is fixed. On overflow, the producer drops stale voice packets rather than growing latency or stalling the audio callback.
 
 This keeps engine scheduling jitter out of the audio callback and out of NetEq's packet-arrival model.
+
+The intended send shape is:
+
+- Main thread polls `AudioServer.get_input_frames()` and pushes raw mono PCM into a bounded queue owned by the sender service.
+- A dedicated worker thread owns the paced 20 ms send clock and the encoder state.
+- The worker pulls exactly one 20 ms canonical frame per tick, encodes it, and emits a packet into a fan-out boundary.
+- Under pressure, drop stale raw PCM or bounded queued packets rather than allowing unbounded send delay.
+
+This keeps encode/send cadence independent of `process()` jitter while avoiding audio-thread work on capture.
 
 ## Future transport hooks
 
@@ -272,6 +310,25 @@ For iroh specifically, the likely v0.1 path is:
 - Use unreliable datagrams for voice packets.
 - Expose optional arrival timestamps from the iroh receive task into `push_packet_with_meta`.
 - Later add an iroh-specific helper/example that reads `rtt()`, `datagram_send_buffer_space()`, and `max_datagram_size()` for sender policy.
+
+### Full-mesh iroh implications
+
+The immediate practical target is a small full-mesh iroh session, roughly 2 to 8 peers. That has an important architectural consequence:
+
+- There is one local microphone but multiple outbound peers.
+- The default send path should therefore produce one shared paced encoded packet stream and fan it out to all connected peers.
+- Do not create one encoder/pacing worker per peer in the baseline design.
+
+This keeps CPU cost proportional to "number of local talkers" rather than "number of remote peers." It is the right default for fixed-bitrate voice over small full mesh.
+
+If we later want sender-side adaptation per peer, split the send side into two logical stages:
+
+- a shared local capture/pacing stage that produces canonical 20 ms 48 kHz mono PCM frames
+- an encoding/distribution stage that is shared by default, but can optionally branch into per-peer encoders for bitrate/FEC/DTX policy
+
+So v0 should be architected as a shared local-user send service with packet fan-out, not as a peer-specific sender object.
+
+One caveat for later: a peer that joins mid-talkspurt will miss the earlier talkspurt-boundary reset signal. That is acceptable for v0 loopback and early mesh testing, but if mid-stream peer joins matter we will likely want an explicit "new peer sync" behavior in v0.1+.
 
 ## Automated evaluation
 
@@ -358,12 +415,14 @@ None of that blocks v0, but it does make an early fork or patch series reasonabl
 1. **Skeleton**: workspace, `voice-core` compiles with `neteq = "=0.8.3"` (exact pin) and `audiopus`, plus `OpusAudioDecoder` impl. Unit test: encode 1 s sine → decode through receiver → assert RMS within tolerance of input.
 2. **Sans-IO loopback stress test**: round-trip recorded speech through encoder → deterministic impairment harness → receiver. Keep one cheap seeded profile in normal test runs, dump output wav on failure, and record `NetEqStats`. This remains the go/no-go for the NetEq bet: if the default profile misses the placeholder thresholds above or sounds clearly bad in spot checks, reassess before writing more gdext code.
 3. **gdext scaffolding**: godot-rust crate builds a .so, registers `NetworkAudioSender` and `AudioStreamNetwork`, installs into `addons/`. Verify the pinned neteq version still builds cleanly on the current Rust toolchain before doing integration work on top of it.
-4. **Mic wire-up**: sender node pulls from `AudioServer.get_input_frames()` and emits `packet_ready`. Linux verified.
-5. **Playback wire-up**: `AudioStreamNetwork._mix` drains the packet queue with a bounded budget, pulls from its private `VoiceReceiver`, and resamples to the driver mix rate before filling `dst`. Loopback demo scene: one `NetworkAudioSender`, `packet_ready` signal connected directly in GDScript to `AudioStreamNetwork.push_packet`. Hearing your own voice through the full pipeline = v0 done.
-6. **Stats UI** in example: buffer size, expand events, packet loss, VAD state. Useful for debugging and as a template for game HUDs.
-7. **README**: loopback setup, the "bring your own networking" story, pointers to godot-iroh and HLMP as next steps.
-8. **iroh example**: after the in-memory loopback is solid, add a focused example that sends voice over iroh datagrams in a direct peer-to-peer setup. This is the first concrete post-v0 networking milestone, ahead of any HLMP helper.
-9. **Heavier evaluation sweep**: before calling the receive path solid, run the broader offline corpus + impairment matrix from the automated-evaluation section and review both objective metrics and a small listening canary set.
+4. **Initial gdext / demo scaffold**: `NetworkAudioSender`, `AudioStreamNetwork`, loopback demo scene, and Godot/PipeWire harness exist. Use this as the baseline integration scaffold rather than rebuilding it from scratch.
+5. **Sender architecture correction**: replace `process()`-driven send cadence with a dedicated sender worker that owns the paced 20 ms clock. Main-thread Godot capture fills a bounded PCM queue using `AudioServer.get_input_frames()` at `get_input_mix_rate()`. Add explicit start/stop/join lifecycle and verify shutdown is clean.
+6. **Playback architecture correction**: make `AudioStreamNetworkPlayback` use `AudioStreamPlaybackResampled` so output-side resampling is owned by Godot rather than by project-wide 48 kHz assumptions. Keep `VoiceReceiver` audio-thread-owned and queue-drained with a bounded budget.
+7. **Loopback revalidation**: rerun the loopback demo and PipeWire harness after the sender-worker/output-resampling change. Success criteria: sustained audio without runaway concealment, no long-run sample-rate drift, and clean shutdown without `ObjectDB` leaks.
+8. **Stats UI / diagnostics** in example: keep sender/receiver timing and buffer stats visible. These are part of the development surface for debugging cadence, drift, and backlog behavior.
+9. **README**: loopback setup, the "bring your own networking" story, pointers to godot-iroh and HLMP as next steps, and the intended shared-send/per-talker-receive architecture.
+10. **iroh full-mesh example**: after the corrected local loopback path is solid, add a focused example that fans one shared local encoded packet stream out over iroh datagrams to a small direct peer-to-peer mesh. This is the first concrete post-v0 networking milestone, ahead of any HLMP helper.
+11. **Heavier evaluation sweep**: before calling the receive path solid, run the broader offline corpus + impairment matrix from the automated-evaluation section and review both objective metrics and a small listening canary set.
 
 Past v0: HLMP router helper, iroh example, rnnoise, mute/deafen, tag/team routing, convenience "drop one node" wrapper. Order depends on what falls out of actually integrating HLMP and iroh with the v0 primitives.
 
