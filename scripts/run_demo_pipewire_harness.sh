@@ -100,29 +100,17 @@ ffmpeg -hide_banner -loglevel error -nostdin \
   >"$OUTPUT_DIR/input_player.log" 2>&1 &
 PLAYER_PID=$!
 
-if command -v pw-record >/dev/null 2>&1; then
-  pw-record --target "$INPUT_SINK.monitor" --latency 20ms "$INPUT_CAPTURE_WAV" \
-    >"$OUTPUT_DIR/input_capture.log" 2>&1 &
-  INPUT_RECORDER_PID=$!
-else
-  ffmpeg -hide_banner -loglevel error -nostdin -y \
-    -f pulse -i "$INPUT_SINK.monitor" -t "$RUN_SECONDS" \
-    -ac 2 -ar 48000 "$INPUT_CAPTURE_WAV" \
-    >"$OUTPUT_DIR/input_capture.log" 2>&1 &
-  INPUT_RECORDER_PID=$!
-fi
+ffmpeg -hide_banner -loglevel error -nostdin -y \
+  -f pulse -i "$INPUT_SINK.monitor" -t "$RUN_SECONDS" \
+  -ac 2 -ar 48000 "$INPUT_CAPTURE_WAV" \
+  >"$OUTPUT_DIR/input_capture.log" 2>&1 &
+INPUT_RECORDER_PID=$!
 
-if command -v pw-record >/dev/null 2>&1; then
-  pw-record --target "$OUTPUT_SINK.monitor" --latency 20ms "$OUTPUT_CAPTURE_WAV" \
-    >"$OUTPUT_DIR/output_capture.log" 2>&1 &
-  RECORDER_PID=$!
-else
-  ffmpeg -hide_banner -loglevel error -nostdin -y \
-    -f pulse -i "$OUTPUT_SINK.monitor" -t "$RUN_SECONDS" \
-    -ac 2 -ar 48000 "$OUTPUT_CAPTURE_WAV" \
-    >"$OUTPUT_DIR/output_capture.log" 2>&1 &
-  RECORDER_PID=$!
-fi
+ffmpeg -hide_banner -loglevel error -nostdin -y \
+  -f pulse -i "$OUTPUT_SINK.monitor" -t "$RUN_SECONDS" \
+  -ac 2 -ar 48000 "$OUTPUT_CAPTURE_WAV" \
+  >"$OUTPUT_DIR/output_capture.log" 2>&1 &
+RECORDER_PID=$!
 
 sleep 0.5
 
