@@ -7,6 +7,7 @@ use crossbeam_queue::ArrayQueue;
 use godot::builtin::{GString, PackedByteArray, VarDictionary};
 use godot::classes::native::AudioFrame;
 use godot::classes::{AudioStream, AudioStreamPlayback, IAudioStream, IAudioStreamPlayback};
+use godot::meta::conv::RawPtr;
 use godot::obj::Gd;
 use godot::prelude::*;
 use voice_core::{PacketArrival, ReceiverStats, VoicePacket, VoiceReceiver};
@@ -289,7 +290,13 @@ impl IAudioStreamPlayback for AudioStreamNetworkPlayback {
         self.playback_position_frames as f64 / RECEIVER_SAMPLE_RATE_HZ as f64
     }
 
-    unsafe fn mix_rawptr(&mut self, buffer: *mut AudioFrame, _rate_scale: f32, frames: i32) -> i32 {
+    unsafe fn mix_rawptr(
+        &mut self,
+        buffer: RawPtr<*mut AudioFrame>,
+        _rate_scale: f32,
+        frames: i32,
+    ) -> i32 {
+        let buffer = buffer.ptr();
         if buffer.is_null() || frames <= 0 {
             return 0;
         }

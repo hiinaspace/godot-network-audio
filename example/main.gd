@@ -18,9 +18,7 @@ var phase := 0.0
 var total_generated_frames := 0
 var send_accumulator := 0.0
 var input_mode := INPUT_MODE_MICROPHONE
-var microphone_frame_budget := FRAME_SAMPLES
 var synthetic_fallback_seconds := 0.75
-var microphone_seen_frames := false
 var demo_start_msec := 0
 var prebuffer_remaining_packets := STARTUP_PREBUFFER_PACKETS
 var selected_input_device := ""
@@ -41,8 +39,6 @@ func _ready() -> void:
 	print("demo: input devices=", AudioServer.get_input_device_list())
 	_select_output_device()
 	_select_input_device()
-	var input_active_result := AudioServer.set_input_device_active(true)
-	print("demo: input active result=", input_active_result)
 
 	sender = ClassDB.instantiate("NetworkAudioSender")
 	stream = ClassDB.instantiate("AudioStreamNetwork")
@@ -52,6 +48,8 @@ func _ready() -> void:
 
 	sender.name = "Sender"
 	sender.input_sample_rate_hz = int(AudioServer.get_mix_rate())
+	sender.capture_audio_server_input = true
+	sender.microphone_frame_budget = FRAME_SAMPLES
 	add_child(sender)
 
 	player = AudioStreamPlayer.new()
@@ -87,9 +85,9 @@ func _ready() -> void:
 
 func _process(delta: float) -> void:
 	if input_mode == INPUT_MODE_MICROPHONE:
-		_pump_microphone()
 		var elapsed_msec := Time.get_ticks_msec() - demo_start_msec
-		if allow_synthetic_fallback and not microphone_seen_frames and elapsed_msec >= int(synthetic_fallback_seconds * 1000.0):
+		if allow_synthetic_fallback and sender.get_captured_input_frames() <= 0 and elapsed_msec >= int(synthetic_fallback_seconds * 1000.0):
+			sender.capture_audio_server_input = false
 			input_mode = INPUT_MODE_SYNTHETIC
 			print("demo: microphone fallback -> synthetic")
 	else:
@@ -114,31 +112,9 @@ func _push_synthetic_frame() -> void:
 	_push_samples(samples)
 
 
-func _pump_microphone() -> void:
-	var available: int = AudioServer.get_input_frames_available()
-	if available <= 0:
-		return
-
-	microphone_seen_frames = true
-	while available > 0:
-		var chunk_frames: int = min(available, microphone_frame_budget)
-		var stereo_frames: PackedVector2Array = AudioServer.get_input_frames(chunk_frames)
-		if stereo_frames.is_empty():
-			return
-
-		var mono_samples := PackedFloat32Array()
-		mono_samples.resize(stereo_frames.size())
-		for i in stereo_frames.size():
-			var frame: Vector2 = stereo_frames[i]
-			mono_samples[i] = 0.5 * (frame.x + frame.y)
-		_push_samples(mono_samples)
-		available -= stereo_frames.size()
-
-
 func _push_samples(samples: PackedFloat32Array) -> void:
 	var emitted: int = sender.push_pcm_mono(samples)
 	total_generated_frames += 1
-	_maybe_start_playback()
 	if total_generated_frames <= 3:
 		print("demo: pushed samples=", samples.size(), " emitted packets=", emitted)
 
@@ -147,6 +123,8 @@ func _on_packet_ready(bytes: PackedByteArray) -> void:
 	var ok: bool = stream.push_packet(bytes)
 	if not ok:
 		push_error("demo: stream rejected packet bytes")
+		return
+	_maybe_start_playback()
 
 
 func _on_encoder_error(message: String) -> void:
@@ -164,7 +142,6 @@ func _shutdown_demo() -> void:
 		player.stop()
 	if is_instance_valid(stats_timer):
 		stats_timer.stop()
-	AudioServer.set_input_device_active(false)
 	get_tree().quit()
 
 

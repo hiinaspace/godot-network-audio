@@ -11,7 +11,7 @@ version = "0.1.0"
 anyhow = "1.0.100"
 audiopus = "0.3.0-rc.0"
 crossbeam-queue = "0.3.12"
-godot = { version = "0.4.5", features = ["experimental-threads"] }
+godot = { version = "0.5.0", features = ["api-4-6", "experimental-threads"] }
 hound = "3.5.1"
 neteq = "=0.8.3"
 thiserror = "2.0.17"
