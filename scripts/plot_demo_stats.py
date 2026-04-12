@@ -45,11 +45,18 @@ def parse_log(path: Path) -> list[dict]:
 
 def parse_trace_jsonl(path: Path) -> list[dict]:
     rows = []
-    for line in path.read_text().splitlines():
+    lines = path.read_text().splitlines()
+    for line_no, line in enumerate(lines, start=1):
         line = line.strip()
         if not line:
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            # Harness shutdown may truncate the last line if Godot is terminated mid-write.
+            if line_no == len(lines):
+                break
+            raise
         rows.append(
             {
                 "t_sec": max(0.0, row.get("mono_usec", 0)) / 1_000_000.0,

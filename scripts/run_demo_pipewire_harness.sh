@@ -29,6 +29,7 @@ OUTPUT_MODULE_ID=""
 PLAYER_PID=""
 RECORDER_PID=""
 INPUT_RECORDER_PID=""
+GODOT_PID=""
 ORIGINAL_DEFAULT_SINK=""
 ORIGINAL_DEFAULT_SOURCE=""
 
@@ -54,6 +55,7 @@ cleanup() {
   kill_pid "$PLAYER_PID"
   kill_pid "$RECORDER_PID"
   kill_pid "$INPUT_RECORDER_PID"
+  kill_pid "$GODOT_PID"
   if [[ -n "$ORIGINAL_DEFAULT_SINK" ]]; then
     pactl set-default-sink "$ORIGINAL_DEFAULT_SINK" 2>/dev/null || true
   fi
@@ -132,7 +134,6 @@ else
   GODOT_BIN="$HOME/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64"
 fi
 
-set +e
 PULSE_SOURCE="$INPUT_SOURCE" \
 PULSE_SINK="$OUTPUT_SINK" \
 GNA_DEMO_INPUT_DEVICE="$INPUT_SOURCE" \
@@ -140,13 +141,33 @@ GNA_DEMO_OUTPUT_DEVICE="$OUTPUT_SINK" \
 GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$RUN_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$TRACE_JSONL_PATH" \
-timeout --signal=TERM --kill-after=5s "$((RUN_SECONDS + GODOT_GRACE_SECONDS))" \
   "$GODOT_BIN" --path "$ROOT_DIR/example" --scene res://main.tscn --verbose \
-  >"$LOG_PATH" 2>&1
+  >"$LOG_PATH" 2>&1 &
+GODOT_PID=$!
+
+sleep "$RUN_SECONDS"
+
+GODOT_STATUS=0
+if kill -0 "$GODOT_PID" 2>/dev/null; then
+  kill "$GODOT_PID" 2>/dev/null || true
+  for _ in $(seq 1 $((GODOT_GRACE_SECONDS * 10))); do
+    if ! kill -0 "$GODOT_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if kill -0 "$GODOT_PID" 2>/dev/null; then
+    kill -9 "$GODOT_PID" 2>/dev/null || true
+  fi
+fi
+
+set +e
+wait "$GODOT_PID"
 GODOT_STATUS=$?
 set -e
+GODOT_PID=""
 
-if [[ "$GODOT_STATUS" -ne 0 && "$GODOT_STATUS" -ne 124 && "$GODOT_STATUS" -ne 143 ]]; then
+if [[ "$GODOT_STATUS" -ne 0 && "$GODOT_STATUS" -ne 143 && "$GODOT_STATUS" -ne 137 ]]; then
   echo "godot exited with status $GODOT_STATUS" >&2
   exit "$GODOT_STATUS"
 fi
