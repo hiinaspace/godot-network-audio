@@ -310,8 +310,7 @@ pub fn linear_resample_mono(input: &[f32], input_rate: u32, output_rate: u32) ->
         return input.to_vec();
     }
 
-    let out_len =
-        ((input.len() as u64 * output_rate as u64) + input_rate as u64 - 1) / input_rate as u64;
+    let out_len = (input.len() as u64 * output_rate as u64).div_ceil(input_rate as u64);
     let out_len = out_len as usize;
     let ratio = input_rate as f64 / output_rate as f64;
     let mut out = Vec::with_capacity(out_len);

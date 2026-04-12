@@ -1,0 +1,13 @@
+[package]
+name = "godot_network_audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crossbeam-queue.workspace = true
+godot.workspace = true
+voice-core = { path = "../voice-core" }
