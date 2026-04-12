@@ -5,7 +5,7 @@ const FRAME_SAMPLES := 960
 const FRAME_SECONDS := float(FRAME_SAMPLES) / float(SAMPLE_RATE)
 const INPUT_MODE_MICROPHONE := "microphone"
 const INPUT_MODE_SYNTHETIC := "synthetic"
-const STARTUP_PREBUFFER_PACKETS := 0
+const STARTUP_PREBUFFER_PACKETS := 4
 const DEFAULT_QUIT_SECONDS := 4.0
 
 var sender
@@ -20,7 +20,7 @@ var send_accumulator := 0.0
 var input_mode := INPUT_MODE_MICROPHONE
 var synthetic_fallback_seconds := 0.75
 var demo_start_msec := 0
-var prebuffer_remaining_packets := STARTUP_PREBUFFER_PACKETS
+var startup_prebuffer_packets := STARTUP_PREBUFFER_PACKETS
 var selected_input_device := ""
 var selected_output_device := ""
 var allow_synthetic_fallback := true
@@ -256,10 +256,8 @@ func _maybe_start_playback() -> void:
 		return
 	if player.playing:
 		return
-	if prebuffer_remaining_packets > 0:
-		prebuffer_remaining_packets -= 1
-		if prebuffer_remaining_packets > 0:
-			return
+	if stream.queued_packet_count() < startup_prebuffer_packets:
+		return
 	player.play()
 	print("demo: playback started after prebuffer, queued_packets=", stream.queued_packet_count())
 
@@ -282,3 +280,6 @@ func _load_env_config() -> void:
 	var dtx_env := OS.get_environment("GNA_DEMO_ENABLE_DTX").to_lower()
 	if dtx_env in ["0", "false", "no"]:
 		enable_dtx = false
+	var prebuffer_env := OS.get_environment("GNA_DEMO_STARTUP_PREBUFFER_PACKETS")
+	if prebuffer_env != "":
+		startup_prebuffer_packets = max(0, prebuffer_env.to_int())
