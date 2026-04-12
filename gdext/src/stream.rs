@@ -29,6 +29,11 @@ struct QueuedPacket {
     arrival: PacketArrival,
 }
 
+#[derive(Clone)]
+pub(crate) struct LoopbackTarget {
+    shared: Arc<SharedStreamState>,
+}
+
 #[derive(Debug)]
 struct SharedStreamState {
     queue: ArrayQueue<QueuedPacket>,
@@ -149,6 +154,43 @@ impl SharedStreamState {
             .store(stats.consecutive_failures, Ordering::Relaxed);
         self.intentional_silence
             .store(stats.intentional_silence, Ordering::Relaxed);
+    }
+
+    fn enqueue_packet(&self, packet: VoicePacket, arrival: PacketArrival) -> bool {
+        let now_us = self.now_mono_us();
+        let last_enqueue_us = self.last_enqueue_us.swap(now_us, Ordering::Relaxed);
+        if last_enqueue_us != 0 {
+            let interval_us = now_us.saturating_sub(last_enqueue_us);
+            self.enqueue_interval_count.fetch_add(1, Ordering::Relaxed);
+            self.enqueue_interval_sum_us
+                .fetch_add(interval_us, Ordering::Relaxed);
+            let _ = self.enqueue_interval_max_us.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.max(interval_us)),
+            );
+        }
+        self.enqueued_packets.fetch_add(1, Ordering::Relaxed);
+        let queued = QueuedPacket { packet, arrival };
+        match self.queue.push(queued) {
+            Ok(()) => true,
+            Err(queued) => {
+                let _ = self.queue.pop();
+                self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.queue.push(queued).is_ok()
+            }
+        }
+    }
+}
+
+impl LoopbackTarget {
+    pub(crate) fn enqueue_now(&self, packet: VoicePacket) -> bool {
+        self.shared.enqueue_packet(
+            packet,
+            PacketArrival {
+                received_at_mono_us: self.shared.now_mono_us(),
+            },
+        )
     }
 }
 
@@ -347,31 +389,12 @@ impl AudioStreamNetwork {
 
 impl AudioStreamNetwork {
     fn enqueue_packet(&mut self, packet: VoicePacket, arrival: PacketArrival) -> bool {
-        let now_us = self.shared.now_mono_us();
-        let last_enqueue_us = self.shared.last_enqueue_us.swap(now_us, Ordering::Relaxed);
-        if last_enqueue_us != 0 {
-            let interval_us = now_us.saturating_sub(last_enqueue_us);
-            self.shared
-                .enqueue_interval_count
-                .fetch_add(1, Ordering::Relaxed);
-            self.shared
-                .enqueue_interval_sum_us
-                .fetch_add(interval_us, Ordering::Relaxed);
-            let _ = self.shared.enqueue_interval_max_us.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.max(interval_us)),
-            );
-        }
-        self.shared.enqueued_packets.fetch_add(1, Ordering::Relaxed);
-        let queued = QueuedPacket { packet, arrival };
-        match self.shared.queue.push(queued) {
-            Ok(()) => true,
-            Err(queued) => {
-                let _ = self.shared.queue.pop();
-                self.shared.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                self.shared.queue.push(queued).is_ok()
-            }
+        self.shared.enqueue_packet(packet, arrival)
+    }
+
+    pub(crate) fn loopback_target(&self) -> LoopbackTarget {
+        LoopbackTarget {
+            shared: Arc::clone(&self.shared),
         }
     }
 }

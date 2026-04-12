@@ -68,7 +68,10 @@ func _ready() -> void:
 	player.autoplay = false
 	add_child(player)
 
-	sender.packet_ready.connect(_on_packet_ready)
+	if sender.has_method("connect_loopback_stream"):
+		sender.connect_loopback_stream(stream)
+	else:
+		sender.packet_ready.connect(_on_packet_ready)
 	sender.encoder_error.connect(_on_encoder_error)
 
 	stats_timer = Timer.new()
@@ -163,7 +166,9 @@ func _shutdown_demo() -> void:
 		stats_timer.stop()
 	# Disconnect before stopping playback so no in-flight packet_ready fires
 	# into a partially-torn-down stream.
-	if is_instance_valid(sender):
+	if is_instance_valid(sender) and sender.has_method("disconnect_loopback_stream"):
+		sender.disconnect_loopback_stream()
+	elif is_instance_valid(sender):
 		sender.packet_ready.disconnect(_on_packet_ready)
 	if is_instance_valid(player):
 		player.stop()

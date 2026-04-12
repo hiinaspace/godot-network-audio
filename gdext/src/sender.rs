@@ -10,6 +10,7 @@ use std::time::Instant;
 use voice_core::{PacketFlags, VoiceEncoder, VoiceEncoderConfig};
 
 use crate::packet_bytes::encode_packet_bytes;
+use crate::stream::{AudioStreamNetwork, LoopbackTarget};
 
 const DEFAULT_MICROPHONE_FRAME_BUDGET: i32 = 960;
 /// Target inter-packet interval for paced emission, in microseconds.
@@ -99,6 +100,7 @@ pub struct NetworkAudioSender {
     #[export]
     microphone_frame_budget: i32,
     sender: Option<LocalSendPipeline>,
+    loopback_target: Option<LoopbackTarget>,
     last_speaking: bool,
     last_error: GString,
     captured_input_frames: i64,
@@ -140,6 +142,7 @@ impl INode for NetworkAudioSender {
             capture_audio_server_input: false,
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
             sender: None,
+            loopback_target: None,
             last_speaking: false,
             last_error: GString::new(),
             captured_input_frames: 0,
@@ -214,6 +217,19 @@ impl NetworkAudioSender {
     #[func]
     fn push_pcm_mono(&mut self, samples: PackedFloat32Array) -> i32 {
         self.push_pcm_slice(&samples.to_vec())
+    }
+
+    #[func]
+    fn connect_loopback_stream(&mut self, stream: Gd<AudioStreamNetwork>) {
+        let target = stream.bind().loopback_target();
+        self.loopback_target = Some(target);
+        self.rebuild_encoder();
+    }
+
+    #[func]
+    fn disconnect_loopback_stream(&mut self) {
+        self.loopback_target = None;
+        self.rebuild_encoder();
     }
 
     #[func]
@@ -424,7 +440,7 @@ impl NetworkAudioSender {
             denoise: self.denoise,
         };
 
-        match LocalSendPipeline::new(config) {
+        match LocalSendPipeline::new(config, self.loopback_target.clone()) {
             Ok(sender) => {
                 self.sender = Some(sender);
                 self.last_error = GString::new();
@@ -559,13 +575,16 @@ impl NetworkAudioSender {
 }
 
 impl LocalSendPipeline {
-    fn new(config: VoiceEncoderConfig) -> anyhow::Result<Self> {
+    fn new(
+        config: VoiceEncoderConfig,
+        loopback_target: Option<LoopbackTarget>,
+    ) -> anyhow::Result<Self> {
         let state = Arc::new(PipelineState::new());
         let thread_state = Arc::clone(&state);
 
         let handle = thread::Builder::new()
             .name("gna-send-pacer".to_string())
-            .spawn(move || worker_loop(thread_state, config))?;
+            .spawn(move || worker_loop(thread_state, config, loopback_target))?;
 
         Ok(Self {
             state,
@@ -664,7 +683,11 @@ impl Drop for LocalSendPipeline {
     }
 }
 
-fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
+fn worker_loop(
+    state: Arc<PipelineState>,
+    config: VoiceEncoderConfig,
+    loopback_target: Option<LoopbackTarget>,
+) {
     let mut encoder = match VoiceEncoder::new(config) {
         Ok(encoder) => encoder,
         Err(err) => {
@@ -739,6 +762,9 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
                             !packet.flags.contains(PacketFlags::END_OF_TALKSPURT),
                             Ordering::Relaxed,
                         );
+                        if let Some(target) = loopback_target.as_ref() {
+                            let _ = target.enqueue_now(packet.clone());
+                        }
                         let bytes = encode_packet_bytes(&packet).to_vec();
                         let mut guard = state.queues.lock().expect("worker queue mutex poisoned");
                         if guard.encoded_packets.len() >= MAX_PENDING_PACKETS {

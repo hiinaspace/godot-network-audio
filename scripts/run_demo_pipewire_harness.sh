@@ -92,6 +92,7 @@ OUTPUT_CAPTURE_WAV="$OUTPUT_DIR/output_godot_sink.wav"
 LOG_PATH="$OUTPUT_DIR/godot_demo.log"
 TRACE_JSONL_PATH="$OUTPUT_DIR/demo_trace.jsonl"
 STATS_PNG_PATH="$OUTPUT_DIR/demo_stats.png"
+IO_SPECTROGRAM_PNG_PATH="$OUTPUT_DIR/demo_io_spectrograms.png"
 
 ffmpeg -hide_banner -loglevel error -nostdin \
   -stream_loop -1 -re -i "$INPUT_WAV" \
@@ -179,4 +180,18 @@ elif [[ -f "$LOG_PATH" ]]; then
   uv run "$ROOT_DIR/scripts/plot_demo_stats.py" "$LOG_PATH" "$STATS_PNG_PATH" >/dev/null
 fi
 
-printf '%s\n' "$INPUT_CAPTURE_WAV" "$OUTPUT_CAPTURE_WAV" "$LOG_PATH" "$TRACE_JSONL_PATH" "$STATS_PNG_PATH"
+if [[ -f "$INPUT_CAPTURE_WAV" && -f "$OUTPUT_CAPTURE_WAV" ]]; then
+  uv run "$ROOT_DIR/scripts/plot_demo_io_spectrograms.py" \
+    "$INPUT_CAPTURE_WAV" \
+    "$OUTPUT_CAPTURE_WAV" \
+    "$IO_SPECTROGRAM_PNG_PATH" \
+    >/dev/null
+fi
+
+printf '%s\n' \
+  "$INPUT_CAPTURE_WAV" \
+  "$OUTPUT_CAPTURE_WAV" \
+  "$LOG_PATH" \
+  "$TRACE_JSONL_PATH" \
+  "$STATS_PNG_PATH" \
+  "$IO_SPECTROGRAM_PNG_PATH"
