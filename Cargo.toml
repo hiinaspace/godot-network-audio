@@ -16,3 +16,6 @@ hound = "3.5.1"
 neteq = "=0.8.3"
 thiserror = "2.0.17"
 web-time = "1.1.0"
+
+[patch.crates-io]
+neteq = { path = "../../lib/videocall-rs/neteq" }

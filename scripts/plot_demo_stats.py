@@ -170,6 +170,13 @@ def main() -> int:
     accel_pct = [
         100.0 * row["r"].get("accelerate_rate", 0) / Q14_SCALE for row in rows
     ]
+    preemptive_pct = [
+        100.0 * row["r"].get("preemptive_rate", 0) / Q14_SCALE for row in rows
+    ]
+    expand_ops = [row["r"].get("expand_per_sec", 0.0) for row in rows]
+    accel_ops = [row["r"].get("accelerate_per_sec", 0.0) for row in rows]
+    preemptive_ops = [row["r"].get("preemptive_expand_per_sec", 0.0) for row in rows]
+    normal_ops = [row["r"].get("normal_per_sec", 0.0) for row in rows]
 
     target_ms = [row["r"].get("target_delay_ms", 0) for row in rows]
     buf_ms = [row["r"].get("current_buffer_size_ms", 0) for row in rows]
@@ -278,20 +285,33 @@ def main() -> int:
 
     # Panel 4: receiver NetEq rates (cumulative %)
     ax = axes[3]
-    ax.set_title(
-        "Receiver: NetEq operation rates (cumulative Q14 fractions, lower is better)"
-    )
+    ax.set_title("Receiver: NetEq rates and operation activity")
     ax.plot(t, expand_pct, color="#d62728", lw=2, marker="o", ms=4,
             label="expand_rate % (PLC / concealment)")
     ax.plot(t, accel_pct, color="darkorange", lw=2, marker="s", ms=4,
             label="accelerate_rate % (time-stretch drain)")
+    ax.plot(t, preemptive_pct, color="purple", lw=1.5, marker="^", ms=3,
+            label="preemptive_rate %")
     ax.set_ylabel("% of total output samples")
     ax.set_ylim(0, 105)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%g%%"))
-    ax.legend(fontsize=8)
+    ax2 = ax.twinx()
+    ax2.plot(t, expand_ops, color="#8b0000", lw=1.2, ls="--",
+             label="expand ops/sec")
+    ax2.plot(t, accel_ops, color="#ff8c00", lw=1.2, ls="--",
+             label="accelerate ops/sec")
+    ax2.plot(t, preemptive_ops, color="#4b0082", lw=1.2, ls="--",
+             label="preemptive ops/sec")
+    ax2.plot(t, normal_ops, color="#2e8b57", lw=1.2, ls=":",
+             label="normal ops/sec")
+    ax2.set_ylabel("operations / sec")
+    ax2.set_ylim(0)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right")
     ax.text(
         0.01, 0.97,
-        "Both are cumulative lifetime ratios — once PLC events accumulate they don't reset",
+        "Q14 rates are cumulative lifetime ratios; ops/sec is the more useful live signal",
         transform=ax.transAxes, fontsize=7, va="top", color="dimgray"
     )
 

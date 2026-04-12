@@ -38,8 +38,14 @@ struct SharedStreamState {
     target_delay_ms: AtomicU32,
     preferred_buffer_size_ms: AtomicU32,
     packets_awaiting_decode: AtomicU32,
+    packets_per_sec: AtomicU32,
     expand_rate: AtomicU32,
     accelerate_rate: AtomicU32,
+    preemptive_rate: AtomicU32,
+    expand_per_sec_milli: AtomicU32,
+    accelerate_per_sec_milli: AtomicU32,
+    preemptive_expand_per_sec_milli: AtomicU32,
+    normal_per_sec_milli: AtomicU32,
     concealed_samples: AtomicU64,
     consecutive_failures: AtomicU32,
     intentional_silence: AtomicBool,
@@ -56,8 +62,14 @@ impl SharedStreamState {
             target_delay_ms: AtomicU32::new(0),
             preferred_buffer_size_ms: AtomicU32::new(0),
             packets_awaiting_decode: AtomicU32::new(0),
+            packets_per_sec: AtomicU32::new(0),
             expand_rate: AtomicU32::new(0),
             accelerate_rate: AtomicU32::new(0),
+            preemptive_rate: AtomicU32::new(0),
+            expand_per_sec_milli: AtomicU32::new(0),
+            accelerate_per_sec_milli: AtomicU32::new(0),
+            preemptive_expand_per_sec_milli: AtomicU32::new(0),
+            normal_per_sec_milli: AtomicU32::new(0),
             concealed_samples: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             intentional_silence: AtomicBool::new(false),
@@ -74,8 +86,15 @@ impl SharedStreamState {
         self.target_delay_ms.store(0, Ordering::Relaxed);
         self.preferred_buffer_size_ms.store(0, Ordering::Relaxed);
         self.packets_awaiting_decode.store(0, Ordering::Relaxed);
+        self.packets_per_sec.store(0, Ordering::Relaxed);
         self.expand_rate.store(0, Ordering::Relaxed);
         self.accelerate_rate.store(0, Ordering::Relaxed);
+        self.preemptive_rate.store(0, Ordering::Relaxed);
+        self.expand_per_sec_milli.store(0, Ordering::Relaxed);
+        self.accelerate_per_sec_milli.store(0, Ordering::Relaxed);
+        self.preemptive_expand_per_sec_milli
+            .store(0, Ordering::Relaxed);
+        self.normal_per_sec_milli.store(0, Ordering::Relaxed);
         self.concealed_samples.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.intentional_silence.store(false, Ordering::Relaxed);
@@ -90,10 +109,30 @@ impl SharedStreamState {
             .store(stats.preferred_buffer_size_ms, Ordering::Relaxed);
         self.packets_awaiting_decode
             .store(stats.packets_awaiting_decode as u32, Ordering::Relaxed);
+        self.packets_per_sec
+            .store(stats.packets_per_sec, Ordering::Relaxed);
         self.expand_rate
             .store(stats.expand_rate as u32, Ordering::Relaxed);
         self.accelerate_rate
             .store(stats.accelerate_rate as u32, Ordering::Relaxed);
+        self.preemptive_rate
+            .store(stats.preemptive_rate as u32, Ordering::Relaxed);
+        self.expand_per_sec_milli.store(
+            (stats.expand_per_sec * 1000.0).round().max(0.0) as u32,
+            Ordering::Relaxed,
+        );
+        self.accelerate_per_sec_milli.store(
+            (stats.accelerate_per_sec * 1000.0).round().max(0.0) as u32,
+            Ordering::Relaxed,
+        );
+        self.preemptive_expand_per_sec_milli.store(
+            (stats.preemptive_expand_per_sec * 1000.0).round().max(0.0) as u32,
+            Ordering::Relaxed,
+        );
+        self.normal_per_sec_milli.store(
+            (stats.normal_per_sec * 1000.0).round().max(0.0) as u32,
+            Ordering::Relaxed,
+        );
         self.concealed_samples
             .store(stats.concealed_samples, Ordering::Relaxed);
         self.consecutive_failures
@@ -220,12 +259,39 @@ impl AudioStreamNetwork {
             self.shared.packets_awaiting_decode.load(Ordering::Relaxed) as i64,
         );
         dict.set(
+            "packets_per_sec",
+            self.shared.packets_per_sec.load(Ordering::Relaxed),
+        );
+        dict.set(
             "expand_rate",
             self.shared.expand_rate.load(Ordering::Relaxed),
         );
         dict.set(
             "accelerate_rate",
             self.shared.accelerate_rate.load(Ordering::Relaxed),
+        );
+        dict.set(
+            "preemptive_rate",
+            self.shared.preemptive_rate.load(Ordering::Relaxed),
+        );
+        dict.set(
+            "expand_per_sec",
+            self.shared.expand_per_sec_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        );
+        dict.set(
+            "accelerate_per_sec",
+            self.shared.accelerate_per_sec_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        );
+        dict.set(
+            "preemptive_expand_per_sec",
+            self.shared
+                .preemptive_expand_per_sec_milli
+                .load(Ordering::Relaxed) as f64
+                / 1000.0,
+        );
+        dict.set(
+            "normal_per_sec",
+            self.shared.normal_per_sec_milli.load(Ordering::Relaxed) as f64 / 1000.0,
         );
         dict.set(
             "concealed_samples",
