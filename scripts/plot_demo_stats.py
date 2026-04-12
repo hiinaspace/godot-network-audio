@@ -156,6 +156,9 @@ def main() -> int:
     max_empty_poll_streak = [
         row["s"].get("max_empty_input_poll_streak", 0) for row in rows
     ]
+    avg_main_drain_ms = [row["s"].get("avg_main_drain_interval_ms", 0.0) for row in rows]
+    max_main_drain_ms = [row["s"].get("max_main_drain_interval_ms", 0.0) for row in rows]
+    max_drain_batch = [row["s"].get("max_drain_batch_packets", 0) for row in rows]
 
     # --- receiver series ---
     conc_cumul = [row["r"].get("concealed_samples", 0) for row in rows]
@@ -181,6 +184,8 @@ def main() -> int:
     target_ms = [row["r"].get("target_delay_ms", 0) for row in rows]
     buf_ms = [row["r"].get("current_buffer_size_ms", 0) for row in rows]
     preferred_ms = [row["r"].get("preferred_buffer_size_ms", 0) for row in rows]
+    avg_enqueue_ms = [row["r"].get("avg_enqueue_interval_ms", 0.0) for row in rows]
+    max_enqueue_ms = [row["r"].get("max_enqueue_interval_ms", 0.0) for row in rows]
 
     # ------------------------------------------------------------------ plot --
     fig, axes = plt.subplots(
@@ -269,6 +274,22 @@ def main() -> int:
     )
     ax2.plot(
         t,
+        avg_main_drain_ms,
+        color="darkorange",
+        lw=1.2,
+        ls="--",
+        label="avg main drain interval (ms)",
+    )
+    ax2.plot(
+        t,
+        max_main_drain_ms,
+        color="crimson",
+        lw=1.2,
+        ls=":",
+        label="max main drain interval (ms)",
+    )
+    ax2.plot(
+        t,
         max_empty_poll_streak,
         color="purple",
         lw=1.2,
@@ -276,6 +297,14 @@ def main() -> int:
         marker="^",
         ms=3,
         label="max empty poll streak",
+    )
+    ax2.plot(
+        t,
+        max_drain_batch,
+        color="gray",
+        lw=1.0,
+        ls="-.",
+        label="max drain batch packets",
     )
     ax2.set_ylabel("ms / polls")
     ax2.set_ylim(0)
@@ -327,10 +356,19 @@ def main() -> int:
     ax.plot(t, conc_rate_ms,
             color="red", lw=1, ls="-.", marker="x", ms=5,
             label="concealment ms/sec")
+    ax2 = ax.twinx()
+    ax2.plot(t, avg_enqueue_ms, color="darkgreen", lw=1.2, ls="--",
+             label="avg enqueue interval (ms)")
+    ax2.plot(t, max_enqueue_ms, color="forestgreen", lw=1.2, ls=":",
+             label="max enqueue interval (ms)")
     ax.set_ylabel("milliseconds")
     ax.set_xlabel("seconds into run")
     ax.set_ylim(0)
-    ax.legend(fontsize=8)
+    ax2.set_ylabel("enqueue ms")
+    ax2.set_ylim(0)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8)
 
     # summary annotation
     total_conc_s = conc_cumul[-1] / 48_000.0

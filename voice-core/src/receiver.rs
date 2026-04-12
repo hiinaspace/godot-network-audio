@@ -7,6 +7,8 @@ use crate::packet::{PacketArrival, VoicePacket};
 
 const PAYLOAD_TYPE_OPUS: u8 = 96;
 const SSRC_FIXED: u32 = 0x474e_6175;
+const OUTPUT_FRAME_MS: u32 = 10;
+const TALKSPURT_RESUME_PREBUFFER_PACKETS: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReceiverStats {
@@ -36,6 +38,8 @@ pub struct VoiceReceiver {
     sticky_error: Option<String>,
     pending_silence: bool,
     intentional_silence: bool,
+    resuming_talkspurt: bool,
+    resumed_packet_count: u32,
 }
 
 impl VoiceReceiver {
@@ -69,6 +73,8 @@ impl VoiceReceiver {
             sticky_error: None,
             pending_silence: false,
             intentional_silence: false,
+            resuming_talkspurt: false,
+            resumed_packet_count: 0,
         })
     }
 
@@ -99,6 +105,8 @@ impl VoiceReceiver {
             self.inner.flush();
             self.pending_silence = false;
             self.intentional_silence = false;
+            self.resuming_talkspurt = true;
+            self.resumed_packet_count = 0;
         }
 
         if pkt
@@ -121,6 +129,9 @@ impl VoiceReceiver {
             self.record_failure(format!("insert_packet: {err}"));
             Error::from(err)
         })?;
+        if self.resuming_talkspurt {
+            self.resumed_packet_count = self.resumed_packet_count.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -128,7 +139,8 @@ impl VoiceReceiver {
     pub fn pull_frame(&mut self, out: &mut [f32]) {
         if self.pending_silence {
             let stats = self.inner.get_statistics();
-            if stats.current_buffer_size_ms == 0 && stats.packets_awaiting_decode == 0 {
+            if stats.current_buffer_size_ms <= OUTPUT_FRAME_MS && stats.packets_awaiting_decode == 0
+            {
                 self.pending_silence = false;
                 self.intentional_silence = true;
             }
@@ -138,6 +150,15 @@ impl VoiceReceiver {
             out.fill(0.0);
             self.consecutive_failures = 0;
             return;
+        }
+
+        if self.resuming_talkspurt {
+            if self.resumed_packet_count < TALKSPURT_RESUME_PREBUFFER_PACKETS {
+                out.fill(0.0);
+                self.consecutive_failures = 0;
+                return;
+            }
+            self.resuming_talkspurt = false;
         }
 
         match self.inner.get_audio() {

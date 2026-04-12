@@ -34,6 +34,11 @@ struct SharedStreamState {
     queue: ArrayQueue<QueuedPacket>,
     mono_epoch: Instant,
     dropped_packets: AtomicU64,
+    enqueued_packets: AtomicU64,
+    last_enqueue_us: AtomicU64,
+    enqueue_interval_count: AtomicU64,
+    enqueue_interval_sum_us: AtomicU64,
+    enqueue_interval_max_us: AtomicU64,
     current_buffer_size_ms: AtomicU32,
     target_delay_ms: AtomicU32,
     preferred_buffer_size_ms: AtomicU32,
@@ -58,6 +63,11 @@ impl SharedStreamState {
             queue: ArrayQueue::new(DEFAULT_QUEUE_CAPACITY),
             mono_epoch: Instant::now(),
             dropped_packets: AtomicU64::new(0),
+            enqueued_packets: AtomicU64::new(0),
+            last_enqueue_us: AtomicU64::new(0),
+            enqueue_interval_count: AtomicU64::new(0),
+            enqueue_interval_sum_us: AtomicU64::new(0),
+            enqueue_interval_max_us: AtomicU64::new(0),
             current_buffer_size_ms: AtomicU32::new(0),
             target_delay_ms: AtomicU32::new(0),
             preferred_buffer_size_ms: AtomicU32::new(0),
@@ -259,6 +269,25 @@ impl AudioStreamNetwork {
             self.shared.packets_awaiting_decode.load(Ordering::Relaxed) as i64,
         );
         dict.set(
+            "enqueued_packets",
+            self.shared.enqueued_packets.load(Ordering::Relaxed) as i64,
+        );
+        let enqueue_count = self.shared.enqueue_interval_count.load(Ordering::Relaxed);
+        dict.set(
+            "avg_enqueue_interval_ms",
+            if enqueue_count > 0 {
+                self.shared.enqueue_interval_sum_us.load(Ordering::Relaxed) as f64
+                    / enqueue_count as f64
+                    / 1000.0
+            } else {
+                0.0
+            },
+        );
+        dict.set(
+            "max_enqueue_interval_ms",
+            self.shared.enqueue_interval_max_us.load(Ordering::Relaxed) as f64 / 1000.0,
+        );
+        dict.set(
             "packets_per_sec",
             self.shared.packets_per_sec.load(Ordering::Relaxed),
         );
@@ -318,6 +347,23 @@ impl AudioStreamNetwork {
 
 impl AudioStreamNetwork {
     fn enqueue_packet(&mut self, packet: VoicePacket, arrival: PacketArrival) -> bool {
+        let now_us = self.shared.now_mono_us();
+        let last_enqueue_us = self.shared.last_enqueue_us.swap(now_us, Ordering::Relaxed);
+        if last_enqueue_us != 0 {
+            let interval_us = now_us.saturating_sub(last_enqueue_us);
+            self.shared
+                .enqueue_interval_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .enqueue_interval_sum_us
+                .fetch_add(interval_us, Ordering::Relaxed);
+            let _ = self.shared.enqueue_interval_max_us.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.max(interval_us)),
+            );
+        }
+        self.shared.enqueued_packets.fetch_add(1, Ordering::Relaxed);
         let queued = QueuedPacket { packet, arrival };
         match self.shared.queue.push(queued) {
             Ok(()) => true,
@@ -433,15 +479,22 @@ impl AudioStreamNetworkPlayback {
     }
 
     fn fill_output_frames(&mut self, out: &mut [AudioFrame]) {
-        let Some(receiver) = self.receiver.as_mut() else {
+        if self.receiver.is_none() {
             return;
-        };
+        }
 
         let mut written = 0;
         while written < out.len() {
             if self.pending_cursor >= self.pending_mono.len() {
+                // Poll the cross-thread ingress queue again before each 10 ms pull so
+                // packets that arrive mid-callback are visible to NetEq immediately.
+                self.drain_packets_into_receiver();
                 self.pending_mono.resize(RECEIVER_FRAME_SAMPLES, 0.0);
-                receiver.pull_frame(&mut self.pending_mono);
+                if let Some(receiver) = self.receiver.as_mut() {
+                    receiver.pull_frame(&mut self.pending_mono);
+                } else {
+                    break;
+                }
                 self.pending_cursor = 0;
             }
 

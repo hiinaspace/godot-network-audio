@@ -116,6 +116,12 @@ pub struct NetworkAudioSender {
     capture_pull_interval_max_us: u64,
     current_empty_input_poll_streak: i64,
     max_empty_input_poll_streak: i64,
+    last_drain_nonempty_us: u64,
+    drain_nonempty_count: i64,
+    drain_nonempty_interval_sum_us: u64,
+    drain_nonempty_interval_max_us: u64,
+    max_drain_batch_packets: i64,
+    last_drain_batch_packets: i64,
     packets_sent: i64,
     worker_pcm_dropped: i64,
     worker_packets_dropped: i64,
@@ -151,6 +157,12 @@ impl INode for NetworkAudioSender {
             capture_pull_interval_max_us: 0,
             current_empty_input_poll_streak: 0,
             max_empty_input_poll_streak: 0,
+            last_drain_nonempty_us: 0,
+            drain_nonempty_count: 0,
+            drain_nonempty_interval_sum_us: 0,
+            drain_nonempty_interval_max_us: 0,
+            max_drain_batch_packets: 0,
+            last_drain_batch_packets: 0,
             packets_sent: 0,
             worker_pcm_dropped: 0,
             worker_packets_dropped: 0,
@@ -285,6 +297,22 @@ impl NetworkAudioSender {
             "max_empty_input_poll_streak",
             self.max_empty_input_poll_streak,
         );
+        dict.set(
+            "avg_main_drain_interval_ms",
+            if self.drain_nonempty_count > 0 {
+                self.drain_nonempty_interval_sum_us as f64
+                    / self.drain_nonempty_count as f64
+                    / 1000.0
+            } else {
+                0.0
+            },
+        );
+        dict.set(
+            "max_main_drain_interval_ms",
+            self.drain_nonempty_interval_max_us as f64 / 1000.0,
+        );
+        dict.set("max_drain_batch_packets", self.max_drain_batch_packets);
+        dict.set("last_drain_batch_packets", self.last_drain_batch_packets);
         dict.set(
             "capture_audio_server_input",
             self.capture_audio_server_input,
@@ -479,6 +507,21 @@ impl NetworkAudioSender {
         let mut packets = Vec::new();
         while let Some(packet_bytes) = sender.pop_encoded_packet() {
             packets.push(packet_bytes);
+        }
+        self.last_drain_batch_packets = packets.len() as i64;
+        self.max_drain_batch_packets = self
+            .max_drain_batch_packets
+            .max(self.last_drain_batch_packets);
+        if !packets.is_empty() {
+            let now_us = self.clock_origin.elapsed().as_micros() as u64;
+            if self.last_drain_nonempty_us != 0 {
+                let interval_us = now_us.saturating_sub(self.last_drain_nonempty_us);
+                self.drain_nonempty_count += 1;
+                self.drain_nonempty_interval_sum_us += interval_us;
+                self.drain_nonempty_interval_max_us =
+                    self.drain_nonempty_interval_max_us.max(interval_us);
+            }
+            self.last_drain_nonempty_us = now_us;
         }
         let speaking = sender.is_speaking();
         let last_error = sender.take_last_error();
