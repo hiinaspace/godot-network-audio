@@ -19,6 +19,7 @@ pub struct ReceiverStats {
     pub concealed_samples: u64,
     pub consecutive_failures: u32,
     pub sticky_error: Option<String>,
+    pub intentional_silence: bool,
 }
 
 pub struct VoiceReceiver {
@@ -27,6 +28,8 @@ pub struct VoiceReceiver {
     channels: u8,
     consecutive_failures: u32,
     sticky_error: Option<String>,
+    pending_silence: bool,
+    intentional_silence: bool,
 }
 
 impl VoiceReceiver {
@@ -58,6 +61,8 @@ impl VoiceReceiver {
             channels,
             consecutive_failures: 0,
             sticky_error: None,
+            pending_silence: false,
+            intentional_silence: false,
         })
     }
 
@@ -80,6 +85,23 @@ impl VoiceReceiver {
         arrival: PacketArrival,
         simulated_now_mono_us: u64,
     ) -> Result<()> {
+        if pkt
+            .flags
+            .contains(crate::packet::PacketFlags::START_OF_TALKSPURT)
+            && (self.pending_silence || self.intentional_silence)
+        {
+            self.inner.flush();
+            self.pending_silence = false;
+            self.intentional_silence = false;
+        }
+
+        if pkt
+            .flags
+            .contains(crate::packet::PacketFlags::END_OF_TALKSPURT)
+        {
+            self.pending_silence = true;
+        }
+
         if pkt.payload.is_empty() {
             return Ok(());
         }
@@ -98,6 +120,20 @@ impl VoiceReceiver {
     }
 
     pub fn pull_frame(&mut self, out: &mut [f32]) {
+        if self.pending_silence {
+            let stats = self.inner.get_statistics();
+            if stats.current_buffer_size_ms == 0 && stats.packets_awaiting_decode == 0 {
+                self.pending_silence = false;
+                self.intentional_silence = true;
+            }
+        }
+
+        if self.intentional_silence {
+            out.fill(0.0);
+            self.consecutive_failures = 0;
+            return;
+        }
+
         match self.inner.get_audio() {
             Ok(frame) => {
                 self.consecutive_failures = 0;
@@ -124,6 +160,7 @@ impl VoiceReceiver {
             concealed_samples: stats.lifetime.concealed_samples,
             consecutive_failures: self.consecutive_failures,
             sticky_error: self.sticky_error.clone(),
+            intentional_silence: self.intentional_silence || self.pending_silence,
         }
     }
 
@@ -222,6 +259,71 @@ mod tests {
         assert!(stats.sticky_error.is_none());
         assert!(metrics.measured_frames > 0);
         assert!(metrics.measured_output_rms > 0.01);
+
+        Ok(())
+    }
+
+    #[test]
+    fn end_of_talkspurt_enters_intentional_silence() -> AnyResult<()> {
+        let mut encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+
+        encoder.push_pcm(&vec![0.1; ENCODE_FRAME_SAMPLES]);
+        let start_pkt = encoder.poll_packet()?.expect("expected voiced packet");
+        assert!(start_pkt
+            .flags
+            .contains(crate::packet::PacketFlags::START_OF_TALKSPURT));
+
+        let end_pkt = VoicePacket {
+            seq: start_pkt.seq.wrapping_add(1),
+            timestamp: start_pkt
+                .timestamp
+                .wrapping_add(ENCODE_FRAME_SAMPLES as u32),
+            flags: crate::packet::PacketFlags::from_bits(
+                crate::packet::PacketFlags::END_OF_TALKSPURT,
+            ),
+            payload: Vec::new(),
+        };
+        assert!(end_pkt.payload.is_empty());
+
+        receiver.push_packet(
+            start_pkt,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+        receiver.push_packet(
+            end_pkt,
+            PacketArrival {
+                received_at_mono_us: 20_000,
+            },
+        )?;
+
+        for _ in 0..12 {
+            let mut frame = vec![0.0; PULL_FRAME_SAMPLES];
+            receiver.pull_frame(&mut frame);
+            if receiver.stats().intentional_silence {
+                break;
+            }
+        }
+
+        let stats_before = receiver.stats();
+        assert!(stats_before.intentional_silence);
+        let concealed_before = stats_before.concealed_samples;
+
+        let mut silent_frame = vec![1.0; PULL_FRAME_SAMPLES];
+        receiver.pull_frame(&mut silent_frame);
+        receiver.pull_frame(&mut silent_frame);
+
+        let stats_after = receiver.stats();
+        assert!(
+            stats_after
+                .concealed_samples
+                .saturating_sub(concealed_before)
+                <= PULL_FRAME_SAMPLES as u64 * 2,
+            "concealment kept growing after intentional silence"
+        );
+        assert!(stats_after.intentional_silence);
 
         Ok(())
     }

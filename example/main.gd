@@ -29,8 +29,7 @@ var quit_after_seconds := DEFAULT_QUIT_SECONDS
 var trace_jsonl_path := ""
 var trace_file: FileAccess = null
 var trace_frame := 0
-var vad_threshold_db := -45.0
-var force_transmit := false
+var enable_dtx := true
 
 
 func _ready() -> void:
@@ -55,8 +54,7 @@ func _ready() -> void:
 
 	sender.name = "Sender"
 	sender.input_sample_rate_hz = int(AudioServer.get_mix_rate())
-	sender.vad_threshold_db = vad_threshold_db
-	sender.push_to_talk = force_transmit
+	sender.enable_dtx = enable_dtx
 	sender.capture_audio_server_input = not force_synthetic
 	sender.microphone_frame_budget = FRAME_SAMPLES
 	add_child(sender)
@@ -281,9 +279,6 @@ func _load_env_config() -> void:
 		var parsed := quit_env.to_float()
 		if parsed > 0.0:
 			quit_after_seconds = parsed
-	var vad_env := OS.get_environment("GNA_DEMO_VAD_THRESHOLD_DB")
-	if vad_env != "":
-		vad_threshold_db = vad_env.to_float()
-	var force_transmit_env := OS.get_environment("GNA_DEMO_FORCE_TRANSMIT").to_lower()
-	if force_transmit_env in ["1", "true", "yes"]:
-		force_transmit = true
+	var dtx_env := OS.get_environment("GNA_DEMO_ENABLE_DTX").to_lower()
+	if dtx_env in ["0", "false", "no"]:
+		enable_dtx = false

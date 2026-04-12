@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use voice_core::vad::VadConfig;
 use voice_core::{PacketFlags, VoiceEncoder, VoiceEncoderConfig};
 
 use crate::packet_bytes::encode_packet_bytes;
@@ -60,7 +59,6 @@ struct PipelineState {
     cv: Condvar,
     stop: AtomicBool,
     speaking: AtomicBool,
-    force_transmit: AtomicBool,
     last_error: Mutex<Option<String>>,
     stats: WorkerStats,
 }
@@ -72,7 +70,6 @@ impl PipelineState {
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
             speaking: AtomicBool::new(false),
-            force_transmit: AtomicBool::new(false),
             last_error: Mutex::new(None),
             stats: WorkerStats::default(),
         }
@@ -93,9 +90,7 @@ pub struct NetworkAudioSender {
     #[export]
     input_sample_rate_hz: i32,
     #[export]
-    vad_threshold_db: f32,
-    #[export]
-    push_to_talk: bool,
+    enable_dtx: bool,
     #[export]
     denoise: bool,
     #[export]
@@ -126,8 +121,7 @@ impl INode for NetworkAudioSender {
             base,
             bitrate_bps: 16_000,
             input_sample_rate_hz: 48_000,
-            vad_threshold_db: -45.0,
-            push_to_talk: false,
+            enable_dtx: true,
             denoise: false,
             capture_audio_server_input: false,
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
@@ -364,14 +358,11 @@ impl NetworkAudioSender {
             input_sample_rate: self.input_sample_rate_hz.max(1) as u32,
             frame_duration_ms: 20,
             bitrate_bps: self.bitrate_bps,
-            vad: VadConfig {
-                threshold_db: self.vad_threshold_db,
-                hangover_frames: VadConfig::default().hangover_frames,
-            },
+            enable_dtx: self.enable_dtx,
             denoise: self.denoise,
         };
 
-        match LocalSendPipeline::new(config, self.push_to_talk) {
+        match LocalSendPipeline::new(config) {
             Ok(sender) => {
                 self.sender = Some(sender);
                 self.last_error = GString::new();
@@ -429,7 +420,7 @@ impl NetworkAudioSender {
         };
 
         self.input_samples_pushed += samples.len() as i64;
-        sender.push_input_pcm(samples, self.push_to_talk);
+        sender.push_input_pcm(samples);
         sender.queued_packet_count()
     }
 
@@ -478,11 +469,8 @@ impl NetworkAudioSender {
 }
 
 impl LocalSendPipeline {
-    fn new(config: VoiceEncoderConfig, force_transmit: bool) -> anyhow::Result<Self> {
+    fn new(config: VoiceEncoderConfig) -> anyhow::Result<Self> {
         let state = Arc::new(PipelineState::new());
-        state
-            .force_transmit
-            .store(force_transmit, Ordering::Relaxed);
         let thread_state = Arc::clone(&state);
 
         let handle = thread::Builder::new()
@@ -495,10 +483,7 @@ impl LocalSendPipeline {
         })
     }
 
-    fn push_input_pcm(&self, samples: &[f32], force_transmit: bool) {
-        self.state
-            .force_transmit
-            .store(force_transmit, Ordering::Relaxed);
+    fn push_input_pcm(&self, samples: &[f32]) {
         let mut guard = self
             .state
             .queues
@@ -628,7 +613,6 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
             .tick_lag_max_us
             .fetch_max(tick_lag_us, Ordering::Relaxed);
 
-        let force_transmit = state.force_transmit.load(Ordering::Relaxed);
         let frame = {
             let mut guard = state.queues.lock().expect("worker queue mutex poisoned");
             let take = guard.pcm_samples.len().min(960);
@@ -657,7 +641,6 @@ fn worker_loop(state: Arc<PipelineState>, config: VoiceEncoderConfig) {
                     .worker_partial_pcm_ticks
                     .fetch_add(1, Ordering::Relaxed);
             }
-            encoder.set_force_transmit(force_transmit);
             encoder.push_pcm(&frame);
             loop {
                 match encoder.poll_packet() {

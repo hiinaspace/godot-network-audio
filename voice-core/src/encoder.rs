@@ -1,10 +1,9 @@
-use audiopus::coder::Encoder as OpusEncoder;
+use audiopus::coder::{Encoder as OpusEncoder, GenericCtl};
 use audiopus::{Application, Bitrate, Channels, SampleRate};
 
 use crate::error::{Error, Result};
 use crate::packet::{PacketFlags, VoicePacket};
 use crate::resample::InputResampler;
-use crate::vad::{EnergyVad, VadConfig};
 
 const FRAME_DURATION_MS: u32 = 20;
 const FRAME_SAMPLES_48K_MONO: usize = 960;
@@ -15,7 +14,7 @@ pub struct VoiceEncoderConfig {
     pub input_sample_rate: u32,
     pub frame_duration_ms: u32,
     pub bitrate_bps: i32,
-    pub vad: VadConfig,
+    pub enable_dtx: bool,
     pub denoise: bool,
 }
 
@@ -25,7 +24,7 @@ impl Default for VoiceEncoderConfig {
             input_sample_rate: 48_000,
             frame_duration_ms: FRAME_DURATION_MS,
             bitrate_bps: 16_000,
-            vad: VadConfig::default(),
+            enable_dtx: true,
             denoise: false,
         }
     }
@@ -34,12 +33,11 @@ impl Default for VoiceEncoderConfig {
 pub struct VoiceEncoder {
     encoder: OpusEncoder,
     resampler: InputResampler,
-    vad: EnergyVad,
     pending_pcm: Vec<f32>,
-    force_transmit: bool,
     seq: u16,
     timestamp: u32,
     speaking: bool,
+    enable_dtx: bool,
 }
 
 impl VoiceEncoder {
@@ -63,16 +61,18 @@ impl VoiceEncoder {
         encoder
             .set_vbr(true)
             .map_err(|e| Error::Opus(format!("enable vbr: {e}")))?;
+        encoder
+            .set_dtx(config.enable_dtx)
+            .map_err(|e| Error::Opus(format!("set dtx: {e}")))?;
 
         Ok(Self {
             encoder,
             resampler: InputResampler::new(config.input_sample_rate, 48_000)?,
-            vad: EnergyVad::new(config.vad),
             pending_pcm: Vec::new(),
-            force_transmit: false,
             seq: 0,
             timestamp: 0,
             speaking: false,
+            enable_dtx: config.enable_dtx,
         })
     }
 
@@ -88,9 +88,14 @@ impl VoiceEncoder {
         // Milestone 1 keeps this simple. Replace this per-frame allocation with a reused
         // scratch buffer before wiring the encoder into real-time engine paths.
         let frame: Vec<f32> = self.pending_pcm.drain(..FRAME_SAMPLES_48K_MONO).collect();
-        let voiced = self.force_transmit || self.vad.is_voiced(&frame);
+        let mut payload = vec![0_u8; MAX_PACKET_BYTES];
+        let packet_len = self
+            .encoder
+            .encode_float(&frame, &mut payload)
+            .map_err(|e| Error::Opus(format!("encode: {e}")))?;
 
-        if !voiced {
+        // With DTX enabled, Opus may return tiny no-send packets during silence.
+        if self.enable_dtx && packet_len <= 2 {
             if self.speaking {
                 self.speaking = false;
                 return Ok(Some(VoicePacket {
@@ -102,12 +107,6 @@ impl VoiceEncoder {
             }
             return Ok(None);
         }
-
-        let mut payload = vec![0_u8; MAX_PACKET_BYTES];
-        let packet_len = self
-            .encoder
-            .encode_float(&frame, &mut payload)
-            .map_err(|e| Error::Opus(format!("encode: {e}")))?;
         payload.truncate(packet_len);
 
         let mut flags = PacketFlags::default();
@@ -124,13 +123,10 @@ impl VoiceEncoder {
         }))
     }
 
-    pub fn set_force_transmit(&mut self, on: bool) {
-        self.force_transmit = on;
-    }
-
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
         self.speaking = false;
+        let _ = self.encoder.reset_state();
     }
 
     fn next_seq(&mut self) -> u16 {

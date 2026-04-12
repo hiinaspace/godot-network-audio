@@ -42,6 +42,7 @@ struct SharedStreamState {
     accelerate_rate: AtomicU32,
     concealed_samples: AtomicU64,
     consecutive_failures: AtomicU32,
+    intentional_silence: AtomicBool,
     playing: AtomicBool,
 }
 
@@ -59,6 +60,7 @@ impl SharedStreamState {
             accelerate_rate: AtomicU32::new(0),
             concealed_samples: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
+            intentional_silence: AtomicBool::new(false),
             playing: AtomicBool::new(false),
         }
     }
@@ -76,6 +78,7 @@ impl SharedStreamState {
         self.accelerate_rate.store(0, Ordering::Relaxed);
         self.concealed_samples.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.intentional_silence.store(false, Ordering::Relaxed);
     }
 
     fn publish_stats(&self, stats: &ReceiverStats) {
@@ -95,6 +98,8 @@ impl SharedStreamState {
             .store(stats.concealed_samples, Ordering::Relaxed);
         self.consecutive_failures
             .store(stats.consecutive_failures, Ordering::Relaxed);
+        self.intentional_silence
+            .store(stats.intentional_silence, Ordering::Relaxed);
     }
 }
 
@@ -229,6 +234,10 @@ impl AudioStreamNetwork {
         dict.set(
             "consecutive_failures",
             self.shared.consecutive_failures.load(Ordering::Relaxed),
+        );
+        dict.set(
+            "intentional_silence",
+            self.shared.intentional_silence.load(Ordering::Relaxed),
         );
         dict.set("queued_packets", self.shared.queue.len() as i64);
         dict.set(
