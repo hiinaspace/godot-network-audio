@@ -378,12 +378,17 @@ impl AudioStreamNetworkPlayback {
 }
 
 fn build_receiver(max_delay_ms: u32) -> Option<VoiceReceiver> {
-    VoiceReceiver::new_with_delay_bounds(
+    match VoiceReceiver::new_with_delay_bounds(
         RECEIVER_SAMPLE_RATE_HZ,
         RECEIVER_MIN_DELAY_MS,
         max_delay_ms.max(RECEIVER_MIN_DELAY_MS),
-    )
-    .ok()
+    ) {
+        Ok(receiver) => Some(receiver),
+        Err(err) => {
+            godot_error!("AudioStreamNetwork failed to build VoiceReceiver: {}", err);
+            None
+        }
+    }
 }
 
 fn zero_frames(frames: &mut [AudioFrame]) {

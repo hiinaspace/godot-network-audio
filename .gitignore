@@ -6,3 +6,4 @@ Cargo.lock
 *.json
 *.jsonl
 *.log
+example/addons/godot_network_audio/bin/

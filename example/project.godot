@@ -8,6 +8,10 @@ config_version=5
 config/name="godot-network-audio demo"
 run/main_scene="res://main.tscn"
 
+[audio]
+
+driver/enable_input=true
+
 [rendering]
 
 renderer/rendering_method="gl_compatibility"
