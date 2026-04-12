@@ -97,6 +97,7 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
+	_maybe_start_playback()
 	if input_mode == INPUT_MODE_MICROPHONE:
 		var elapsed_msec := Time.get_ticks_msec() - demo_start_msec
 		if allow_synthetic_fallback and sender.get_captured_input_frames() <= 0 and elapsed_msec >= int(synthetic_fallback_seconds * 1000.0):
