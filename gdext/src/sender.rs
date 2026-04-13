@@ -4,13 +4,17 @@ use godot::obj::Singleton;
 use godot::prelude::*;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use voice_core::{PacketFlags, VoiceEncoder, VoiceEncoderConfig};
 
 use crate::packet_bytes::encode_packet_bytes;
 use crate::stream::{AudioStreamNetwork, LoopbackTarget};
+
+/// Called directly from the encode thread with encoded packet bytes.
+/// When installed, bypasses the `encoded_packets` queue and `_process()` drain entirely.
+pub(crate) type DirectSendHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 const DEFAULT_MICROPHONE_FRAME_BUDGET: i32 = 960;
 /// Target inter-packet interval for paced emission, in microseconds.
@@ -62,6 +66,9 @@ struct PipelineState {
     speaking: AtomicBool,
     last_error: Mutex<Option<String>>,
     stats: WorkerStats,
+    /// When set, encoded packets are handed off directly to this handler from
+    /// the encode thread instead of being queued for `_process()` drain.
+    direct_send_handler: RwLock<Option<DirectSendHandler>>,
 }
 
 impl PipelineState {
@@ -73,6 +80,7 @@ impl PipelineState {
             speaking: AtomicBool::new(false),
             last_error: Mutex::new(None),
             stats: WorkerStats::default(),
+            direct_send_handler: RwLock::new(None),
         }
     }
 
@@ -101,6 +109,7 @@ pub struct NetworkAudioSender {
     microphone_frame_budget: i32,
     sender: Option<LocalSendPipeline>,
     loopback_target: Option<LoopbackTarget>,
+    direct_send_handler: Option<DirectSendHandler>,
     last_speaking: bool,
     last_error: GString,
     captured_input_frames: i64,
@@ -143,6 +152,7 @@ impl INode for NetworkAudioSender {
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
             sender: None,
             loopback_target: None,
+            direct_send_handler: None,
             last_speaking: false,
             last_error: GString::new(),
             captured_input_frames: 0,
@@ -442,6 +452,10 @@ impl NetworkAudioSender {
 
         match LocalSendPipeline::new(config, self.loopback_target.clone()) {
             Ok(sender) => {
+                // Reinstall the direct send handler on the new pipeline if one was registered.
+                if let Some(handler) = self.direct_send_handler.clone() {
+                    sender.set_direct_send_handler(handler);
+                }
                 self.sender = Some(sender);
                 self.last_error = GString::new();
             }
@@ -452,6 +466,16 @@ impl NetworkAudioSender {
                 self.base_mut()
                     .emit_signal("encoder_error", &[message.to_variant()]);
             }
+        }
+    }
+
+    /// Install a handler that receives encoded packet bytes directly from the
+    /// encode thread, bypassing `_process()`. When set, the `packet_ready`
+    /// signal is NOT emitted (the handler replaces it).
+    pub(crate) fn install_direct_send_handler(&mut self, handler: DirectSendHandler) {
+        self.direct_send_handler = Some(handler.clone());
+        if let Some(sender) = self.sender.as_ref() {
+            sender.set_direct_send_handler(handler);
         }
     }
 
@@ -668,6 +692,14 @@ impl LocalSendPipeline {
         self.state.stats.queued_packets.store(0, Ordering::Relaxed);
     }
 
+    fn set_direct_send_handler(&self, handler: DirectSendHandler) {
+        *self
+            .state
+            .direct_send_handler
+            .write()
+            .expect("direct_send_handler poisoned") = Some(handler);
+    }
+
     fn stop(&mut self) {
         self.state.stop.store(true, Ordering::Relaxed);
         self.state.cv.notify_all();
@@ -766,17 +798,29 @@ fn worker_loop(
                             let _ = target.enqueue_now(packet.clone());
                         }
                         let bytes = encode_packet_bytes(&packet).to_vec();
-                        let mut guard = state.queues.lock().expect("worker queue mutex poisoned");
-                        if guard.encoded_packets.len() >= MAX_PENDING_PACKETS {
-                            let _ = guard.encoded_packets.pop_front();
-                            state.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        // If a direct send handler is installed, call it immediately
+                        // from this thread instead of queuing for _process() drain.
+                        let handler = state
+                            .direct_send_handler
+                            .read()
+                            .expect("direct_send_handler poisoned")
+                            .clone();
+                        if let Some(ref h) = handler {
+                            h(bytes);
+                        } else {
+                            let mut guard =
+                                state.queues.lock().expect("worker queue mutex poisoned");
+                            if guard.encoded_packets.len() >= MAX_PENDING_PACKETS {
+                                let _ = guard.encoded_packets.pop_front();
+                                state.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            guard.encoded_packets.push_back(bytes);
+                            state
+                                .stats
+                                .queued_packets
+                                .store(guard.encoded_packets.len() as i64, Ordering::Relaxed);
+                            drop(guard);
                         }
-                        guard.encoded_packets.push_back(bytes);
-                        state
-                            .stats
-                            .queued_packets
-                            .store(guard.encoded_packets.len() as i64, Ordering::Relaxed);
-                        drop(guard);
 
                         let emit_us = epoch.elapsed().as_micros() as u64;
                         let prev = state

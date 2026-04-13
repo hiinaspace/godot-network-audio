@@ -189,8 +189,8 @@ for ax in axes.flat:
     ax.grid(True, alpha=0.3)
 if sender:
     t = [(r["mono_usec"] - sender[0]["mono_usec"]) / 1_000_000 for r in sender]
-    axes[0,0].plot(t, [r.get("sender", {}).get("packets_sent", 0) for r in sender])
-    axes[0,0].set_title("Sender packets_sent")
+    axes[0,0].plot(t, [r.get("sender", {}).get("emitted_packets", 0) for r in sender])
+    axes[0,0].set_title("Sender emitted_packets")
     axes[0,1].plot(t, [r.get("sender", {}).get("avg_packet_interval_ms", 0.0) for r in sender])
     axes[0,1].set_title("Sender avg packet interval ms")
 if receiver:

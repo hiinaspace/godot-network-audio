@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use godot::builtin::{Array, GString, PackedByteArray, VarDictionary, Variant};
@@ -8,11 +8,13 @@ use godot::classes::{INode, Node};
 use godot::obj::WithBaseField;
 use godot::prelude::*;
 use godot_network_audio_iroh::{RemotePeer, VoiceEvent, VoiceIrohService};
+use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use iroh_base::TransportAddr;
 use tokio::sync::broadcast;
 use voice_core::VoicePacket;
 
+use crate::sender::NetworkAudioSender;
 use crate::stream::{AudioStreamNetwork, LoopbackTarget};
 
 #[derive(GodotClass)]
@@ -22,6 +24,10 @@ pub struct IrohVoiceTransport {
     service: Option<VoiceIrohService>,
     receiver: Option<broadcast::Receiver<VoiceEvent>>,
     receive_sink: Option<LoopbackTarget>,
+    /// Shared with the direct send handler so it can be updated on peer connect
+    /// without reinstalling the closure. Written on connect/disconnect, read on
+    /// every encoded packet — both happen on non-main threads.
+    active_send_conn: Arc<RwLock<Option<Connection>>>,
     process_mode_enabled: bool,
     last_error: GString,
     packets_sent: i64,
@@ -37,6 +43,7 @@ impl INode for IrohVoiceTransport {
             service: None,
             receiver: None,
             receive_sink: None,
+            active_send_conn: Arc::new(RwLock::new(None)),
             process_mode_enabled: false,
             last_error: GString::new(),
             packets_sent: 0,
@@ -114,12 +121,43 @@ impl IrohVoiceTransport {
             }
         };
         match service.connect(addr) {
-            Ok(_peer) => true,
+            Ok(peer) => {
+                // Populate the shared connection slot immediately so the direct
+                // send handler can start forwarding packets without waiting for
+                // the next _process() frame to drain the broadcast event.
+                if let Some(conn) = service.get_connection(peer) {
+                    *self
+                        .active_send_conn
+                        .write()
+                        .expect("active_send_conn poisoned") = Some(conn);
+                }
+                true
+            }
             Err(err) => {
                 self.record_error(format!("connect voice peer: {err:#}"));
                 false
             }
         }
+    }
+
+    /// Wire `sender`'s encoded output directly to this transport's active peer,
+    /// bypassing Godot's `_process()` cadence entirely. Call this after
+    /// `start_endpoint()`; the connection slot is updated automatically when
+    /// `connect_to_peer()` succeeds. The GDScript `packet_ready` signal will
+    /// NOT be emitted while a direct handler is installed.
+    #[func]
+    fn attach_sender(&mut self, mut sender: Gd<NetworkAudioSender>) {
+        let conn_slot = self.active_send_conn.clone();
+        let handler = Arc::new(move |bytes: Vec<u8>| {
+            let conn = conn_slot
+                .read()
+                .expect("active_send_conn poisoned")
+                .clone();
+            if let Some(conn) = conn {
+                let _ = conn.send_datagram(Bytes::from(bytes));
+            }
+        });
+        sender.bind_mut().install_direct_send_handler(handler);
     }
 
     /// Attach an AudioStreamNetwork as the receive target. Packets are pushed
@@ -216,15 +254,38 @@ impl IrohVoiceTransport {
         match event {
             VoiceEvent::PeerConnected { peer } => {
                 self.peers_connected += 1;
+                // Also update the send connection slot for the accepted-connection
+                // path (e.g. receiver role with attach_sender).
+                if let Some(service) = self.service.as_ref() {
+                    if let Some(conn) = service.get_connection(peer) {
+                        *self
+                            .active_send_conn
+                            .write()
+                            .expect("active_send_conn poisoned") = Some(conn);
+                    }
+                }
                 self.base_mut()
                     .emit_signal("peer_connected", &[peer.id.to_string().to_variant()]);
             }
             VoiceEvent::PeerReplaced { peer } => {
+                if let Some(service) = self.service.as_ref() {
+                    if let Some(conn) = service.get_connection(peer) {
+                        *self
+                            .active_send_conn
+                            .write()
+                            .expect("active_send_conn poisoned") = Some(conn);
+                    }
+                }
                 self.base_mut()
                     .emit_signal("peer_replaced", &[peer.id.to_string().to_variant()]);
             }
             VoiceEvent::PeerDisconnected { peer } => {
                 self.peers_connected = self.peers_connected.saturating_sub(1);
+                // Clear the send slot so the handler stops trying to send.
+                *self
+                    .active_send_conn
+                    .write()
+                    .expect("active_send_conn poisoned") = None;
                 self.base_mut()
                     .emit_signal("peer_disconnected", &[peer.id.to_string().to_variant()]);
             }

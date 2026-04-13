@@ -198,6 +198,13 @@ impl VoiceIrohService {
             .map_err(|err| anyhow!("send voice datagram to {}: {err}", peer.id))
     }
 
+    /// Return a clone of the active `Connection` for `peer`, if one exists.
+    /// `Connection` is internally reference-counted so cloning is cheap.
+    pub fn get_connection(&self, peer: RemotePeer) -> Option<Connection> {
+        let peers = self.shared.peers.lock().expect("peer map poisoned");
+        peers.get(&peer.id).cloned()
+    }
+
     pub fn peer_rtt(&self, peer: RemotePeer) -> Option<Duration> {
         let connection = {
             let peers = self.shared.peers.lock().expect("peer map poisoned");

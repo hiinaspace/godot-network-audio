@@ -76,8 +76,10 @@ func _ready() -> void:
 		sender.input_sample_rate_hz = int(AudioServer.get_input_mix_rate())
 		sender.capture_audio_server_input = not force_synthetic
 		sender.microphone_frame_budget = FRAME_SAMPLES
-		sender.packet_ready.connect(_on_packet_ready)
 		add_child(sender)
+		# Wire sender directly to transport: encoded packets flow from the encode
+		# thread → connection.send_datagram() without touching _process().
+		transport.attach_sender(sender)
 		if force_synthetic:
 			input_mode = "synthetic"
 
@@ -136,12 +138,6 @@ func _connect_remote_from_file() -> void:
 	if not transport.connect_to_peer(info):
 		push_error("iroh demo: failed to connect to peer")
 
-func _on_packet_ready(bytes: PackedByteArray) -> void:
-	if peer_id == "":
-		return
-	if not transport.send_packet(peer_id, bytes):
-		push_error("iroh demo: failed to send packet")
-
 func _maybe_start_playback() -> void:
 	if player == null or player.playing:
 		return
@@ -170,7 +166,7 @@ func _print_stats() -> void:
 func _shutdown_demo() -> void:
 	_close_trace_file()
 	if sender != null:
-		sender.packet_ready.disconnect(_on_packet_ready)
+		pass  # direct send handler is owned by the closure, nothing to disconnect
 	if player != null:
 		player.stop()
 		player.stream = null
