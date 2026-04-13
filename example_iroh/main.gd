@@ -10,6 +10,7 @@ const STARTUP_PREBUFFER_PACKETS := 4
 
 var role := ROLE_RECEIVER
 var quit_after_seconds := DEFAULT_QUIT_SECONDS
+var max_fps := 0  # 0 = uncapped; set GNA_DEMO_MAX_FPS to override (e.g. 5 for receiver stress test)
 var selected_input_device := ""
 var selected_output_device := ""
 var endpoint_info_path := ""
@@ -37,6 +38,9 @@ var peer_id := ""
 func _ready() -> void:
 	demo_start_msec = Time.get_ticks_msec()
 	_load_env_config()
+	# Cap frame rate very low so it is obvious in the trace whether audio
+	# delivery still depends on _process(). Override with GNA_DEMO_MAX_FPS.
+	Engine.max_fps = max_fps
 	_open_trace_file()
 	print("iroh demo: ready role=", role)
 	print("iroh demo: current output device=", AudioServer.output_device)
@@ -63,7 +67,7 @@ func _ready() -> void:
 		player = AudioStreamPlayer.new()
 		player.stream = stream
 		add_child(player)
-		transport.set_receive_target(stream)
+		transport.set_receive_stream(stream)
 	else:
 		sender = ClassDB.instantiate("NetworkAudioSender")
 		if sender == null:
@@ -274,3 +278,6 @@ func _load_env_config() -> void:
 	value = OS.get_environment("GNA_DEMO_FORCE_SYNTHETIC")
 	if value != "":
 		force_synthetic = value != "0"
+	value = OS.get_environment("GNA_DEMO_MAX_FPS")
+	if value != "":
+		max_fps = max(value.to_int(), 1)

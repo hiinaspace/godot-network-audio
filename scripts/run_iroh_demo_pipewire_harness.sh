@@ -68,7 +68,7 @@ cleanup() {
 trap cleanup EXIT
 
 source "$HOME/.cargo/env"
-cargo build -p godot_network_audio -p godot_network_audio_iroh_gdext >/dev/null
+cargo build -p godot_network_audio --features iroh-transport >/dev/null
 bash "$ROOT_DIR/scripts/sync_iroh_example_extensions.sh" >/dev/null
 
 ORIGINAL_DEFAULT_SINK="$(pactl info | sed -n 's/^Default Sink: //p' | head -n 1)"
@@ -123,6 +123,7 @@ GNA_IROH_ENDPOINT_INFO_PATH="$RECEIVER_INFO_JSON" \
 GNA_DEMO_OUTPUT_DEVICE="$RECEIVER_OUTPUT_SINK" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$TOTAL_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$RECEIVER_TRACE" \
+GNA_DEMO_MAX_FPS="${GNA_IROH_RECEIVER_MAX_FPS:-5}" \
   "$GODOT_BIN" --path "$ROOT_DIR/example_iroh" --scene res://main.tscn --verbose \
   >"$RECEIVER_LOG" 2>&1 &
 RECEIVER_PID=$!
