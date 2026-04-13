@@ -55,6 +55,12 @@ func _ready() -> void:
 	if stream == null or transport == null:
 		push_error("iroh demo: failed to instantiate classes")
 		return
+	var min_delay_str := OS.get_environment("GNA_DEMO_MIN_DELAY_MS")
+	if min_delay_str != "":
+		stream.min_delay_ms = min_delay_str.to_int()
+	var max_delay_str := OS.get_environment("GNA_DEMO_MAX_DELAY_MS")
+	if max_delay_str != "":
+		stream.max_delay_ms = max_delay_str.to_int()
 
 	add_child(transport)
 	if not transport.start_endpoint():

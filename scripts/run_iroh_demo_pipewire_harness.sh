@@ -161,46 +161,8 @@ kill_pid "$INPUT_RECORDER_PID"; INPUT_RECORDER_PID=""
 kill_pid "$OUTPUT_RECORDER_PID"; OUTPUT_RECORDER_PID=""
 kill_pid "$PLAYER_PID"; PLAYER_PID=""
 
-python3 - <<'PY' "$SENDER_TRACE" "$RECEIVER_TRACE" "$STATS_PNG"
-import json, sys
-from pathlib import Path
-import matplotlib.pyplot as plt
-
-sender_path, receiver_path, out_path = map(Path, sys.argv[1:])
-
-def load_rows(path):
-    rows = []
-    if not path.exists():
-      return rows
-    for line in path.read_text().splitlines():
-      line = line.strip()
-      if not line:
-        continue
-      try:
-        rows.append(json.loads(line))
-      except json.JSONDecodeError:
-        pass
-    return rows
-
-sender = load_rows(sender_path)
-receiver = load_rows(receiver_path)
-fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-for ax in axes.flat:
-    ax.grid(True, alpha=0.3)
-if sender:
-    t = [(r["mono_usec"] - sender[0]["mono_usec"]) / 1_000_000 for r in sender]
-    axes[0,0].plot(t, [r.get("sender", {}).get("emitted_packets", 0) for r in sender])
-    axes[0,0].set_title("Sender emitted_packets")
-    axes[0,1].plot(t, [r.get("sender", {}).get("avg_packet_interval_ms", 0.0) for r in sender])
-    axes[0,1].set_title("Sender avg packet interval ms")
-if receiver:
-    t = [(r["mono_usec"] - receiver[0]["mono_usec"]) / 1_000_000 for r in receiver]
-    axes[1,0].plot(t, [r.get("receiver", {}).get("concealed_samples", 0) for r in receiver])
-    axes[1,0].set_title("Receiver concealed_samples")
-    axes[1,1].plot(t, [r.get("transport", {}).get("packets_received", 0) for r in receiver])
-    axes[1,1].set_title("Transport packets_received")
-fig.savefig(out_path, dpi=160)
-PY
+uv run "$ROOT_DIR/scripts/plot_demo_stats.py" \
+  --sender "$SENDER_TRACE" --receiver "$RECEIVER_TRACE" "$STATS_PNG" >/dev/null
 
 uv run "$ROOT_DIR/scripts/plot_demo_io_spectrograms.py" "$INPUT_CAPTURE_WAV" "$OUTPUT_CAPTURE_WAV" "$SPECTROGRAM_PNG" >/dev/null
 

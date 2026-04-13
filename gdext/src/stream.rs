@@ -204,6 +204,8 @@ impl LoopbackTarget {
 pub struct AudioStreamNetwork {
     base: Base<AudioStream>,
     #[export]
+    min_delay_ms: i32,
+    #[export]
     max_delay_ms: i32,
     shared: Arc<SharedStreamState>,
 }
@@ -226,6 +228,7 @@ impl IAudioStream for AudioStreamNetwork {
     fn init(base: Base<AudioStream>) -> Self {
         Self {
             base,
+            min_delay_ms: RECEIVER_MIN_DELAY_MS as i32,
             max_delay_ms: 120,
             shared: Arc::new(SharedStreamState::new()),
         }
@@ -233,11 +236,12 @@ impl IAudioStream for AudioStreamNetwork {
 
     fn instantiate_playback(&self) -> Option<Gd<AudioStreamPlayback>> {
         let shared = Arc::clone(&self.shared);
-        let max_delay_ms = self.max_delay_ms.max(RECEIVER_MIN_DELAY_MS as i32) as u32;
+        let min_delay_ms = self.min_delay_ms.max(0) as u32;
+        let max_delay_ms = self.max_delay_ms.max(min_delay_ms as i32) as u32;
         let playback = Gd::from_init_fn(move |base| AudioStreamNetworkPlayback {
             base,
             shared,
-            receiver: build_receiver(max_delay_ms),
+            receiver: build_receiver(min_delay_ms, max_delay_ms),
             pending_mono: Vec::new(),
             pending_cursor: 0,
             playback_position_frames: 0,
@@ -386,6 +390,7 @@ impl AudioStreamNetwork {
             "dropped_packets",
             self.shared.dropped_packets.load(Ordering::Relaxed) as i64,
         );
+        dict.set("configured_min_delay_ms", self.min_delay_ms);
         dict.set("configured_max_delay_ms", self.max_delay_ms);
         dict.set("is_playing", self.shared.playing.load(Ordering::Relaxed));
         dict
@@ -410,7 +415,7 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
         Self {
             base,
             shared: Arc::new(SharedStreamState::new()),
-            receiver: build_receiver(120),
+            receiver: build_receiver(RECEIVER_MIN_DELAY_MS, 120),
             pending_mono: Vec::new(),
             pending_cursor: 0,
             playback_position_frames: 0,
@@ -543,12 +548,10 @@ impl AudioStreamNetworkPlayback {
     }
 }
 
-fn build_receiver(max_delay_ms: u32) -> Option<VoiceReceiver> {
-    match VoiceReceiver::new_with_delay_bounds(
-        RECEIVER_SAMPLE_RATE_HZ,
-        RECEIVER_MIN_DELAY_MS,
-        max_delay_ms.max(RECEIVER_MIN_DELAY_MS),
-    ) {
+fn build_receiver(min_delay_ms: u32, max_delay_ms: u32) -> Option<VoiceReceiver> {
+    let min = min_delay_ms.max(RECEIVER_MIN_DELAY_MS);
+    let max = max_delay_ms.max(min);
+    match VoiceReceiver::new_with_delay_bounds(RECEIVER_SAMPLE_RATE_HZ, min, max) {
         Ok(receiver) => Some(receiver),
         Err(err) => {
             godot_error!("AudioStreamNetwork failed to build VoiceReceiver: {}", err);
