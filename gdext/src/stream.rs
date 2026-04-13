@@ -192,6 +192,11 @@ impl LoopbackTarget {
             },
         )
     }
+
+    #[cfg(feature = "iroh-transport")]
+    pub(crate) fn enqueue_with_timestamp(&self, packet: VoicePacket, received_at_mono_us: u64) -> bool {
+        self.shared.enqueue_packet(packet, PacketArrival { received_at_mono_us })
+    }
 }
 
 #[derive(GodotClass)]

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -53,12 +53,14 @@ impl Default for VoiceIrohConfig {
     }
 }
 
-#[derive(Debug)]
+type PacketHandler = Arc<dyn Fn(Bytes, u64) + Send + Sync>;
+
 struct SharedState {
     start: Instant,
     peers: Mutex<HashMap<EndpointId, Connection>>,
     events: broadcast::Sender<VoiceEvent>,
     alpn: Vec<u8>,
+    packet_handler: RwLock<Option<PacketHandler>>,
 }
 
 impl SharedState {
@@ -126,6 +128,7 @@ impl VoiceIrohService {
             peers: Mutex::new(HashMap::new()),
             events,
             alpn: config.alpn,
+            packet_handler: RwLock::new(None),
         });
 
         let endpoint = runtime.block_on(async {
@@ -203,6 +206,13 @@ impl VoiceIrohService {
         connection.rtt(PathId::ZERO)
     }
 
+    /// Install a direct packet handler that is called from the iroh receive task
+    /// instead of going through the broadcast channel. Connection events
+    /// (peer connected/disconnected) still go through the broadcast.
+    pub fn set_packet_handler(&self, handler: PacketHandler) {
+        *self.shared.packet_handler.write().expect("packet_handler lock poisoned") = Some(handler);
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
@@ -265,10 +275,23 @@ fn spawn_datagram_task(connection: Connection, shared: Arc<SharedState>) {
     tokio::spawn(async move {
         let peer = connection.remote_id();
         while let Ok(bytes) = connection.read_datagram().await {
+            let received_at_mono_us = shared.now_mono_us();
+            // Fast path: push directly to audio queue without going through the
+            // broadcast channel or Godot's main-thread _process() cadence.
+            let handler = shared
+                .packet_handler
+                .read()
+                .expect("packet_handler lock poisoned")
+                .clone();
+            if let Some(ref h) = handler {
+                h(bytes.clone(), received_at_mono_us);
+            }
+            // Always broadcast so the GDScript packet_received signal and stats
+            // counter still work regardless of whether a handler is installed.
             let _ = shared.events.send(VoiceEvent::PacketReceived {
                 peer: RemotePeer { id: peer },
                 bytes,
-                received_at_mono_us: shared.now_mono_us(),
+                received_at_mono_us,
             });
         }
         if let Some(event) = shared.remove_connection(peer) {
