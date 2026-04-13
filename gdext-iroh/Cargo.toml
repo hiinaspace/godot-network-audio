@@ -1,0 +1,17 @@
+[package]
+name = "godot_network_audio_iroh_gdext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+godot.workspace = true
+iroh.workspace = true
+iroh-base.workspace = true
+godot_network_audio_iroh = { path = "../iroh-sidecar" }
+tokio.workspace = true
