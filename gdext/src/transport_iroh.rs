@@ -7,7 +7,7 @@ use godot::builtin::{Array, GString, PackedByteArray, VarDictionary, Variant};
 use godot::classes::{INode, Node};
 use godot::obj::WithBaseField;
 use godot::prelude::*;
-use godot_network_audio_iroh::{RemotePeer, VoiceEvent, VoiceIrohService};
+use godot_network_audio_iroh::{RemotePeer, VoiceEvent, VoiceIrohConfig, VoiceIrohService};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use iroh_base::TransportAddr;
@@ -82,7 +82,28 @@ impl IrohVoiceTransport {
 
     #[func]
     fn start_endpoint(&mut self) -> bool {
-        match VoiceIrohService::bind_default() {
+        // If GNA_IROH_BIND_ADDR is set, bind to that specific address in local-only
+        // mode (no relay, no pkarr/DNS).  This is used for netem impairment tests
+        // over a veth pair where the relay would bypass traffic shaping.
+        let config = match std::env::var("GNA_IROH_BIND_ADDR") {
+            Ok(addr_str) if !addr_str.is_empty() => {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => VoiceIrohConfig {
+                        bind_addr: Some(addr),
+                        relay: false,
+                        ..Default::default()
+                    },
+                    Err(err) => {
+                        self.record_error(format!(
+                            "GNA_IROH_BIND_ADDR={addr_str:?} parse error: {err}"
+                        ));
+                        return false;
+                    }
+                }
+            }
+            _ => VoiceIrohConfig::default(),
+        };
+        match VoiceIrohService::bind(config) {
             Ok(service) => {
                 self.receiver = Some(service.subscribe());
                 self.service = Some(service);

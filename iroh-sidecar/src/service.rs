@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -43,12 +44,22 @@ pub enum VoiceEvent {
 #[derive(Debug, Clone)]
 pub struct VoiceIrohConfig {
     pub alpn: Vec<u8>,
+    /// If `Some`, bind only to this address and disable relay/pkarr/DNS.
+    /// Intended for netem testing over a veth pair where all traffic must
+    /// go through a specific interface.  When `None`, the relay preset
+    /// handles binding.
+    pub bind_addr: Option<SocketAddr>,
+    /// If `false`, use `Builder::empty()` — no relay, no pkarr/DNS.
+    /// Automatically implied when `bind_addr` is `Some`.  Default `true`.
+    pub relay: bool,
 }
 
 impl Default for VoiceIrohConfig {
     fn default() -> Self {
         Self {
             alpn: VOICE_ALPN_V0.to_vec(),
+            bind_addr: None,
+            relay: true,
         }
     }
 }
@@ -127,17 +138,34 @@ impl VoiceIrohService {
             start: Instant::now(),
             peers: Mutex::new(HashMap::new()),
             events,
-            alpn: config.alpn,
+            alpn: config.alpn.clone(),
             packet_handler: RwLock::new(None),
         });
 
-        let endpoint = runtime.block_on(async {
-            Endpoint::builder(presets::N0)
-                .alpns(vec![shared.alpn.clone()])
-                .bind()
-                .await
-        })?;
-        runtime.block_on(endpoint.online());
+        let use_relay = config.relay && config.bind_addr.is_none();
+        let endpoint = if use_relay {
+            runtime.block_on(async {
+                Endpoint::builder(presets::N0)
+                    .alpns(vec![config.alpn.clone()])
+                    .bind()
+                    .await
+            })?
+        } else {
+            // Local-only mode: no relay, no pkarr/DNS.  Bind to the specific
+            // address supplied, or any local port if None.  Used for netem
+            // tests over a veth pair where all traffic must go through one
+            // interface and the relay would bypass the shaping.
+            let mut builder = Endpoint::empty_builder()
+                .clear_ip_transports()
+                .alpns(vec![config.alpn.clone()]);
+            if let Some(addr) = config.bind_addr {
+                builder = builder.bind_addr(addr).context("bind local address")?;
+            }
+            runtime.block_on(async { builder.bind().await })?
+        };
+        if use_relay {
+            runtime.block_on(endpoint.online());
+        }
 
         let (stop_tx, stop_rx) = oneshot::channel();
         let accept_task = runtime.spawn(run_accept_loop(endpoint.clone(), shared.clone(), stop_rx));

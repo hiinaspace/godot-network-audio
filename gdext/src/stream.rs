@@ -228,7 +228,7 @@ impl IAudioStream for AudioStreamNetwork {
     fn init(base: Base<AudioStream>) -> Self {
         Self {
             base,
-            min_delay_ms: RECEIVER_MIN_DELAY_MS as i32,
+            min_delay_ms: 80,
             max_delay_ms: 120,
             shared: Arc::new(SharedStreamState::new()),
         }

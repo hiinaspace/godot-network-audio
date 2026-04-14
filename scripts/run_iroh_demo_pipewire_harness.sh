@@ -60,10 +60,20 @@ cleanup() {
   kill_pid "$RECEIVER_PID"
   [[ -n "$ORIGINAL_DEFAULT_SINK" ]] && pactl set-default-sink "$ORIGINAL_DEFAULT_SINK" 2>/dev/null || true
   [[ -n "$ORIGINAL_DEFAULT_SOURCE" ]] && pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
+  # Unload by stored module ID first (fast path).
   [[ -n "$INPUT_SOURCE_MODULE_ID" ]] && pactl unload-module "$INPUT_SOURCE_MODULE_ID" 2>/dev/null || true
   [[ -n "$INPUT_MODULE_ID" ]] && pactl unload-module "$INPUT_MODULE_ID" 2>/dev/null || true
   [[ -n "$SENDER_OUTPUT_MODULE_ID" ]] && pactl unload-module "$SENDER_OUTPUT_MODULE_ID" 2>/dev/null || true
   [[ -n "$RECEIVER_OUTPUT_MODULE_ID" ]] && pactl unload-module "$RECEIVER_OUTPUT_MODULE_ID" 2>/dev/null || true
+  # Fallback: scan by name for any modules from this run tag that weren't captured
+  # (e.g. if the script crashed before a load-module call completed).
+  if [[ -n "$RUN_TAG" ]]; then
+    mapfile -t stale_ids < <(pactl list short modules 2>/dev/null \
+      | awk -v tag="$RUN_TAG" '$0 ~ tag { print $1 }')
+    for mid in "${stale_ids[@]}"; do
+      pactl unload-module "$mid" 2>/dev/null || true
+    done
+  fi
 }
 trap cleanup EXIT
 
@@ -111,7 +121,7 @@ ffmpeg -hide_banner -loglevel error -nostdin -y \
 OUTPUT_RECORDER_PID=$!
 
 if command -v fgvm >/dev/null 2>&1; then
-  GODOT_BIN="$(fgvm which | tail -n 1)"
+  GODOT_BIN="$(fgvm which | tail -n 1 | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $NF}')"
 else
   GODOT_BIN="$HOME/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64"
 fi
@@ -120,6 +130,7 @@ PULSE_SINK="$RECEIVER_OUTPUT_SINK" \
 PULSE_SOURCE="$SENDER_INPUT_SOURCE" \
 GNA_IROH_ROLE=receiver \
 GNA_IROH_ENDPOINT_INFO_PATH="$RECEIVER_INFO_JSON" \
+GNA_IROH_BIND_ADDR="${GNA_IROH_BIND_ADDR_RECEIVER:-}" \
 GNA_DEMO_OUTPUT_DEVICE="$RECEIVER_OUTPUT_SINK" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$TOTAL_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$RECEIVER_TRACE" \
@@ -144,6 +155,7 @@ PULSE_SINK="$SENDER_OUTPUT_SINK" \
 PULSE_SOURCE="$SENDER_INPUT_SOURCE" \
 GNA_IROH_ROLE=sender \
 GNA_IROH_REMOTE_INFO_PATH="$RECEIVER_INFO_JSON" \
+GNA_IROH_BIND_ADDR="${GNA_IROH_BIND_ADDR_SENDER:-}" \
 GNA_DEMO_INPUT_DEVICE="$SENDER_INPUT_SOURCE" \
 GNA_DEMO_OUTPUT_DEVICE="$SENDER_OUTPUT_SINK" \
 GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
