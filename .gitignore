@@ -1,7 +1,6 @@
 .codex
 /target
 **/target
-Cargo.lock
 *.wav
 *.json
 *.jsonl

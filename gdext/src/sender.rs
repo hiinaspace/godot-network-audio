@@ -472,6 +472,7 @@ impl NetworkAudioSender {
     /// Install a handler that receives encoded packet bytes directly from the
     /// encode thread, bypassing `_process()`. When set, the `packet_ready`
     /// signal is NOT emitted (the handler replaces it).
+    #[cfg(feature = "iroh-transport")]
     pub(crate) fn install_direct_send_handler(&mut self, handler: DirectSendHandler) {
         self.direct_send_handler = Some(handler.clone());
         if let Some(sender) = self.sender.as_ref() {

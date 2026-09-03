@@ -1,18 +1,16 @@
 [package]
-name = "godot_network_audio_iroh_gdext"
+name = "voice-mesh-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
-godot.workspace = true
 iroh.workspace = true
-iroh-base.workspace = true
-godot_network_audio_iroh = { path = "../iroh-sidecar" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tinyvec.workspace = true
 tokio.workspace = true
+voice-core = { path = "../voice-core" }

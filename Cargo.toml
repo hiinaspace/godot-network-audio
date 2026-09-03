@@ -1,5 +1,11 @@
 [workspace]
-members = ["voice-core", "gdext", "iroh-sidecar", "gdext-iroh"]
+members = [
+    "voice-core",
+    "voice-mesh-bench",
+    "gdext",
+    "iroh-sidecar",
+    "gdext-iroh",
+]
 resolver = "2"
 
 [workspace.package]
@@ -14,12 +20,18 @@ bytes = "1.11"
 crossbeam-queue = "0.3.12"
 godot = { version = "0.5.0", features = ["api-4-6", "experimental-threads"] }
 hound = "3.5.1"
-iroh = "0.97.0"
-iroh-base = "0.97.0"
-neteq = "=0.8.3"
+iroh = "1.1.0"
+iroh-base = "1.1.0"
+libc = "0.2"
+neteq = "=0.9.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2.0.17"
+# Iroh's hickory/noq graph enables tinyvec's alloc support without std;
+# tinyvec 1.13 currently misses vec! in that configuration.
+tinyvec = { version = "1.13", features = ["std"] }
 tokio = { version = "1.44.1", features = ["rt-multi-thread", "sync", "time"] }
 web-time = "1.1.0"
 
 [patch.crates-io]
-neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "4ec2cc8088d754b3fb1029a53664d3041ce40fbd" }
+neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "360d31ccf470bf4a062badc4ebcd36eac8c4b245" }

@@ -170,10 +170,7 @@ impl IrohVoiceTransport {
     fn attach_sender(&mut self, mut sender: Gd<NetworkAudioSender>) {
         let conn_slot = self.active_send_conn.clone();
         let handler = Arc::new(move |bytes: Vec<u8>| {
-            let conn = conn_slot
-                .read()
-                .expect("active_send_conn poisoned")
-                .clone();
+            let conn = conn_slot.read().expect("active_send_conn poisoned").clone();
             if let Some(conn) = conn {
                 let _ = conn.send_datagram(Bytes::from(bytes));
             }
@@ -242,7 +239,8 @@ impl IrohVoiceTransport {
     }
 
     fn maybe_install_packet_handler(&mut self) {
-        let (Some(service), Some(sink)) = (self.service.as_ref(), self.receive_sink.as_ref()) else {
+        let (Some(service), Some(sink)) = (self.service.as_ref(), self.receive_sink.as_ref())
+        else {
             return;
         };
         let sink = sink.clone();

@@ -8,4 +8,5 @@ license.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 iroh.workspace = true
+tinyvec.workspace = true
 tokio.workspace = true

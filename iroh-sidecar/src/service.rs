@@ -155,7 +155,7 @@ impl VoiceIrohService {
             // address supplied, or any local port if None.  Used for netem
             // tests over a veth pair where all traffic must go through one
             // interface and the relay would bypass the shaping.
-            let mut builder = Endpoint::empty_builder()
+            let mut builder = Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
                 .alpns(vec![config.alpn.clone()]);
             if let Some(addr) = config.bind_addr {
@@ -245,7 +245,11 @@ impl VoiceIrohService {
     /// instead of going through the broadcast channel. Connection events
     /// (peer connected/disconnected) still go through the broadcast.
     pub fn set_packet_handler(&self, handler: PacketHandler) {
-        *self.shared.packet_handler.write().expect("packet_handler lock poisoned") = Some(handler);
+        *self
+            .shared
+            .packet_handler
+            .write()
+            .expect("packet_handler lock poisoned") = Some(handler);
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
