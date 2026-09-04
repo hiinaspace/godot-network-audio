@@ -174,6 +174,8 @@ func _on_peer_connected(connected_peer_id: String) -> void:
 	var peer_player
 	if spatialize_receivers:
 		peer_player = AudioStreamPlayer3D.new()
+		peer_player.attenuation_model = AudioStreamPlayer3D.ATTENUATION_DISABLED
+		peer_player.max_distance = 100.0
 		var index := receive_players.size()
 		var angle := TAU * float(index) / 8.0
 		peer_player.position = Vector3(cos(angle) * 2.0, 0.0, sin(angle) * 2.0)
