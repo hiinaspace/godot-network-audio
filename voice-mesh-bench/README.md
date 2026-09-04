@@ -1,10 +1,11 @@
 # voice-mesh-bench
 
-Headless, single-process scale harness for the transport and media core. It
-creates one local-only Iroh endpoint per participant, establishes one QUIC
-connection for every pair, sends scheduled Opus talkspurts over unreliable
-datagrams, and runs a separate NetEq receiver for every active
-speaker/listener direction.
+Headless scale harness for the transport and media core. Its direct topology
+creates one local-only Iroh endpoint per participant and one QUIC connection
+for every pair. Its static-star topology connects each participant to a
+dedicated authoritative forwarding endpoint. Both send scheduled Opus
+talkspurts over unreliable datagrams and run a separate NetEq receiver for
+every active speaker/listener direction.
 
 Godot and the GDExtension are intentionally not involved.
 
@@ -110,11 +111,21 @@ Run real Iroh connection churn with continuous media using:
 scripts/run_voice_churn.sh target/voice-mesh/churn 12 3
 ```
 
-Schema v8 closes every connection for one participant, waits for the configured
-downtime, reconnects the same endpoint, and installs fresh datagram readers.
-Affected and unaffected route gaps are reported separately. The churn runner
-uses all participants as continuous senders so DTX and interest changes cannot
-be mistaken for transport gaps.
+Schema v9 covers late join, permanent leave, same-identity reconnect, and
+new-identity replacement. Affected and unaffected route gaps are reported
+separately. The churn runner uses all participants as continuous senders so DTX
+and interest changes cannot be mistaken for transport gaps.
+
+Compare the sender-filtered direct mesh with a static authoritative voice star:
+
+```sh
+scripts/run_voice_topology_comparison.sh target/voice-mesh/topology 12 3
+```
+
+Schema v10 adds `--topology direct|star`, SFU ingress/forwarding/error counters,
+and separate client-uplink and SFU-egress bitrates. The SFU forwards the
+original encoded datagram without decoding or mixing, filtering against the
+same deterministic interest schedule used by direct senders.
 
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party

@@ -3,7 +3,10 @@ use std::{
     env, fs,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -26,7 +29,7 @@ const ALPN: &[u8] = b"godot-network-audio/mesh-bench/0";
 const SAMPLE_RATE: u32 = 48_000;
 const ENCODE_FRAME_SAMPLES: usize = 960;
 const PULL_FRAME_SAMPLES: usize = 480;
-const ENVELOPE_HEADER_LEN: usize = 16;
+const ENVELOPE_HEADER_LEN: usize = 24;
 const PLAYOUT_TICK: Duration = Duration::from_millis(10);
 const SEND_TICK: Duration = Duration::from_millis(20);
 const STARTUP_SETTLE: Duration = Duration::from_millis(100);
@@ -50,6 +53,21 @@ const NON_SILENT_RMS: f32 = 0.000_1;
 enum Scenario {
     Baseline,
     GameInterest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Topology {
+    Direct,
+    Star,
+}
+
+impl Topology {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct-full-mesh",
+            Self::Star => "authoritative-star",
+        }
+    }
 }
 
 impl Scenario {
@@ -160,6 +178,7 @@ impl Delivery {
 
 #[derive(Debug, Clone)]
 struct Config {
+    topology: Topology,
     participants: usize,
     talkers: usize,
     duration: Duration,
@@ -186,6 +205,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            topology: Topology::Direct,
             participants: 4,
             talkers: 1,
             duration: Duration::from_secs(5),
@@ -220,6 +240,14 @@ impl Config {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
+                "--topology" => {
+                    let value = args.next().context("--topology requires a value")?;
+                    config.topology = match value.as_str() {
+                        "direct" => Topology::Direct,
+                        "star" => Topology::Star,
+                        _ => bail!("--topology must be direct or star, got {value}"),
+                    };
+                }
                 "--participants" => {
                     config.participants = parse_next(&mut args, "--participants")?;
                 }
@@ -383,6 +411,9 @@ impl Config {
             }
         }
         if config.churn_profile.active() {
+            if config.topology != Topology::Direct {
+                bail!("churn profiles currently require --topology direct");
+            }
             if config.churn_participant >= config.participants {
                 bail!("--churn-participant must be less than participants");
             }
@@ -493,9 +524,11 @@ type EndpointSlot = Arc<RwLock<Option<Endpoint>>>;
 
 struct Mesh {
     endpoints: Vec<EndpointSlot>,
+    sfu_endpoint: Option<Endpoint>,
     connections: Vec<Vec<ConnectionSlot>>,
     receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
     readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    sfu_counters: Arc<SfuCounters>,
 }
 
 impl Mesh {
@@ -506,8 +539,41 @@ impl Mesh {
                 endpoint.close().await;
             }
         }
+        if let Some(endpoint) = self.sfu_endpoint {
+            endpoint.close().await;
+        }
         for reader in self.readers.lock().expect("reader lock poisoned").drain(..) {
             reader.abort();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SfuCounters {
+    received_datagrams: AtomicU64,
+    received_bytes: AtomicU64,
+    forwarded_datagrams: AtomicU64,
+    forwarded_bytes: AtomicU64,
+    send_errors: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SfuSnapshot {
+    received_datagrams: u64,
+    received_bytes: u64,
+    forwarded_datagrams: u64,
+    forwarded_bytes: u64,
+    send_errors: u64,
+}
+
+impl SfuCounters {
+    fn snapshot(&self) -> SfuSnapshot {
+        SfuSnapshot {
+            received_datagrams: self.received_datagrams.load(Ordering::Relaxed),
+            received_bytes: self.received_bytes.load(Ordering::Relaxed),
+            forwarded_datagrams: self.forwarded_datagrams.load(Ordering::Relaxed),
+            forwarded_bytes: self.forwarded_bytes.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -628,6 +694,12 @@ struct Metrics {
     sent_bytes: u64,
     received_bytes: u64,
     outbound_mbit_per_second: f64,
+    sfu_received_datagrams: u64,
+    sfu_received_bytes: u64,
+    sfu_forwarded_datagrams: u64,
+    sfu_forwarded_bytes: u64,
+    sfu_send_errors: u64,
+    sfu_outbound_mbit_per_second: f64,
     latency_us_p50: u64,
     latency_us_p95: u64,
     latency_us_p99: u64,
@@ -1029,6 +1101,7 @@ fn print_help() {
          \nUSAGE:\n\
          \x20 voice-mesh-bench [OPTIONS]\n\
          \nOPTIONS:\n\
+         \x20 --topology NAME  direct or star (default direct)\n\
          \x20 --participants N  Fully connected participants (2-64; default 4)\n\
          \x20 --talkers N       Scheduled talkers (default 1)\n\
          \x20 --seconds N       Media duration, at least 0.5 (default 5)\n\
@@ -1216,13 +1289,16 @@ async fn run(config: Config) -> Result<Metrics> {
 
     let cpu_seconds = after_media.cpu_seconds - after_setup.cpu_seconds;
     let media_seconds = media_wall.as_secs_f64();
-    let missing_datagrams = send_counters
-        .sent_datagrams
-        .saturating_sub(counters.received_datagrams);
+    let sfu = mesh.sfu_counters.snapshot();
+    let expected_received_datagrams = match config.topology {
+        Topology::Direct => send_counters.sent_datagrams,
+        Topology::Star => sfu.forwarded_datagrams,
+    };
+    let missing_datagrams = expected_received_datagrams.saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 9,
+        schema_version: 10,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
-        topology: "direct-full-mesh",
+        topology: config.topology.as_str(),
         scenario: config.scenario.as_str(),
         delivery: match config.scenario {
             Scenario::Baseline => "full-broadcast",
@@ -1267,10 +1343,12 @@ async fn run(config: Config) -> Result<Metrics> {
         },
         dtx: config.dtx,
         requested_duration_seconds: config.duration.as_secs_f64(),
-        mesh_connections: if config.churn_profile == ChurnProfile::Join {
-            (config.participants - 1) * (config.participants - 2) / 2
-        } else {
-            config.participants * (config.participants - 1) / 2
+        mesh_connections: match config.topology {
+            Topology::Star => config.participants,
+            Topology::Direct if config.churn_profile == ChurnProfile::Join => {
+                (config.participants - 1) * (config.participants - 2) / 2
+            }
+            Topology::Direct => config.participants * (config.participants - 1) / 2,
         },
         active_receiver_count,
         setup_wall_ms: setup_wall.as_secs_f64() * 1_000.0,
@@ -1315,6 +1393,16 @@ async fn run(config: Config) -> Result<Metrics> {
         received_bytes: counters.received_bytes,
         outbound_mbit_per_second: if media_seconds > 0.0 {
             send_counters.sent_bytes as f64 * 8.0 / media_seconds / 1_000_000.0
+        } else {
+            0.0
+        },
+        sfu_received_datagrams: sfu.received_datagrams,
+        sfu_received_bytes: sfu.received_bytes,
+        sfu_forwarded_datagrams: sfu.forwarded_datagrams,
+        sfu_forwarded_bytes: sfu.forwarded_bytes,
+        sfu_send_errors: sfu.send_errors,
+        sfu_outbound_mbit_per_second: if media_seconds > 0.0 {
+            sfu.forwarded_bytes as f64 * 8.0 / media_seconds / 1_000_000.0
         } else {
             0.0
         },
@@ -1418,6 +1506,17 @@ async fn build_mesh(
     clock_start: Instant,
     receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
 ) -> Result<Mesh> {
+    match config.topology {
+        Topology::Direct => build_direct_mesh(config, clock_start, receive_txs).await,
+        Topology::Star => build_star(config, clock_start, receive_txs).await,
+    }
+}
+
+async fn build_direct_mesh(
+    config: &Config,
+    clock_start: Instant,
+    receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
+) -> Result<Mesh> {
     let participants = config.participants;
     let mut endpoints = Vec::with_capacity(participants);
     for participant in 0..participants {
@@ -1496,9 +1595,96 @@ async fn build_mesh(
 
     Ok(Mesh {
         endpoints,
+        sfu_endpoint: None,
         connections,
         receive_txs,
         readers,
+        sfu_counters: Arc::new(SfuCounters::default()),
+    })
+}
+
+async fn build_star(
+    config: &Config,
+    clock_start: Instant,
+    receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
+) -> Result<Mesh> {
+    let participants = config.participants;
+    let sfu_endpoint = new_endpoint().await?;
+    let sfu_addr = sfu_endpoint.addr();
+    let mut endpoints = Vec::with_capacity(participants);
+    let connections = (0..participants)
+        .map(|_| {
+            (0..participants)
+                .map(|_| Arc::new(RwLock::new(None)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut sfu_connections = Vec::with_capacity(participants);
+
+    for (participant, connection_row) in connections.iter().enumerate() {
+        let endpoint = new_endpoint().await?;
+        let accepting_endpoint = sfu_endpoint.clone();
+        let accepting = async move {
+            let incoming = accepting_endpoint
+                .accept()
+                .await
+                .context("SFU endpoint closed while building star")?;
+            incoming.await.context("accept star client")
+        };
+        let connecting_endpoint = endpoint.clone();
+        let connecting_addr = sfu_addr.clone();
+        let connecting = async move {
+            connecting_endpoint
+                .connect(connecting_addr, ALPN)
+                .await
+                .context("connect client to SFU")
+        };
+        let (client, server) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(connecting, accepting)
+        })
+        .await
+        .context("timed out building star connection")??;
+        *connection_row[participant]
+            .write()
+            .expect("connection lock poisoned") = Some(client);
+        endpoints.push(Arc::new(RwLock::new(Some(endpoint))));
+        sfu_connections.push(server);
+    }
+
+    let readers = Arc::new(Mutex::new(Vec::with_capacity(participants * 2)));
+    for (participant, connection_row) in connections.iter().enumerate() {
+        let connection = connection_row[participant]
+            .read()
+            .expect("connection lock poisoned")
+            .clone()
+            .expect("star client connection was installed");
+        spawn_star_client_reader(
+            connection,
+            receive_txs[participant].clone(),
+            clock_start,
+            &readers,
+        );
+    }
+    let sfu_counters = Arc::new(SfuCounters::default());
+    let sfu_connections = Arc::new(sfu_connections);
+    for speaker in 0..participants {
+        spawn_sfu_reader(
+            speaker,
+            sfu_connections[speaker].clone(),
+            Arc::clone(&sfu_connections),
+            config.clone(),
+            Arc::clone(&sfu_counters),
+            &readers,
+        );
+    }
+
+    Ok(Mesh {
+        endpoints,
+        sfu_endpoint: Some(sfu_endpoint),
+        connections,
+        receive_txs,
+        readers,
+        sfu_counters,
     })
 }
 
@@ -1540,6 +1726,87 @@ fn spawn_datagram_reader(
         }
     });
     readers.lock().expect("reader lock poisoned").push(reader);
+}
+
+fn spawn_star_client_reader(
+    connection: Connection,
+    tx: mpsc::UnboundedSender<ReceivedDatagram>,
+    clock_start: Instant,
+    readers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    let reader = tokio::spawn(async move {
+        while let Ok(bytes) = connection.read_datagram().await {
+            let Some(speaker) = envelope_speaker(&bytes) else {
+                continue;
+            };
+            let received_at_us = clock_start.elapsed().as_micros() as u64;
+            if tx
+                .send(ReceivedDatagram {
+                    speaker,
+                    bytes,
+                    received_at_us,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    readers.lock().expect("reader lock poisoned").push(reader);
+}
+
+fn spawn_sfu_reader(
+    speaker: usize,
+    source: Connection,
+    clients: Arc<Vec<Connection>>,
+    config: Config,
+    counters: Arc<SfuCounters>,
+    readers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    let reader = tokio::spawn(async move {
+        while let Ok(bytes) = source.read_datagram().await {
+            counters.received_datagrams.fetch_add(1, Ordering::Relaxed);
+            counters
+                .received_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            if envelope_speaker(&bytes) != Some(speaker) || bytes.len() < ENVELOPE_HEADER_LEN {
+                continue;
+            }
+            let frame_index = u64::from_be_bytes(
+                bytes[8..16]
+                    .try_into()
+                    .expect("checked SFU envelope length"),
+            );
+            for (listener, connection) in clients.iter().enumerate() {
+                if listener == speaker {
+                    continue;
+                }
+                if config.scenario == Scenario::GameInterest
+                    && config.delivery == Delivery::SenderFiltered
+                    && !listener_interested(&config, frame_index, speaker, listener)
+                {
+                    continue;
+                }
+                match connection.send_datagram(bytes.clone()) {
+                    Ok(()) => {
+                        counters.forwarded_datagrams.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .forwarded_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        counters.send_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+    readers.lock().expect("reader lock poisoned").push(reader);
+}
+
+fn envelope_speaker(bytes: &[u8]) -> Option<usize> {
+    let raw = u64::from_be_bytes(bytes.get(16..24)?.try_into().ok()?);
+    usize::try_from(raw).ok()
 }
 
 async fn run_churn(
@@ -2088,9 +2355,36 @@ fn encode_and_send(
     let mut wire = Vec::with_capacity(ENVELOPE_HEADER_LEN + VoicePacket::HEADER_LEN + 512);
     wire.extend_from_slice(&sent_at_us.to_be_bytes());
     wire.extend_from_slice(&frame_index.to_be_bytes());
+    wire.extend_from_slice(&(speaker as u64).to_be_bytes());
     packet.encode_to_bytes(&mut wire);
     let wire = Bytes::from(wire);
     let fanout_start = Instant::now();
+    if config.topology == Topology::Star {
+        let connection = connections[speaker]
+            .read()
+            .expect("connection lock poisoned")
+            .clone();
+        if let Some(connection) = connection {
+            match connection.send_datagram(wire.clone()) {
+                Ok(()) => {
+                    counters.sent_datagrams += 1;
+                    counters.sent_bytes += wire.len() as u64;
+                    if stress {
+                        counters.stress_sent_datagrams += 1;
+                    }
+                }
+                Err(_) => counters.send_errors += 1,
+            }
+        } else {
+            counters.send_errors += 1;
+        }
+        let fanout_span_us = fanout_start.elapsed().as_micros() as u64;
+        counters.fanout_spans_us.push(fanout_span_us);
+        if stress {
+            counters.stress_fanout_spans_us.push(fanout_span_us);
+        }
+        return Ok(());
+    }
     for (listener, connection) in connections.iter().enumerate().take(config.participants) {
         if listener == speaker {
             continue;
@@ -2171,7 +2465,7 @@ fn drain_received(
                 .expect("checked envelope length"),
         );
         let frame_index = u64::from_be_bytes(
-            datagram.bytes[8..ENVELOPE_HEADER_LEN]
+            datagram.bytes[8..16]
                 .try_into()
                 .expect("checked envelope length"),
         );

@@ -10,6 +10,7 @@ import sys
 FIELDS = [
     "schema_version",
     "metric_sample_capacity",
+    "topology",
     "scenario",
     "delivery",
     "receiver_policy",
@@ -27,6 +28,7 @@ FIELDS = [
     "churn_reconnects",
     "churn_reconnect_errors",
     "churn_reconnect_duration_ms",
+    "churn_new_identity",
     "affected_route_max_transport_gap_ms",
     "unaffected_route_max_transport_gap_ms",
     "seed",
@@ -63,6 +65,10 @@ FIELDS = [
     "media_impairment_dropped_datagrams",
     "missing_datagrams",
     "outbound_mbit_per_second",
+    "sfu_received_datagrams",
+    "sfu_forwarded_datagrams",
+    "sfu_send_errors",
+    "sfu_outbound_mbit_per_second",
     "latency_us_p50",
     "latency_us_p95",
     "latency_us_p99",
@@ -119,6 +125,7 @@ def main() -> None:
     rows.sort(
         key=lambda row: (
             row.get("scenario", "baseline"),
+            row.get("topology", "direct-full-mesh"),
             row["participants"],
             row["talkers"],
             row.get("delivery", "full-broadcast"),
