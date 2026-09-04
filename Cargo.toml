@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "codec-bench",
     "voice-core",
     "voice-mesh-bench",
     "gdext",
