@@ -140,6 +140,15 @@ bitrate, algorithmic delay, and recovery from burst loss alongside quality.
 Do not apply a single-source full-reference score to a mixed multi-speaker
 output.
 
+**1.6.1/DRED spike complete:** the focused five-run comparison found roughly
+6% higher voiced encode cost, 17% higher mixed voice/silence cost, and 73%
+higher continuous-silence cost in 1.6.1, with unchanged packet behavior. DRED
+did not fit at 16 kb/s; at 24 kb/s and above it functionally recovered a 100 ms
+scripted gap, while adding 21-180% encoder CPU and 1-15% wire bytes depending on
+bitrate. See `OPUS_1_6_DRED_RESULTS.md`. Keep production on 1.5.2 pending the
+broader review; recorded-speech quality work is optional follow-up rather than
+a prerequisite for the Godot scale gate.
+
 ## Topology, churn, and realism sequence
 
 1. Run clean sender-filtered and broadcast-and-discard interest workloads for
