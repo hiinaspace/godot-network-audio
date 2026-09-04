@@ -72,6 +72,7 @@ func _ready() -> void:
 
 	if role == ROLE_RECEIVER:
 		if spatialize_receivers:
+			get_viewport().audio_listener_enable_3d = true
 			audio_listener = AudioListener3D.new()
 			add_child(audio_listener)
 			audio_listener.make_current()
