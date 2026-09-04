@@ -96,8 +96,10 @@ fn main() -> Result<()> {
     let mut send_errors = 0_u64;
     let mut retired_peers = Vec::new();
     let (replacement_tx, replacement_rx) = mpsc::channel::<Result<Peer>>();
+    let (retired_tx, retired_rx) = mpsc::channel::<Peer>();
 
     for tick in 0..total_frames {
+        retired_peers.extend(retired_rx.try_iter());
         for peer in replacement_rx.try_iter() {
             let mut peer = peer?;
             log_event(&mut events, "joined", &peer)?;
@@ -120,7 +122,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
-                &mut retired_peers,
+                &retired_tx,
             )?;
             // Joining a replacement can occasionally block for seconds inside
             // Iroh. Keep that control-plane work off the 20 ms media loop.
@@ -146,7 +148,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
-                &mut retired_peers,
+                &retired_tx,
             )?;
         } else if tick == phase_frames * 5 {
             set_group_active(&mut peers, 2, active_speakers, false, &mut events)?;
@@ -199,6 +201,8 @@ fn main() -> Result<()> {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
     events.flush()?;
+    drop(retired_tx);
+    retired_peers.extend(retired_rx);
     let mut shutdown_tasks = Vec::new();
     retired_peers.extend(peers.into_iter().flatten());
     spawn_shutdowns(retired_peers, &mut shutdown_tasks);
@@ -304,7 +308,7 @@ fn leave_group(
     active_speakers: usize,
     event: &str,
     events: &mut BufWriter<File>,
-    retired_peers: &mut Vec<Peer>,
+    retired_tx: &mpsc::Sender<Peer>,
 ) -> Result<()> {
     let mut departing = Vec::with_capacity(active_speakers);
     for slot in group_slots(group, active_speakers) {
@@ -315,10 +319,13 @@ fn leave_group(
             departing.push(peer);
         }
     }
-    for peer in &departing {
-        let _ = peer.service.disconnect(peer.remote);
+    for peer in departing {
+        let tx = retired_tx.clone();
+        thread::spawn(move || {
+            let _ = peer.service.disconnect(peer.remote);
+            let _ = tx.send(peer);
+        });
     }
-    retired_peers.extend(departing);
     Ok(())
 }
 
