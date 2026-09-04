@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,9 +73,12 @@ fn main() -> Result<()> {
         File::create(event_path).with_context(|| format!("create event log {event_path}"))?,
     );
     let setup_start = Instant::now();
-    let mut peers = (0..peer_count)
-        .map(|slot| connect_peer(&endpoint, slot, 0, &mut events).map(Some))
-        .collect::<Result<Vec<_>>>()?;
+    let mut peers = Vec::with_capacity(peer_count);
+    for slot in 0..peer_count {
+        let peer = connect_peer(&endpoint, slot, 0)?;
+        log_event(&mut events, "joined", &peer)?;
+        peers.push(Some(peer));
+    }
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
 
     thread::sleep(Duration::from_millis(100));
@@ -84,8 +88,19 @@ fn main() -> Result<()> {
     let mut sent_datagrams = 0_u64;
     let mut send_errors = 0_u64;
     let mut retired_peers = Vec::new();
+    let (replacement_tx, replacement_rx) = mpsc::channel::<Result<Peer>>();
 
     for tick in 0..total_frames {
+        for peer in replacement_rx.try_iter() {
+            let mut peer = peer?;
+            log_event(&mut events, "joined", &peer)?;
+            if tick >= phase_frames * 3 && tick < phase_frames * 4 {
+                peer.active = true;
+                log_event(&mut events, "talker_on", &peer)?;
+            }
+            let slot = peer.slot;
+            peers[slot] = Some(peer);
+        }
         if tick == 0 {
             set_group_active(&mut peers, 0, active_speakers, true, &mut events)?;
         } else if tick == phase_frames {
@@ -100,14 +115,23 @@ fn main() -> Result<()> {
                 &mut events,
                 &mut retired_peers,
             )?;
-        } else if tick == phase_frames * 2 + 25 {
+            // Joining a replacement can occasionally block for seconds inside
+            // Iroh. Keep that control-plane work off the 20 ms media loop.
             for slot in group_slots(0, active_speakers) {
-                peers[slot] = Some(connect_peer(&endpoint, slot, 1, &mut events)?);
+                let endpoint = endpoint.clone();
+                let tx = replacement_tx.clone();
+                thread::spawn(move || {
+                    let result = connect_peer(&endpoint, slot, 1);
+                    let _ = tx.send(result);
+                });
             }
         } else if tick == phase_frames * 3 {
             set_group_active(&mut peers, 1, active_speakers, false, &mut events)?;
-            set_group_active(&mut peers, 0, active_speakers, true, &mut events)?;
+            set_group_active_if_present(&mut peers, 0, active_speakers, true, &mut events)?;
         } else if tick == phase_frames * 4 {
+            if group_slots(0, active_speakers).any(|slot| peers[slot].is_none()) {
+                bail!("replacement peers did not join within one phase");
+            }
             set_group_active(&mut peers, 2, active_speakers, true, &mut events)?;
             leave_group(
                 &mut peers,
@@ -181,12 +205,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn connect_peer(
-    endpoint: &EndpointAddr,
-    slot: usize,
-    generation: u32,
-    events: &mut BufWriter<File>,
-) -> Result<Peer> {
+fn connect_peer(endpoint: &EndpointAddr, slot: usize, generation: u32) -> Result<Peer> {
     let service = VoiceIrohService::bind(VoiceIrohConfig {
         bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         relay: false,
@@ -209,7 +228,6 @@ fn connect_peer(
         active: false,
         closing_talkspurt: false,
     };
-    log_event(events, "joined", &peer)?;
     Ok(peer)
 }
 
@@ -224,6 +242,30 @@ fn set_group_active(
         let peer = peers[slot]
             .as_mut()
             .with_context(|| format!("missing peer in slot {slot}"))?;
+        if peer.active != active {
+            peer.closing_talkspurt = !active;
+            peer.active = active;
+            log_event(
+                events,
+                if active { "talker_on" } else { "talker_off" },
+                peer,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn set_group_active_if_present(
+    peers: &mut [Option<Peer>],
+    group: usize,
+    active_speakers: usize,
+    active: bool,
+    events: &mut BufWriter<File>,
+) -> Result<()> {
+    for slot in group_slots(group, active_speakers) {
+        let Some(peer) = peers[slot].as_mut() else {
+            continue;
+        };
         if peer.active != active {
             peer.closing_talkspurt = !active;
             peer.active = active;
