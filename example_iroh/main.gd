@@ -30,6 +30,7 @@ var player
 var receive_streams := {}
 var receive_players := {}
 var audio_listener: AudioListener3D
+var camera: Camera3D
 var transport
 var stats_timer: Timer
 var quit_timer: Timer
@@ -73,6 +74,9 @@ func _ready() -> void:
 	if role == ROLE_RECEIVER:
 		if spatialize_receivers:
 			get_viewport().audio_listener_enable_3d = true
+			camera = Camera3D.new()
+			add_child(camera)
+			camera.make_current()
 			audio_listener = AudioListener3D.new()
 			add_child(audio_listener)
 			audio_listener.make_current()
