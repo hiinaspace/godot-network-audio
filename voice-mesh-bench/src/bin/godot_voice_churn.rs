@@ -79,6 +79,13 @@ fn main() -> Result<()> {
         log_event(&mut events, "joined", &peer)?;
         peers.push(Some(peer));
     }
+    // Bind replacement endpoints before the media clock starts. Constructing
+    // seven Tokio/Iroh runtimes mid-talkspurt is artificial co-host contention;
+    // the scenario should measure connection churn, not runtime construction.
+    let mut prepared_replacements = Vec::with_capacity(active_speakers);
+    for slot in group_slots(0, active_speakers) {
+        prepared_replacements.push((slot, bind_service()?));
+    }
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
 
     thread::sleep(Duration::from_millis(100));
@@ -117,11 +124,11 @@ fn main() -> Result<()> {
             )?;
             // Joining a replacement can occasionally block for seconds inside
             // Iroh. Keep that control-plane work off the 20 ms media loop.
-            for slot in group_slots(0, active_speakers) {
+            for (slot, service) in prepared_replacements.drain(..) {
                 let endpoint = endpoint.clone();
                 let tx = replacement_tx.clone();
                 thread::spawn(move || {
-                    let result = connect_peer(&endpoint, slot, 1);
+                    let result = connect_prepared_peer(&endpoint, service, slot, 1);
                     let _ = tx.send(result);
                 });
             }
@@ -206,11 +213,23 @@ fn main() -> Result<()> {
 }
 
 fn connect_peer(endpoint: &EndpointAddr, slot: usize, generation: u32) -> Result<Peer> {
-    let service = VoiceIrohService::bind(VoiceIrohConfig {
+    connect_prepared_peer(endpoint, bind_service()?, slot, generation)
+}
+
+fn bind_service() -> Result<VoiceIrohService> {
+    VoiceIrohService::bind(VoiceIrohConfig {
         bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         relay: false,
         ..Default::default()
-    })?;
+    })
+}
+
+fn connect_prepared_peer(
+    endpoint: &EndpointAddr,
+    service: VoiceIrohService,
+    slot: usize,
+    generation: u32,
+) -> Result<Peer> {
     let remote = service
         .connect(endpoint.clone())
         .with_context(|| format!("connect churn peer slot {slot} generation {generation}"))?;

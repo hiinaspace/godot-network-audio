@@ -48,7 +48,8 @@ receiver_events="$OUTPUT_DIR/receiver_events.jsonl"
 quit_file="$OUTPUT_DIR/receiver_done_${tag}"
 env PULSE_SINK="$sink" GNA_IROH_ROLE=receiver GNA_IROH_BIND_ADDR=127.0.0.1:0 \
   GNA_IROH_ENDPOINT_INFO_PATH="$endpoint" GNA_DEMO_OUTPUT_DEVICE="$sink" \
-  GNA_DEMO_SPATIALIZE=1 GNA_DEMO_QUIT_SECONDS="$RECEIVER_SAFETY_SECONDS" \
+  GNA_DEMO_SPATIALIZE="${GNA_CHURN_SPATIALIZE:-1}" \
+  GNA_DEMO_QUIT_SECONDS="$RECEIVER_SAFETY_SECONDS" \
   GNA_DEMO_QUIT_FILE="$quit_file" \
   GNA_DEMO_TRACE_JSONL="$trace" GNA_DEMO_EVENT_JSONL="$receiver_events" \
   /usr/bin/time -v -o "$OUTPUT_DIR/receiver_time.txt" \
