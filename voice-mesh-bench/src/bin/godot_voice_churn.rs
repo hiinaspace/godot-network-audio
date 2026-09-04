@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     let mut next_deadline = Instant::now();
     let mut sent_datagrams = 0_u64;
     let mut send_errors = 0_u64;
-    let mut shutdown_tasks = Vec::new();
+    let mut retired_peers = Vec::new();
 
     for tick in 0..total_frames {
         if tick == 0 {
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
-                &mut shutdown_tasks,
+                &mut retired_peers,
             )?;
         } else if tick == phase_frames * 2 + 25 {
             for slot in group_slots(0, active_speakers) {
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
-                &mut shutdown_tasks,
+                &mut retired_peers,
             )?;
         } else if tick == phase_frames * 5 {
             set_group_active(&mut peers, 2, active_speakers, false, &mut events)?;
@@ -168,7 +168,9 @@ fn main() -> Result<()> {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
     events.flush()?;
-    spawn_shutdowns(peers.into_iter().flatten().collect(), &mut shutdown_tasks);
+    let mut shutdown_tasks = Vec::new();
+    retired_peers.extend(peers.into_iter().flatten());
+    spawn_shutdowns(retired_peers, &mut shutdown_tasks);
     for task in shutdown_tasks {
         let _ = task.join();
     }
@@ -241,7 +243,7 @@ fn leave_group(
     active_speakers: usize,
     event: &str,
     events: &mut BufWriter<File>,
-    shutdown_tasks: &mut Vec<thread::JoinHandle<()>>,
+    retired_peers: &mut Vec<Peer>,
 ) -> Result<()> {
     let mut departing = Vec::with_capacity(active_speakers);
     for slot in group_slots(group, active_speakers) {
@@ -252,7 +254,10 @@ fn leave_group(
             departing.push(peer);
         }
     }
-    spawn_shutdowns(departing, shutdown_tasks);
+    for peer in &departing {
+        let _ = peer.service.disconnect(peer.remote);
+    }
+    retired_peers.extend(departing);
     Ok(())
 }
 

@@ -232,6 +232,23 @@ impl VoiceIrohService {
             .map_err(|err| anyhow!("send voice datagram to {}: {err}", peer.id))
     }
 
+    /// Close one peer connection without tearing down the endpoint/runtime.
+    /// Room membership churn should use this instead of destroying a service.
+    pub fn disconnect(&self, peer: RemotePeer) -> bool {
+        let connection = self
+            .shared
+            .peers
+            .lock()
+            .expect("peer map poisoned")
+            .remove(&peer.id);
+        if let Some(connection) = connection {
+            connection.close(0_u8.into(), b"voice peer disconnected");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Return a clone of the active `Connection` for `peer`, if one exists.
     /// `Connection` is internally reference-counted so cloning is cheap.
     pub fn get_connection(&self, peer: RemotePeer) -> Option<Connection> {
