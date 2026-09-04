@@ -10,6 +10,7 @@ import sys
 FIELDS = [
     "schema_version",
     "metric_sample_capacity",
+    "process_layout",
     "topology",
     "scenario",
     "delivery",
@@ -46,6 +47,9 @@ FIELDS = [
     "max_rss_kib",
     "current_rss_kib_after_setup",
     "current_rss_kib_after_media",
+    "summed_current_rss_kib",
+    "max_worker_rss_kib",
+    "worker_processes",
     "sender_skipped_ticks",
     "stress_events",
     "stress_sender_ticks",
@@ -126,6 +130,7 @@ def main() -> None:
         key=lambda row: (
             row.get("scenario", "baseline"),
             row.get("topology", "direct-full-mesh"),
+            row.get("process_layout", "single"),
             row["participants"],
             row["talkers"],
             row.get("delivery", "full-broadcast"),

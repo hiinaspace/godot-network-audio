@@ -127,6 +127,15 @@ and separate client-uplink and SFU-egress bitrates. The SFU forwards the
 original encoded datagram without decoding or mixing, filtering against the
 same deterministic interest schedule used by direct senders.
 
+Use `--process-layout multi` to run each virtual participant as an independent
+OS process (and the authoritative forwarder as another process for star). This
+schema-v11 control retains one encoder, packet queue, NetEq set, and playback
+clock per client, while removing the shared Tokio runtime and heap. Its report
+includes summed worker CPU/RSS, maximum per-worker RSS, merged latency samples,
+and aggregate transport, deadline, concealment, and SFU counters. Multiprocess
+latency uses the host-wide monotonic clock; this mode is currently scoped to the
+game-interest scenario without churn.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.

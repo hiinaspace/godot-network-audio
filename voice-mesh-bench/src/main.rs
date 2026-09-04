@@ -1,8 +1,10 @@
 use std::{
     collections::BinaryHeap,
     env, fs,
+    io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -17,10 +19,16 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use iroh::{
     endpoint::{presets, Connection},
-    Endpoint,
+    Endpoint, EndpointAddr,
 };
-use serde::Serialize;
-use tokio::{runtime::Builder, sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    runtime::Builder,
+    sync::mpsc,
+    task::JoinHandle,
+    time::MissedTickBehavior,
+};
 use voice_core::{
     PacketArrival, PacketFlags, VoiceEncoder, VoiceEncoderConfig, VoicePacket, VoiceReceiver,
 };
@@ -49,13 +57,13 @@ const CROWD_BURST_END_FRAMES: u64 = 300;
 const BOUNDARY_OSCILLATION_FRAMES: u64 = 5;
 const NON_SILENT_RMS: f32 = 0.000_1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Scenario {
     Baseline,
     GameInterest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Topology {
     Direct,
     Star,
@@ -70,6 +78,12 @@ impl Topology {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProcessLayout {
+    Single,
+    Multi,
+}
+
 impl Scenario {
     fn as_str(self) -> &'static str {
         match self {
@@ -79,19 +93,19 @@ impl Scenario {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Delivery {
     SenderFiltered,
     BroadcastDiscard,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ReceiverPolicy {
     Retire,
     Pool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum InterestProfile {
     Rotating,
     CrowdBurst,
@@ -99,7 +113,7 @@ enum InterestProfile {
     BoundaryOscillation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum MediaImpairment {
     None,
     UniformLoss,
@@ -107,7 +121,7 @@ enum MediaImpairment {
     Outage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ChurnProfile {
     None,
     Join,
@@ -176,9 +190,10 @@ impl Delivery {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     topology: Topology,
+    process_layout: ProcessLayout,
     participants: usize,
     talkers: usize,
     duration: Duration,
@@ -206,6 +221,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             topology: Topology::Direct,
+            process_layout: ProcessLayout::Single,
             participants: 4,
             talkers: 1,
             duration: Duration::from_secs(5),
@@ -246,6 +262,14 @@ impl Config {
                         "direct" => Topology::Direct,
                         "star" => Topology::Star,
                         _ => bail!("--topology must be direct or star, got {value}"),
+                    };
+                }
+                "--process-layout" => {
+                    let value = args.next().context("--process-layout requires a value")?;
+                    config.process_layout = match value.as_str() {
+                        "single" => ProcessLayout::Single,
+                        "multi" => ProcessLayout::Multi,
+                        _ => bail!("--process-layout must be single or multi, got {value}"),
                     };
                 }
                 "--participants" => {
@@ -438,6 +462,14 @@ impl Config {
                 bail!("churn start plus downtime must be shorter than the media duration");
             }
         }
+        if config.process_layout == ProcessLayout::Multi && config.churn_profile.active() {
+            bail!("multiprocess comparison does not support churn profiles");
+        }
+        if config.process_layout == ProcessLayout::Multi
+            && config.scenario != Scenario::GameInterest
+        {
+            bail!("multiprocess comparison currently requires --scenario game-interest");
+        }
         Ok(Some(config))
     }
 }
@@ -625,6 +657,7 @@ struct AllocatorUsage {
 struct Metrics {
     schema_version: u32,
     metric_sample_capacity: usize,
+    process_layout: &'static str,
     topology: &'static str,
     scenario: &'static str,
     delivery: &'static str,
@@ -900,6 +933,10 @@ impl MetricSamples {
         percentile(&mut values, rank)
     }
 
+    fn into_values(self) -> Vec<u64> {
+        self.samples.into_iter().map(|(_, value)| value).collect()
+    }
+
     fn count(&self) -> u64 {
         self.seen
     }
@@ -1070,11 +1107,166 @@ impl SendCounters {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum WorkerRole {
+    Client,
+    Sfu,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerHello {
+    id: usize,
+    role: WorkerRole,
+    endpoint_addr: EndpointAddr,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WorkerCommand {
+    Configure(Config),
+    Connect { peer: usize, addr: EndpointAddr },
+    Accept { peer: usize },
+    Start { delay_ms: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WorkerResponse {
+    Hello(WorkerHello),
+    Ack,
+    Result(ProcessWorkerResult),
+    Error(String),
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProcessWorkerResult {
+    id: usize,
+    role: Option<WorkerRole>,
+    cpu_seconds: f64,
+    max_rss_kib: i64,
+    current_rss_kib: i64,
+    sent_datagrams: u64,
+    sent_bytes: u64,
+    send_errors: u64,
+    received_datagrams: u64,
+    received_bytes: u64,
+    latency_samples_us: Vec<u64>,
+    playout_ticks: u64,
+    playout_deadline_misses: u64,
+    receiver_pull_samples: u64,
+    concealed_samples: u64,
+    receiver_errors: usize,
+    sfu_received_datagrams: u64,
+    sfu_received_bytes: u64,
+    sfu_forwarded_datagrams: u64,
+    sfu_forwarded_bytes: u64,
+    sfu_send_errors: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiprocessMetrics {
+    schema_version: u32,
+    process_layout: &'static str,
+    topology: &'static str,
+    scenario: &'static str,
+    participants: usize,
+    talkers: usize,
+    interest_listeners: usize,
+    dtx: bool,
+    seed: u64,
+    worker_processes: usize,
+    setup_wall_ms: f64,
+    media_cpu_seconds: f64,
+    media_cpu_percent_of_one_core: f64,
+    summed_current_rss_kib: i64,
+    max_worker_rss_kib: i64,
+    sent_datagrams: u64,
+    sent_bytes: u64,
+    send_errors: u64,
+    received_datagrams: u64,
+    received_bytes: u64,
+    missing_datagrams: u64,
+    outbound_mbit_per_second: f64,
+    sfu_received_datagrams: u64,
+    sfu_received_bytes: u64,
+    sfu_forwarded_datagrams: u64,
+    sfu_forwarded_bytes: u64,
+    sfu_send_errors: u64,
+    sfu_outbound_mbit_per_second: f64,
+    latency_us_p50: u64,
+    latency_us_p95: u64,
+    latency_us_p99: u64,
+    latency_us_max: u64,
+    playout_deadline_miss_percent: f64,
+    neteq_concealed_percent: f64,
+    neteq_receiver_errors: usize,
+    workers: Vec<ProcessWorkerResult>,
+}
+
+struct ControlWorker {
+    child: Option<Child>,
+    stream: std::net::TcpStream,
+    reader: BufReader<std::net::TcpStream>,
+}
+
+impl ControlWorker {
+    fn send(&mut self, command: &WorkerCommand) -> Result<()> {
+        serde_json::to_writer(&mut self.stream, command).context("serialize worker command")?;
+        self.stream
+            .write_all(b"\n")
+            .context("write worker command")?;
+        self.stream.flush().context("flush worker command")
+    }
+
+    fn receive(&mut self) -> Result<WorkerResponse> {
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .context("read worker response")?;
+        if line.is_empty() {
+            bail!("worker control connection closed unexpectedly");
+        }
+        serde_json::from_str(&line).context("decode worker response")
+    }
+
+    fn expect_ack(&mut self) -> Result<()> {
+        match self.receive()? {
+            WorkerResponse::Ack => Ok(()),
+            WorkerResponse::Error(error) => bail!("worker failed: {error}"),
+            other => bail!("expected worker acknowledgement, got {other:?}"),
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    let raw_args = env::args().collect::<Vec<_>>();
+    if raw_args.get(1).is_some_and(|arg| arg == "--voice-worker") {
+        let control_addr = raw_args
+            .get(2)
+            .context("--voice-worker requires a control address")?
+            .parse::<SocketAddr>()
+            .context("parse worker control address")?;
+        let id = raw_args
+            .get(3)
+            .context("--voice-worker requires an id")?
+            .parse::<usize>()
+            .context("parse worker id")?;
+        let role = match raw_args.get(4).map(String::as_str) {
+            Some("client") => WorkerRole::Client,
+            Some("sfu") => WorkerRole::Sfu,
+            _ => bail!("--voice-worker role must be client or sfu"),
+        };
+        return run_worker_process(control_addr, id, role);
+    }
     let Some(config) = Config::parse()? else {
         print_help();
         return Ok(());
     };
+    if config.process_layout == ProcessLayout::Multi {
+        let metrics = run_multiprocess(config.clone())?;
+        let json = serde_json::to_string_pretty(&metrics)?;
+        write_metrics_output(config.output.as_ref(), &json)?;
+        println!("{json}");
+        return Ok(());
+    }
     let runtime = Builder::new_multi_thread()
         .worker_threads(config.runtime_workers)
         .enable_all()
@@ -1083,16 +1275,501 @@ fn main() -> Result<()> {
         .context("build Tokio runtime")?;
     let metrics = runtime.block_on(run(config.clone()))?;
     let json = serde_json::to_string_pretty(&metrics)?;
-    if let Some(path) = config.output {
+    write_metrics_output(config.output.as_ref(), &json)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn write_metrics_output(path: Option<&PathBuf>, json: &str) -> Result<()> {
+    if let Some(path) = path {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create output directory {}", parent.display()))?;
         }
-        fs::write(&path, format!("{json}\n"))
+        fs::write(path, format!("{json}\n"))
             .with_context(|| format!("write metrics to {}", path.display()))?;
     }
-    println!("{json}");
     Ok(())
+}
+
+fn run_multiprocess(config: Config) -> Result<MultiprocessMetrics> {
+    let setup_start = Instant::now();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .context("bind multiprocess control listener")?;
+    let control_addr = listener.local_addr().context("read control address")?;
+    let worker_count = config.participants + usize::from(config.topology == Topology::Star);
+    let executable = env::current_exe().context("locate benchmark executable")?;
+    let mut children = (0..worker_count).map(|_| None).collect::<Vec<_>>();
+    for (id, child_slot) in children.iter_mut().enumerate() {
+        let role = if id == config.participants {
+            "sfu"
+        } else {
+            "client"
+        };
+        let child = Command::new(&executable)
+            .arg("--voice-worker")
+            .arg(control_addr.to_string())
+            .arg(id.to_string())
+            .arg(role)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn {role} worker {id}"))?;
+        *child_slot = Some(child);
+    }
+
+    let mut workers = (0..worker_count).map(|_| None).collect::<Vec<_>>();
+    for _ in 0..worker_count {
+        let (stream, _) = listener
+            .accept()
+            .context("accept worker control connection")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .context("set worker read timeout")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .context("set worker write timeout")?;
+        let reader = BufReader::new(stream.try_clone().context("clone worker control stream")?);
+        let mut worker = ControlWorker {
+            child: None,
+            stream,
+            reader,
+        };
+        let hello = match worker.receive()? {
+            WorkerResponse::Hello(hello) => hello,
+            other => bail!("expected worker hello, got {other:?}"),
+        };
+        if hello.id >= worker_count || workers[hello.id].is_some() {
+            bail!("invalid or duplicate worker id {}", hello.id);
+        }
+        let worker_id = hello.id;
+        worker.child = children[worker_id].take();
+        workers[worker_id] = Some((worker, hello));
+    }
+    let mut workers = workers
+        .into_iter()
+        .map(|worker| worker.expect("all workers registered"))
+        .collect::<Vec<_>>();
+    for (worker, _) in &mut workers {
+        worker.send(&WorkerCommand::Configure(config.clone()))?;
+        worker.expect_ack()?;
+    }
+
+    match config.topology {
+        Topology::Direct => {
+            for connector in 0..config.participants {
+                for acceptor in (connector + 1)..config.participants {
+                    connect_worker_pair(&mut workers, connector, acceptor)?;
+                }
+            }
+        }
+        Topology::Star => {
+            for client in 0..config.participants {
+                connect_worker_pair(&mut workers, client, config.participants)?;
+            }
+        }
+    }
+    let setup_wall_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
+    for (worker, _) in &mut workers {
+        worker.send(&WorkerCommand::Start { delay_ms: 500 })?;
+    }
+
+    let mut results = Vec::with_capacity(worker_count);
+    for (worker, _) in &mut workers {
+        let result = match worker.receive()? {
+            WorkerResponse::Result(result) => result,
+            WorkerResponse::Error(error) => bail!("worker failed: {error}"),
+            other => bail!("expected worker result, got {other:?}"),
+        };
+        results.push(result);
+    }
+    for (worker, _) in &mut workers {
+        let status = worker
+            .child
+            .as_mut()
+            .expect("worker child was registered")
+            .wait()
+            .context("wait for benchmark worker")?;
+        if !status.success() {
+            bail!("benchmark worker exited with {status}");
+        }
+    }
+
+    Ok(aggregate_multiprocess_metrics(
+        &config,
+        setup_wall_ms,
+        results,
+    ))
+}
+
+fn connect_worker_pair(
+    workers: &mut [(ControlWorker, WorkerHello)],
+    connector: usize,
+    acceptor: usize,
+) -> Result<()> {
+    let accepting_addr = workers[acceptor].1.endpoint_addr.clone();
+    workers[acceptor]
+        .0
+        .send(&WorkerCommand::Accept { peer: connector })?;
+    workers[connector].0.send(&WorkerCommand::Connect {
+        peer: acceptor,
+        addr: accepting_addr,
+    })?;
+    workers[connector].0.expect_ack()?;
+    workers[acceptor].0.expect_ack()
+}
+
+fn aggregate_multiprocess_metrics(
+    config: &Config,
+    setup_wall_ms: f64,
+    results: Vec<ProcessWorkerResult>,
+) -> MultiprocessMetrics {
+    let media_seconds = config.duration.as_secs_f64() + DELIVERY_GRACE.as_secs_f64();
+    let cpu_seconds = results.iter().map(|result| result.cpu_seconds).sum::<f64>();
+    let sent_datagrams = results.iter().map(|result| result.sent_datagrams).sum();
+    let sent_bytes = results.iter().map(|result| result.sent_bytes).sum();
+    let send_errors = results.iter().map(|result| result.send_errors).sum();
+    let received_datagrams = results.iter().map(|result| result.received_datagrams).sum();
+    let received_bytes = results.iter().map(|result| result.received_bytes).sum();
+    let sfu_received_datagrams = results
+        .iter()
+        .map(|result| result.sfu_received_datagrams)
+        .sum();
+    let sfu_received_bytes = results.iter().map(|result| result.sfu_received_bytes).sum();
+    let sfu_forwarded_datagrams = results
+        .iter()
+        .map(|result| result.sfu_forwarded_datagrams)
+        .sum();
+    let sfu_forwarded_bytes = results
+        .iter()
+        .map(|result| result.sfu_forwarded_bytes)
+        .sum();
+    let sfu_send_errors = results.iter().map(|result| result.sfu_send_errors).sum();
+    let expected = match config.topology {
+        Topology::Direct => sent_datagrams,
+        Topology::Star => sfu_forwarded_datagrams,
+    };
+    let mut latencies = results
+        .iter()
+        .flat_map(|result| result.latency_samples_us.iter().copied())
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let playout_ticks = results.iter().map(|result| result.playout_ticks).sum();
+    let deadline_misses = results
+        .iter()
+        .map(|result| result.playout_deadline_misses)
+        .sum();
+    let receiver_pull_samples = results
+        .iter()
+        .map(|result| result.receiver_pull_samples)
+        .sum();
+    let concealed_samples = results.iter().map(|result| result.concealed_samples).sum();
+    let receiver_errors = results.iter().map(|result| result.receiver_errors).sum();
+    MultiprocessMetrics {
+        schema_version: 11,
+        process_layout: "multi",
+        topology: config.topology.as_str(),
+        scenario: config.scenario.as_str(),
+        participants: config.participants,
+        talkers: config.talkers,
+        interest_listeners: config.interest_listeners,
+        dtx: config.dtx,
+        seed: config.seed,
+        worker_processes: results.len(),
+        setup_wall_ms,
+        media_cpu_seconds: cpu_seconds,
+        media_cpu_percent_of_one_core: cpu_seconds / media_seconds * 100.0,
+        summed_current_rss_kib: results.iter().map(|result| result.current_rss_kib).sum(),
+        max_worker_rss_kib: results
+            .iter()
+            .map(|result| result.max_rss_kib)
+            .max()
+            .unwrap_or(0),
+        sent_datagrams,
+        sent_bytes,
+        send_errors,
+        received_datagrams,
+        received_bytes,
+        missing_datagrams: expected.saturating_sub(received_datagrams),
+        outbound_mbit_per_second: sent_bytes as f64 * 8.0 / media_seconds / 1_000_000.0,
+        sfu_received_datagrams,
+        sfu_received_bytes,
+        sfu_forwarded_datagrams,
+        sfu_forwarded_bytes,
+        sfu_send_errors,
+        sfu_outbound_mbit_per_second: sfu_forwarded_bytes as f64 * 8.0
+            / media_seconds
+            / 1_000_000.0,
+        latency_us_p50: slice_percentile(&latencies, 50),
+        latency_us_p95: slice_percentile(&latencies, 95),
+        latency_us_p99: slice_percentile(&latencies, 99),
+        latency_us_max: latencies.last().copied().unwrap_or(0),
+        playout_deadline_miss_percent: percent(deadline_misses, playout_ticks),
+        neteq_concealed_percent: percent(concealed_samples, receiver_pull_samples),
+        neteq_receiver_errors: receiver_errors,
+        workers: results,
+    }
+}
+
+fn slice_percentile(values: &[u64], rank: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values[(values.len() - 1) * rank.min(100) / 100]
+}
+
+fn run_worker_process(control_addr: SocketAddr, id: usize, role: WorkerRole) -> Result<()> {
+    Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name(format!("voice-worker-{id}"))
+        .build()
+        .context("build worker Tokio runtime")?
+        .block_on(worker_process(control_addr, id, role))
+}
+
+async fn worker_process(control_addr: SocketAddr, id: usize, role: WorkerRole) -> Result<()> {
+    let endpoint = new_endpoint().await?;
+    let stream = tokio::net::TcpStream::connect(control_addr)
+        .await
+        .context("connect to multiprocess coordinator")?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(read_half).lines();
+    send_worker_response(
+        &mut write_half,
+        &WorkerResponse::Hello(WorkerHello {
+            id,
+            role,
+            endpoint_addr: endpoint.addr(),
+        }),
+    )
+    .await?;
+
+    let config = match read_worker_command(&mut lines).await? {
+        WorkerCommand::Configure(config) => config,
+        _ => bail!("first worker command was not configuration"),
+    };
+    send_worker_response(&mut write_half, &WorkerResponse::Ack).await?;
+    let mut connections = vec![None; config.participants + 1];
+    loop {
+        match read_worker_command(&mut lines).await? {
+            WorkerCommand::Configure(_) => bail!("worker configured twice"),
+            WorkerCommand::Connect { peer, addr } => {
+                let connection = endpoint
+                    .connect(addr, ALPN)
+                    .await
+                    .with_context(|| format!("worker {id} connect to {peer}"))?;
+                connections[peer] = Some(connection);
+                send_worker_response(&mut write_half, &WorkerResponse::Ack).await?;
+            }
+            WorkerCommand::Accept { peer } => {
+                let incoming = endpoint
+                    .accept()
+                    .await
+                    .context("worker endpoint closed while accepting")?;
+                let connection = incoming
+                    .await
+                    .with_context(|| format!("worker {id} accept from {peer}"))?;
+                connections[peer] = Some(connection);
+                send_worker_response(&mut write_half, &WorkerResponse::Ack).await?;
+            }
+            WorkerCommand::Start { delay_ms } => {
+                let result = match role {
+                    WorkerRole::Client => {
+                        run_client_worker(id, endpoint.clone(), connections, config, delay_ms)
+                            .await?
+                    }
+                    WorkerRole::Sfu => {
+                        run_sfu_worker(id, endpoint.clone(), connections, config, delay_ms).await?
+                    }
+                };
+                send_worker_response(&mut write_half, &WorkerResponse::Result(result)).await?;
+                endpoint.close().await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn read_worker_command(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>,
+) -> Result<WorkerCommand> {
+    let line = lines
+        .next_line()
+        .await
+        .context("read coordinator command")?
+        .context("coordinator closed worker control connection")?;
+    serde_json::from_str(&line).context("decode coordinator command")
+}
+
+async fn send_worker_response(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    response: &WorkerResponse,
+) -> Result<()> {
+    let mut encoded = serde_json::to_vec(response).context("encode worker response")?;
+    encoded.push(b'\n');
+    writer
+        .write_all(&encoded)
+        .await
+        .context("write worker response")
+}
+
+async fn run_client_worker(
+    id: usize,
+    _endpoint: Endpoint,
+    connections: Vec<Option<Connection>>,
+    config: Config,
+    delay_ms: u64,
+) -> Result<ProcessWorkerResult> {
+    let clock_start = Instant::now();
+    let (receive_tx, receive_rx) = mpsc::unbounded_channel();
+    let readers = Arc::new(Mutex::new(Vec::new()));
+    let connection_slots = (0..config.participants)
+        .map(|_| Arc::new(RwLock::new(None)))
+        .collect::<Vec<_>>();
+    match config.topology {
+        Topology::Direct => {
+            for peer in 0..config.participants {
+                if peer == id {
+                    continue;
+                }
+                let connection = connections[peer]
+                    .clone()
+                    .with_context(|| format!("client {id} missing direct peer {peer}"))?;
+                *connection_slots[peer]
+                    .write()
+                    .expect("connection lock poisoned") = Some(connection.clone());
+                spawn_datagram_reader(connection, peer, receive_tx.clone(), clock_start, &readers);
+            }
+        }
+        Topology::Star => {
+            let connection = connections[config.participants]
+                .clone()
+                .context("client missing SFU connection")?;
+            *connection_slots[id]
+                .write()
+                .expect("connection lock poisoned") = Some(connection.clone());
+            spawn_star_client_reader(connection, receive_tx, clock_start, &readers);
+        }
+    }
+
+    let encoder = VoiceEncoder::new(VoiceEncoderConfig {
+        enable_dtx: config.dtx,
+        ..Default::default()
+    })?;
+    let receivers = build_listener_receivers(id, &config, config.participants)?;
+    let media_start = Instant::now() + Duration::from_millis(delay_ms);
+    let before = process_usage()?;
+    let sender = tokio::spawn(send_media(
+        id,
+        config.participants,
+        config.duration,
+        connection_slots,
+        encoder,
+        media_start,
+        clock_start,
+        config.clone(),
+    ));
+    let listener = tokio::spawn(run_listener(
+        id,
+        config.participants,
+        receive_rx,
+        receivers,
+        media_start,
+        config.duration,
+        clock_start,
+        config,
+    ));
+    let send = sender.await.context("worker sender task panicked")??;
+    let listener = listener.await.context("worker listener task panicked")??;
+    let after = process_usage()?;
+    for reader in readers.lock().expect("reader lock poisoned").drain(..) {
+        reader.abort();
+    }
+    let RunCounters {
+        received_datagrams,
+        received_bytes,
+        latencies_us,
+        playout_ticks,
+        playout_deadline_misses,
+        receiver_pull_samples,
+        ..
+    } = listener.counters;
+    Ok(ProcessWorkerResult {
+        id,
+        role: Some(WorkerRole::Client),
+        cpu_seconds: after.cpu_seconds - before.cpu_seconds,
+        max_rss_kib: after.max_rss_kib,
+        current_rss_kib: current_rss_kib()?,
+        sent_datagrams: send.sent_datagrams,
+        sent_bytes: send.sent_bytes,
+        send_errors: send.send_errors,
+        received_datagrams,
+        received_bytes,
+        latency_samples_us: latencies_us.into_values(),
+        playout_ticks,
+        playout_deadline_misses,
+        receiver_pull_samples,
+        concealed_samples: listener.concealed_samples,
+        receiver_errors: listener.receiver_errors,
+        ..Default::default()
+    })
+}
+
+async fn run_sfu_worker(
+    id: usize,
+    _endpoint: Endpoint,
+    connections: Vec<Option<Connection>>,
+    config: Config,
+    delay_ms: u64,
+) -> Result<ProcessWorkerResult> {
+    let clients = Arc::new(
+        connections[..config.participants]
+            .iter()
+            .enumerate()
+            .map(|(client, connection)| {
+                connection
+                    .clone()
+                    .with_context(|| format!("SFU missing client {client}"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let counters = Arc::new(SfuCounters::default());
+    let readers = Arc::new(Mutex::new(Vec::new()));
+    for speaker in 0..config.participants {
+        spawn_sfu_reader(
+            speaker,
+            clients[speaker].clone(),
+            Arc::clone(&clients),
+            config.clone(),
+            Arc::clone(&counters),
+            &readers,
+        );
+    }
+    let media_start = Instant::now() + Duration::from_millis(delay_ms);
+    let before = process_usage()?;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        media_start + config.duration + DELIVERY_GRACE,
+    ))
+    .await;
+    let after = process_usage()?;
+    let sfu = counters.snapshot();
+    for reader in readers.lock().expect("reader lock poisoned").drain(..) {
+        reader.abort();
+    }
+    Ok(ProcessWorkerResult {
+        id,
+        role: Some(WorkerRole::Sfu),
+        cpu_seconds: after.cpu_seconds - before.cpu_seconds,
+        max_rss_kib: after.max_rss_kib,
+        current_rss_kib: current_rss_kib()?,
+        sfu_received_datagrams: sfu.received_datagrams,
+        sfu_received_bytes: sfu.received_bytes,
+        sfu_forwarded_datagrams: sfu.forwarded_datagrams,
+        sfu_forwarded_bytes: sfu.forwarded_bytes,
+        sfu_send_errors: sfu.send_errors,
+        ..Default::default()
+    })
 }
 
 fn print_help() {
@@ -1102,6 +1779,7 @@ fn print_help() {
          \x20 voice-mesh-bench [OPTIONS]\n\
          \nOPTIONS:\n\
          \x20 --topology NAME  direct or star (default direct)\n\
+         \x20 --process-layout NAME  single or multi (default single)\n\
          \x20 --participants N  Fully connected participants (2-64; default 4)\n\
          \x20 --talkers N       Scheduled talkers (default 1)\n\
          \x20 --seconds N       Media duration, at least 0.5 (default 5)\n\
@@ -1298,6 +1976,7 @@ async fn run(config: Config) -> Result<Metrics> {
     let metrics = Metrics {
         schema_version: 10,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
+        process_layout: "single",
         topology: config.topology.as_str(),
         scenario: config.scenario.as_str(),
         delivery: match config.scenario {
@@ -1707,12 +2386,12 @@ fn spawn_datagram_reader(
     connection: Connection,
     speaker: usize,
     tx: mpsc::UnboundedSender<ReceivedDatagram>,
-    clock_start: Instant,
+    _clock_start: Instant,
     readers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) {
     let reader = tokio::spawn(async move {
         while let Ok(bytes) = connection.read_datagram().await {
-            let received_at_us = clock_start.elapsed().as_micros() as u64;
+            let received_at_us = monotonic_time_us();
             if tx
                 .send(ReceivedDatagram {
                     speaker,
@@ -1731,7 +2410,7 @@ fn spawn_datagram_reader(
 fn spawn_star_client_reader(
     connection: Connection,
     tx: mpsc::UnboundedSender<ReceivedDatagram>,
-    clock_start: Instant,
+    _clock_start: Instant,
     readers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) {
     let reader = tokio::spawn(async move {
@@ -1739,7 +2418,7 @@ fn spawn_star_client_reader(
             let Some(speaker) = envelope_speaker(&bytes) else {
                 continue;
             };
-            let received_at_us = clock_start.elapsed().as_micros() as u64;
+            let received_at_us = monotonic_time_us();
             if tx
                 .send(ReceivedDatagram {
                     speaker,
@@ -2064,7 +2743,7 @@ async fn run_listener(
         .collect::<Vec<_>>();
     let mut last_transport_received_us = vec![None; receivers.len()];
     if config.churn_profile == ChurnProfile::Join {
-        let media_start_us = media_start.duration_since(clock_start).as_micros() as u64;
+        let media_start_us = monotonic_deadline_us(media_start);
         for (speaker, last_received) in last_transport_received_us.iter_mut().enumerate() {
             if route_affected_by_churn(listener, speaker, &config) {
                 *last_received = Some(media_start_us);
@@ -2224,7 +2903,7 @@ async fn run_listener(
         )?;
     }
     if config.churn_profile.active() {
-        let media_end_us = media_end.duration_since(clock_start).as_micros() as u64;
+        let media_end_us = monotonic_deadline_us(media_end);
         for (speaker, last_received) in last_transport_received_us.iter().enumerate() {
             if route_affected_by_churn(listener, speaker, &config) {
                 if let Some(last_received_us) = last_received {
@@ -2338,7 +3017,7 @@ fn encode_and_send(
     connections: &[ConnectionSlot],
     encoder: &mut VoiceEncoder,
     frame_index: u64,
-    clock_start: Instant,
+    _clock_start: Instant,
     config: &Config,
     counters: &mut SendCounters,
 ) -> Result<()> {
@@ -2351,7 +3030,7 @@ fn encode_and_send(
     };
     counters.encoded_packets += 1;
 
-    let sent_at_us = clock_start.elapsed().as_micros() as u64;
+    let sent_at_us = monotonic_time_us();
     let mut wire = Vec::with_capacity(ENVELOPE_HEADER_LEN + VoicePacket::HEADER_LEN + 512);
     wire.extend_from_slice(&sent_at_us.to_be_bytes());
     wire.extend_from_slice(&frame_index.to_be_bytes());
@@ -2427,7 +3106,7 @@ fn drain_received(
     interest_started_us: &mut [Option<u64>],
     config: &Config,
     current_frame_index: u64,
-    clock_start: Instant,
+    _clock_start: Instant,
     counters: &mut RunCounters,
     receiver_creations: &mut u64,
     receiver_reuses: &mut u64,
@@ -2451,7 +3130,7 @@ fn drain_received(
                     counters.unaffected_route_max_transport_gap_us.max(gap_us);
             }
         }
-        let processed_at_us = clock_start.elapsed().as_micros() as u64;
+        let processed_at_us = monotonic_time_us();
         let queue_delay_us = processed_at_us.saturating_sub(datagram.received_at_us);
         counters.queue_delays_us.push(queue_delay_us);
 
@@ -2549,7 +3228,7 @@ fn pull_receivers(
     listener: usize,
     frame_index: u64,
     config: &Config,
-    clock_start: Instant,
+    _clock_start: Instant,
     receivers: &mut [Option<ReceiverSlot>],
     counters: &mut RunCounters,
 ) {
@@ -2601,7 +3280,7 @@ fn pull_receivers(
                 .expect("checked pending start");
             counters
                 .talkspurt_start_to_audio_us
-                .push((clock_start.elapsed().as_micros() as u64).saturating_sub(started_us));
+                .push(monotonic_time_us().saturating_sub(started_us));
         }
     }
 }
@@ -2641,7 +3320,7 @@ fn sync_interest(
     listener: usize,
     frame_index: u64,
     config: &Config,
-    clock_start: Instant,
+    _clock_start: Instant,
     receivers: &mut [Option<ReceiverSlot>],
     interest_active: &mut [bool],
     interest_started_us: &mut [Option<u64>],
@@ -2652,7 +3331,7 @@ fn sync_interest(
     for speaker in 0..receivers.len() {
         let interested = listener_interested(config, frame_index, speaker, listener);
         if interested && !interest_active[speaker] {
-            interest_started_us[speaker] = Some(clock_start.elapsed().as_micros() as u64);
+            interest_started_us[speaker] = Some(monotonic_time_us());
         } else if !interested && interest_active[speaker] {
             interest_started_us[speaker] = None;
             if let Some(mut retired) = receivers[speaker].take() {
@@ -2676,6 +3355,30 @@ fn media_frame_at(media_start: Instant, now: Instant) -> u64 {
     now.saturating_duration_since(media_start)
         .as_micros()
         .saturating_div(SEND_TICK.as_micros()) as u64
+}
+
+fn monotonic_deadline_us(deadline: Instant) -> u64 {
+    monotonic_time_us().saturating_add(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_micros() as u64,
+    )
+}
+
+fn monotonic_time_us() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` points to valid writable storage and CLOCK_MONOTONIC is
+    // process-independent on the Linux benchmark hosts.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    if result != 0 {
+        return 0;
+    }
+    (time.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(time.tv_nsec as u64 / 1_000)
 }
 
 fn speaker_active(config: &Config, frame_index: u64, speaker: usize) -> bool {
