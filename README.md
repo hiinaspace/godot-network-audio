@@ -6,9 +6,31 @@ Specifically, this extension does the stuff you need to do between Godot's
 audio system and data packets to transmit audio efficiently and robustly, but leaves
 the packet delivery part up to your choice of transport (up to some practical requirements).
 
-Status: works quite well in varying network conditions, at least inside some
-test harnesses. API isn't quite usable in an actual game setting though. no
-builds yet.
+Status: works well in the current synthetic network and headless Godot
+harnesses, including 31 connected remote peers and seven simultaneous spatial
+sources. The API is still experimental and there are no packaged builds yet.
+
+Godot 4.7 is the current minimum. The optional iroh integration exposes one
+stable `AudioStreamNetwork` per remote peer, so normal game code can attach each
+voice to its own `AudioStreamPlayer` or `AudioStreamPlayer3D`:
+
+```gdscript
+func _on_peer_connected(peer_id: String) -> void:
+	var voice_stream = transport.get_or_create_receive_stream(peer_id)
+	var voice_player = AudioStreamPlayer3D.new()
+	voice_player.stream = voice_stream
+	add_child(voice_player)
+	voice_player.play()
+
+func _on_peer_disconnected(peer_id: String) -> void:
+	# Stop/free the corresponding player first.
+	transport.remove_receive_stream(peer_id)
+```
+
+By default one encoded local voice packet is fanned out to every connected
+peer. Interest-managed games can call `set_send_peers(peer_ids)` to restrict
+that fan-out without creating one encoder per listener. See `example_iroh/` for
+complete connection and player lifecycle glue.
 
 ## Rough overview
 
@@ -59,4 +81,3 @@ is pretty widely deployed).
 There's also https://github.com/goatchurchprime/two-voip-godot-4 , which roughly
 fills the same part as this repo's attempt (godot audio server into opus with some
 sending/jitter/playout buffers, then you do what you want with the bytes).
-

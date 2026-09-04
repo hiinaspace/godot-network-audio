@@ -7,6 +7,13 @@
 > ranked next work; do not treat the old "all testing so far" bullets below as
 > current status.
 
+> The first Godot scale gate is now complete on Godot 4.7.2. It introduced a
+> peer-routed receive API and validated 31 connected peers / seven simultaneous
+> `AudioStreamPlayer3D` sources against real PulseAudio output. See
+> `voice-mesh-bench/GODOT_SCALE_RESULTS.md`. The next useful gate is source
+> churn under render/main-thread contention, not compatibility work for the old
+> spike API.
+
 This file tracks current status and the next implementation milestones.
 Durable architecture notes live in `DESIGN.md`.
 

@@ -85,10 +85,11 @@ This is intentionally asymmetric with receive. There is one local sender pipelin
 
 The receive pipeline is:
 
-1. transport/main-thread ingress
+1. transport ingress
 - decode packet bytes into `VoicePacket`
 - attach explicit packet arrival time in a monotonic domain
-- enqueue into a bounded queue
+- route by authenticated remote peer identity
+- enqueue into that peer's bounded queue
 
 2. audio-thread playback
 - owns `VoiceReceiver` / NetEq
@@ -97,6 +98,14 @@ The receive pipeline is:
 - fills Godot's requested output frame count exactly
 
 The audio thread owns NetEq. Main and network threads must not lock or call into NetEq directly.
+
+Each remote peer gets one stable `AudioStreamNetwork` and therefore one NetEq
+instance. A game assigns that resource to its peer-specific 2D or 3D player.
+The iroh network thread may enqueue directly, but stream creation/removal and
+Godot node ownership stay on the main thread. Packets that beat peer
+registration are held in a small bounded per-peer queue. Disconnect must stop
+the corresponding player and remove the stream so Godot does not keep pulling
+packet-loss concealment for a source that no longer exists.
 
 ### Silence and talkspurts
 
@@ -168,10 +177,14 @@ Sender side:
 Receiver side:
 - accept packet bytes plus explicit arrival timestamps
 - keep packet transport details out of the audio layer
+- keep one receive stream per audible remote source; mixing belongs to Godot
 
 Current implementation note:
 - the demo/harness currently also has a Rust-only loopback bypass for local testing
 - that path is intentionally a harness convenience, not the intended long-term public transport boundary
+- the optional iroh sidecar preserves remote peer identity and offers
+  `get_or_create_receive_stream`, `remove_receive_stream`, and sender-side
+  interest selection through `set_send_peers`
 
 ### Why iroh first
 

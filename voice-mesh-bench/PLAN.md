@@ -207,6 +207,13 @@ a prerequisite for the Godot scale gate.
    relay, socket-buffer, and host-scheduling behavior hidden by loopback.
 8. Only then add the Godot audio-thread, source-count, spatial-mixing, and
    render-contention layer, preserving the same timelines and metrics.
+   **In progress:** the first headless Godot 4.7.2 gate now creates one
+   peer-routed stream/player per source and passes 31 connected / seven active
+   spatial sources with every expected packet delivered, zero concealment,
+   zero queue drops, and real PulseAudio output. Peer disconnect now retires
+   playback cleanly. Headless audio spatialization is exercised, but rendering
+   is not; the next lane should combine join/leave/talker rotation with
+   controlled render or main-thread contention. See `GODOT_SCALE_RESULTS.md`.
 
 ## Adversarial review corrections
 
