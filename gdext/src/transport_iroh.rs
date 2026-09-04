@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use godot::builtin::{Array, GString, PackedByteArray, VarDictionary, Variant};
@@ -56,6 +57,7 @@ struct PeerIngress {
 struct ReceiveRouter {
     peers: RwLock<HashMap<EndpointId, PeerIngress>>,
     default_sink: RwLock<Option<LoopbackTarget>>,
+    transport_epoch: RwLock<Option<Instant>>,
     pending_drops: AtomicU64,
 }
 
@@ -84,7 +86,7 @@ impl ReceiveRouter {
             }
         };
         if let Some(sink) = sink {
-            sink.enqueue_with_timestamp(packet, received_at_mono_us);
+            self.enqueue_at_transport_time(&sink, packet, received_at_mono_us);
         }
     }
 
@@ -96,7 +98,7 @@ impl ReceiveRouter {
             std::mem::take(&mut ingress.pending)
         };
         for queued in pending {
-            sink.enqueue_with_timestamp(queued.packet, queued.received_at_mono_us);
+            self.enqueue_at_transport_time(&sink, queued.packet, queued.received_at_mono_us);
         }
     }
 
@@ -114,6 +116,23 @@ impl ReceiveRouter {
             .values()
             .map(|ingress| ingress.pending.len())
             .sum()
+    }
+
+    fn enqueue_at_transport_time(
+        &self,
+        sink: &LoopbackTarget,
+        packet: VoicePacket,
+        received_at_mono_us: u64,
+    ) {
+        let epoch = *self
+            .transport_epoch
+            .read()
+            .expect("transport epoch poisoned");
+        if let Some(epoch) = epoch {
+            sink.enqueue_from_epoch(packet, received_at_mono_us, epoch);
+        } else {
+            sink.enqueue_now(packet);
+        }
     }
 }
 
@@ -208,6 +227,11 @@ impl IrohVoiceTransport {
         };
         match VoiceIrohService::bind(config) {
             Ok(service) => {
+                *self
+                    .receive_router
+                    .transport_epoch
+                    .write()
+                    .expect("transport epoch poisoned") = Some(service.monotonic_epoch());
                 self.receiver = Some(service.subscribe());
                 self.service = Some(service);
                 self.install_packet_router();

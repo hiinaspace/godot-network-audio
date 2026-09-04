@@ -194,15 +194,23 @@ impl LoopbackTarget {
     }
 
     #[cfg(feature = "iroh-transport")]
-    pub(crate) fn enqueue_with_timestamp(
+    pub(crate) fn enqueue_from_epoch(
         &self,
         packet: VoicePacket,
         received_at_mono_us: u64,
+        transport_epoch: Instant,
     ) -> bool {
+        let received_at = transport_epoch
+            .checked_add(std::time::Duration::from_micros(received_at_mono_us))
+            .unwrap_or(transport_epoch);
+        let local_received_at_mono_us = received_at
+            .checked_duration_since(self.shared.mono_epoch)
+            .unwrap_or_default()
+            .as_micros() as u64;
         self.shared.enqueue_packet(
             packet,
             PacketArrival {
-                received_at_mono_us,
+                received_at_mono_us: local_received_at_mono_us,
             },
         )
     }

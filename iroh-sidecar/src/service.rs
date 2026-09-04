@@ -191,6 +191,12 @@ impl VoiceIrohService {
         self.endpoint.addr()
     }
 
+    /// Monotonic epoch used by receive timestamps delivered to packet handlers
+    /// and `VoiceEvent::PacketReceived`.
+    pub fn monotonic_epoch(&self) -> Instant {
+        self.shared.start
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<VoiceEvent> {
         self.shared.events.subscribe()
     }
