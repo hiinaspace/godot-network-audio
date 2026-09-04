@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Close and reconnect one participant's real Iroh connections during media.
+# Exercise real Iroh participant join, leave, reconnect, and identity replacement.
 # Usage: run_voice_churn.sh [OUTPUT_DIR] [SECONDS] [SEEDS]
 
 set -euo pipefail
@@ -54,9 +54,10 @@ run_case() {
 seed_end=$((SEED_START + SEEDS - 1))
 for seed in $(seq "$SEED_START" "$seed_end"); do
   run_case clean "$seed" none 1
-  run_case reconnect-250ms "$seed" reconnect 250
+  run_case join "$seed" join 1
+  run_case leave "$seed" leave 1
   run_case reconnect-1000ms "$seed" reconnect 1000
-  run_case reconnect-3000ms "$seed" reconnect 3000
+  run_case replace-1000ms "$seed" replace 1000
 done
 
 python3 "$ROOT_DIR/scripts/summarize_voice_mesh.py" "$OUTPUT_DIR" \

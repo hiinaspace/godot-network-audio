@@ -92,15 +92,29 @@ enum MediaImpairment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChurnProfile {
     None,
+    Join,
+    Leave,
     Reconnect,
+    Replace,
 }
 
 impl ChurnProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Join => "join",
+            Self::Leave => "leave",
             Self::Reconnect => "reconnect",
+            Self::Replace => "replace",
         }
+    }
+
+    fn active(self) -> bool {
+        self != Self::None
+    }
+
+    fn reconnects(self) -> bool {
+        matches!(self, Self::Join | Self::Reconnect | Self::Replace)
     }
 }
 
@@ -296,8 +310,13 @@ impl Config {
                     let value = args.next().context("--churn requires a value")?;
                     config.churn_profile = match value.as_str() {
                         "none" => ChurnProfile::None,
+                        "join" => ChurnProfile::Join,
+                        "leave" => ChurnProfile::Leave,
                         "reconnect" => ChurnProfile::Reconnect,
-                        _ => bail!("--churn must be none or reconnect, got {value}"),
+                        "replace" => ChurnProfile::Replace,
+                        _ => bail!(
+                            "--churn must be none, join, leave, reconnect, or replace, got {value}"
+                        ),
                     };
                 }
                 "--churn-participant" => {
@@ -363,18 +382,28 @@ impl Config {
                 );
             }
         }
-        if config.churn_profile == ChurnProfile::Reconnect {
+        if config.churn_profile.active() {
             if config.churn_participant >= config.participants {
                 bail!("--churn-participant must be less than participants");
             }
-            if config.churn_downtime_ms == 0 {
+            if matches!(
+                config.churn_profile,
+                ChurnProfile::Reconnect | ChurnProfile::Replace
+            ) && config.churn_downtime_ms == 0
+            {
                 bail!("--churn-downtime-ms must be greater than zero");
             }
-            if config
-                .churn_start_ms
-                .saturating_add(config.churn_downtime_ms)
-                >= config.duration.as_millis() as u64
-            {
+            let event_end_ms = if matches!(
+                config.churn_profile,
+                ChurnProfile::Reconnect | ChurnProfile::Replace
+            ) {
+                config
+                    .churn_start_ms
+                    .saturating_add(config.churn_downtime_ms)
+            } else {
+                config.churn_start_ms
+            };
+            if event_end_ms >= config.duration.as_millis() as u64 {
                 bail!("churn start plus downtime must be shorter than the media duration");
             }
         }
@@ -460,9 +489,10 @@ impl ImpairmentRouteState {
 }
 
 type ConnectionSlot = Arc<RwLock<Option<Connection>>>;
+type EndpointSlot = Arc<RwLock<Option<Endpoint>>>;
 
 struct Mesh {
-    endpoints: Vec<Endpoint>,
+    endpoints: Vec<EndpointSlot>,
     connections: Vec<Vec<ConnectionSlot>>,
     receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
     readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -471,7 +501,10 @@ struct Mesh {
 impl Mesh {
     async fn close(self) {
         for endpoint in &self.endpoints {
-            endpoint.close().await;
+            let endpoint = { endpoint.read().expect("endpoint lock poisoned").clone() };
+            if let Some(endpoint) = endpoint {
+                endpoint.close().await;
+            }
         }
         for reader in self.readers.lock().expect("reader lock poisoned").drain(..) {
             reader.abort();
@@ -485,6 +518,7 @@ struct ChurnResult {
     reconnects: u64,
     reconnect_errors: u64,
     reconnect_duration_ms: f64,
+    new_identity: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -543,6 +577,7 @@ struct Metrics {
     churn_reconnects: u64,
     churn_reconnect_errors: u64,
     churn_reconnect_duration_ms: f64,
+    churn_new_identity: bool,
     affected_route_max_transport_gap_ms: f64,
     unaffected_route_max_transport_gap_ms: f64,
     seed: u64,
@@ -1008,7 +1043,7 @@ fn print_help() {
          \x20 --media-burst-ms N      Mean burst duration for burst-loss (default 60)\n\
          \x20 --media-outage-start-ms N  Outage start on media timeline (default 3000)\n\
          \x20 --media-outage-duration-ms N  Outage length (default 300)\n\
-         \x20 --churn NAME      none or reconnect (default none)\n\
+         \x20 --churn NAME      none, join, leave, reconnect, or replace (default none)\n\
          \x20 --churn-participant N  Participant to disconnect (default 0)\n\
          \x20 --churn-start-ms N  Disconnect time on media timeline (default 6000)\n\
          \x20 --churn-downtime-ms N  Time before reconnecting (default 1000)\n\
@@ -1030,7 +1065,7 @@ async fn run(config: Config) -> Result<Metrics> {
         receive_txs.push(tx);
         receive_rxs.push(rx);
     }
-    let mesh = build_mesh(config.participants, clock_start, receive_txs).await?;
+    let mesh = build_mesh(&config, clock_start, receive_txs).await?;
 
     let encoder_count = match config.scenario {
         Scenario::Baseline => config.talkers,
@@ -1054,8 +1089,8 @@ async fn run(config: Config) -> Result<Metrics> {
     tokio::time::sleep(STARTUP_SETTLE).await;
     let media_start = Instant::now() + Duration::from_millis(20);
     let media_end = media_start + config.duration;
-    let churn_task = if config.churn_profile == ChurnProfile::Reconnect {
-        Some(tokio::spawn(run_reconnect_churn(
+    let churn_task = if config.churn_profile.active() {
+        Some(tokio::spawn(run_churn(
             mesh.endpoints.clone(),
             mesh.connections.clone(),
             mesh.receive_txs.clone(),
@@ -1185,7 +1220,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 8,
+        schema_version: 9,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
@@ -1211,6 +1246,7 @@ async fn run(config: Config) -> Result<Metrics> {
         churn_reconnects: churn_result.reconnects,
         churn_reconnect_errors: churn_result.reconnect_errors,
         churn_reconnect_duration_ms: churn_result.reconnect_duration_ms,
+        churn_new_identity: churn_result.new_identity,
         affected_route_max_transport_gap_ms: counters.affected_route_max_transport_gap_us as f64
             / 1_000.0,
         unaffected_route_max_transport_gap_ms: counters.unaffected_route_max_transport_gap_us
@@ -1231,7 +1267,11 @@ async fn run(config: Config) -> Result<Metrics> {
         },
         dtx: config.dtx,
         requested_duration_seconds: config.duration.as_secs_f64(),
-        mesh_connections: config.participants * (config.participants - 1) / 2,
+        mesh_connections: if config.churn_profile == ChurnProfile::Join {
+            (config.participants - 1) * (config.participants - 2) / 2
+        } else {
+            config.participants * (config.participants - 1) / 2
+        },
         active_receiver_count,
         setup_wall_ms: setup_wall.as_secs_f64() * 1_000.0,
         setup_cpu_seconds: after_setup.cpu_seconds - process_start.cpu_seconds,
@@ -1374,21 +1414,21 @@ async fn run(config: Config) -> Result<Metrics> {
 }
 
 async fn build_mesh(
-    participants: usize,
+    config: &Config,
     clock_start: Instant,
     receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
 ) -> Result<Mesh> {
+    let participants = config.participants;
     let mut endpoints = Vec::with_capacity(participants);
-    for _ in 0..participants {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .clear_ip_transports()
-            .alpns(vec![ALPN.to_vec()])
-            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .context("bind benchmark endpoint to loopback")?
-            .bind()
-            .await
-            .context("start benchmark endpoint")?;
-        endpoints.push(endpoint);
+    for participant in 0..participants {
+        let endpoint = if config.churn_profile == ChurnProfile::Join
+            && participant == config.churn_participant
+        {
+            None
+        } else {
+            Some(new_endpoint().await?)
+        };
+        endpoints.push(Arc::new(RwLock::new(endpoint)));
     }
 
     let connections = (0..participants)
@@ -1400,16 +1440,22 @@ async fn build_mesh(
         .collect::<Vec<_>>();
     for connector in 0..participants {
         for acceptor in (connector + 1)..participants {
-            let accepting_endpoint = endpoints[acceptor].clone();
+            let accepting_endpoint = endpoint_from_slot(&endpoints[acceptor]);
+            let connecting_endpoint = endpoint_from_slot(&endpoints[connector]);
+            let (Some(connecting_endpoint), Some(accepting_endpoint)) =
+                (connecting_endpoint, accepting_endpoint)
+            else {
+                continue;
+            };
+            let accepting_addr = accepting_endpoint.addr();
+            let accept_endpoint = accepting_endpoint.clone();
             let accepting = async move {
-                let incoming = accepting_endpoint
+                let incoming = accept_endpoint
                     .accept()
                     .await
                     .context("endpoint closed while building mesh")?;
                 incoming.await.context("accept mesh connection")
             };
-            let connecting_endpoint = endpoints[connector].clone();
-            let accepting_addr = endpoints[acceptor].addr();
             let connecting = async move {
                 connecting_endpoint
                     .connect(accepting_addr, ALPN)
@@ -1456,6 +1502,21 @@ async fn build_mesh(
     })
 }
 
+async fn new_endpoint() -> Result<Endpoint> {
+    Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .context("bind benchmark endpoint to loopback")?
+        .bind()
+        .await
+        .context("start benchmark endpoint")
+}
+
+fn endpoint_from_slot(slot: &EndpointSlot) -> Option<Endpoint> {
+    slot.read().expect("endpoint lock poisoned").clone()
+}
+
 fn spawn_datagram_reader(
     connection: Connection,
     speaker: usize,
@@ -1481,8 +1542,8 @@ fn spawn_datagram_reader(
     readers.lock().expect("reader lock poisoned").push(reader);
 }
 
-async fn run_reconnect_churn(
-    endpoints: Vec<Endpoint>,
+async fn run_churn(
+    endpoints: Vec<EndpointSlot>,
     connections: Vec<Vec<ConnectionSlot>>,
     receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
     readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -1497,40 +1558,84 @@ async fn run_reconnect_churn(
 
     let participant = config.churn_participant;
     let mut result = ChurnResult::default();
-    for (peer, peer_connections) in connections.iter().enumerate().take(config.participants) {
-        if peer == participant {
-            continue;
-        }
-        let local = connections[participant][peer]
-            .write()
-            .expect("connection lock poisoned")
-            .take();
-        let remote = peer_connections[participant]
-            .write()
-            .expect("connection lock poisoned")
-            .take();
-        if let Some(connection) = local.or(remote) {
-            connection.close(0u8.into(), b"benchmark churn");
-            result.disconnects += 1;
+    if config.churn_profile != ChurnProfile::Join {
+        for (peer, peer_connections) in connections.iter().enumerate().take(config.participants) {
+            if peer == participant {
+                continue;
+            }
+            let local = connections[participant][peer]
+                .write()
+                .expect("connection lock poisoned")
+                .take();
+            let remote = peer_connections[participant]
+                .write()
+                .expect("connection lock poisoned")
+                .take();
+            if let Some(connection) = local.or(remote) {
+                connection.close(0u8.into(), b"benchmark churn");
+                result.disconnects += 1;
+            }
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(config.churn_downtime_ms)).await;
+    if config.churn_profile == ChurnProfile::Leave {
+        let endpoint = endpoints[participant]
+            .write()
+            .expect("endpoint lock poisoned")
+            .take();
+        if let Some(endpoint) = endpoint {
+            endpoint.close().await;
+        }
+        return Ok(result);
+    }
+
+    if config.churn_profile == ChurnProfile::Replace {
+        let old_endpoint = endpoints[participant]
+            .write()
+            .expect("endpoint lock poisoned")
+            .take();
+        if let Some(endpoint) = old_endpoint {
+            endpoint.close().await;
+        }
+    }
+    if matches!(
+        config.churn_profile,
+        ChurnProfile::Reconnect | ChurnProfile::Replace
+    ) {
+        tokio::time::sleep(Duration::from_millis(config.churn_downtime_ms)).await;
+    }
+    if matches!(
+        config.churn_profile,
+        ChurnProfile::Join | ChurnProfile::Replace
+    ) {
+        let endpoint = new_endpoint().await?;
+        *endpoints[participant]
+            .write()
+            .expect("endpoint lock poisoned") = Some(endpoint);
+        result.new_identity = true;
+    }
+
     let reconnect_start = Instant::now();
+    if !config.churn_profile.reconnects() {
+        return Ok(result);
+    }
     for (peer, peer_connections) in connections.iter().enumerate().take(config.participants) {
         if peer == participant {
             continue;
         }
-        let accepting_endpoint = endpoints[peer].clone();
+        let accepting_endpoint = endpoint_from_slot(&endpoints[peer])
+            .context("peer endpoint missing while reconnecting")?;
+        let connecting_endpoint = endpoint_from_slot(&endpoints[participant])
+            .context("churn participant endpoint missing while reconnecting")?;
+        let accepting_addr = accepting_endpoint.addr();
+        let accept_endpoint = accepting_endpoint.clone();
         let accepting = async move {
-            let incoming = accepting_endpoint
+            let incoming = accept_endpoint
                 .accept()
                 .await
                 .context("endpoint closed while reconnecting")?;
             incoming.await.context("accept reconnected peer")
         };
-        let connecting_endpoint = endpoints[participant].clone();
-        let accepting_addr = endpoints[peer].addr();
         let connecting = async move {
             connecting_endpoint
                 .connect(accepting_addr, ALPN)
@@ -1691,6 +1796,14 @@ async fn run_listener(
         .map(|speaker| ImpairmentRouteState::new(config.seed, speaker, listener))
         .collect::<Vec<_>>();
     let mut last_transport_received_us = vec![None; receivers.len()];
+    if config.churn_profile == ChurnProfile::Join {
+        let media_start_us = media_start.duration_since(clock_start).as_micros() as u64;
+        for (speaker, last_received) in last_transport_received_us.iter_mut().enumerate() {
+            if route_affected_by_churn(listener, speaker, &config) {
+                *last_received = Some(media_start_us);
+            }
+        }
+    }
     let mut receiver_totals = ReceiverTotals::default();
     let mut max_concurrent_receivers = receivers.iter().flatten().count();
     let mut max_receiver_pool = 0_usize;
@@ -1842,6 +1955,19 @@ async fn run_listener(
             &mut impairment_routes,
             &mut last_transport_received_us,
         )?;
+    }
+    if config.churn_profile.active() {
+        let media_end_us = media_end.duration_since(clock_start).as_micros() as u64;
+        for (speaker, last_received) in last_transport_received_us.iter().enumerate() {
+            if route_affected_by_churn(listener, speaker, &config) {
+                if let Some(last_received_us) = last_received {
+                    result.counters.affected_route_max_transport_gap_us = result
+                        .counters
+                        .affected_route_max_transport_gap_us
+                        .max(media_end_us.saturating_sub(*last_received_us));
+                }
+            }
+        }
     }
     result.active_receiver_count = receivers.iter().flatten().count();
     result.max_concurrent_receivers = result
@@ -2023,10 +2149,7 @@ fn drain_received(
             .context("received speaker outside transport gap table")?;
         if let Some(previous_us) = last_received.replace(datagram.received_at_us) {
             let gap_us = datagram.received_at_us.saturating_sub(previous_us);
-            if config.churn_profile == ChurnProfile::Reconnect
-                && (listener == config.churn_participant
-                    || datagram.speaker == config.churn_participant)
-            {
+            if route_affected_by_churn(listener, datagram.speaker, config) {
                 counters.affected_route_max_transport_gap_us =
                     counters.affected_route_max_transport_gap_us.max(gap_us);
             } else {
@@ -2120,6 +2243,12 @@ fn drain_received(
         )?;
     }
     Ok(())
+}
+
+fn route_affected_by_churn(listener: usize, speaker: usize, config: &Config) -> bool {
+    speaker != listener
+        && config.churn_profile.active()
+        && (listener == config.churn_participant || speaker == config.churn_participant)
 }
 
 fn pull_receivers(
