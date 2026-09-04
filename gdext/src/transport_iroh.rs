@@ -147,6 +147,7 @@ pub struct IrohVoiceTransport {
     send_router: Arc<RwLock<SendRouter>>,
     direct_packets_sent: Arc<AtomicU64>,
     direct_send_errors: Arc<AtomicU64>,
+    direct_packets_received: Arc<AtomicU64>,
     process_mode_enabled: bool,
     last_error: GString,
     packets_sent: i64,
@@ -166,6 +167,7 @@ impl INode for IrohVoiceTransport {
             send_router: Arc::new(RwLock::new(SendRouter::default())),
             direct_packets_sent: Arc::new(AtomicU64::new(0)),
             direct_send_errors: Arc::new(AtomicU64::new(0)),
+            direct_packets_received: Arc::new(AtomicU64::new(0)),
             process_mode_enabled: false,
             last_error: GString::new(),
             packets_sent: 0,
@@ -428,7 +430,10 @@ impl IrohVoiceTransport {
             "send_errors",
             self.direct_send_errors.load(Ordering::Relaxed) as i64,
         );
-        dict.set("packets_received", self.packets_received);
+        dict.set(
+            "packets_received",
+            self.packets_received + self.direct_packets_received.load(Ordering::Relaxed) as i64,
+        );
         dict.set("peers_connected", self.peers_connected);
         dict.set("receive_streams", self.receive_streams.len() as i64);
         dict.set(
@@ -455,10 +460,12 @@ impl IrohVoiceTransport {
             return;
         };
         let router = self.receive_router.clone();
+        let received = self.direct_packets_received.clone();
         service.set_packet_handler(Arc::new(
             move |peer, bytes: Bytes, received_at_mono_us: u64| {
                 if let Ok(packet) = VoicePacket::decode_from_bytes(&bytes) {
                     router.route(peer.id, packet, received_at_mono_us);
+                    received.fetch_add(1, Ordering::Relaxed);
                 }
             },
         ));

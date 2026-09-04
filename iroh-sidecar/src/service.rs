@@ -330,14 +330,16 @@ fn spawn_datagram_task(connection: Connection, shared: Arc<SharedState>) {
                 .clone();
             if let Some(ref h) = handler {
                 h(RemotePeer { id: peer }, bytes.clone(), received_at_mono_us);
+            } else {
+                // Broadcast is the fallback ingress API. A direct handler is
+                // mutually exclusive: duplicating sustained media into both paths
+                // can make a main-thread event drain chase an unbounded producer.
+                let _ = shared.events.send(VoiceEvent::PacketReceived {
+                    peer: RemotePeer { id: peer },
+                    bytes,
+                    received_at_mono_us,
+                });
             }
-            // Always broadcast so the GDScript packet_received signal and stats
-            // counter still work regardless of whether a handler is installed.
-            let _ = shared.events.send(VoiceEvent::PacketReceived {
-                peer: RemotePeer { id: peer },
-                bytes,
-                received_at_mono_us,
-            });
         }
         if let Some(event) = shared.remove_connection(peer) {
             let _ = shared.events.send(event);
