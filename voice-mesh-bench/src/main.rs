@@ -1324,6 +1324,9 @@ fn run_multiprocess(config: Config) -> Result<MultiprocessMetrics> {
             .accept()
             .context("accept worker control connection")?;
         stream
+            .set_nodelay(true)
+            .context("disable worker control Nagle buffering")?;
+        stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .context("set worker read timeout")?;
         stream
@@ -1533,6 +1536,9 @@ async fn worker_process(control_addr: SocketAddr, id: usize, role: WorkerRole) -
     let stream = tokio::net::TcpStream::connect(control_addr)
         .await
         .context("connect to multiprocess coordinator")?;
+    stream
+        .set_nodelay(true)
+        .context("disable coordinator control Nagle buffering")?;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(read_half).lines();
     send_worker_response(
