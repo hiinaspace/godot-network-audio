@@ -74,7 +74,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-source "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then
+  source "$HOME/.cargo/env"
+fi
 cargo build -p godot_network_audio >/dev/null
 bash "$ROOT_DIR/scripts/sync_demo_extension.sh" >/dev/null
 
@@ -115,12 +117,19 @@ RECORDER_PID=$!
 
 sleep 0.5
 
-if command -v fgvm >/dev/null 2>&1; then
+if [[ -n "${GODOT_BIN:-}" ]]; then
+  :
+elif command -v fgvm >/dev/null 2>&1; then
   GODOT_BIN="$(fgvm which | tail -n 1)"
 elif [[ -x "$HOME/bin/fgvm" ]]; then
   GODOT_BIN="$("$HOME/bin/fgvm" which | tail -n 1)"
+elif command -v godot >/dev/null 2>&1; then
+  GODOT_BIN="$(command -v godot)"
+elif command -v godot4 >/dev/null 2>&1; then
+  GODOT_BIN="$(command -v godot4)"
 else
-  GODOT_BIN="$HOME/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64"
+  echo "Godot not found; set GODOT_BIN or install godot/godot4 on PATH" >&2
+  exit 1
 fi
 
 PULSE_SOURCE="$INPUT_SOURCE" \

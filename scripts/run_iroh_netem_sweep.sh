@@ -39,7 +39,9 @@ SWEEP_PNG="$OUTPUT_DIR/sweep.png"
 
 mkdir -p "$OUTPUT_DIR"
 
-source "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then
+  source "$HOME/.cargo/env"
+fi
 echo "Building extension..."
 cargo build -p godot_network_audio --features iroh-transport >/dev/null
 bash "$ROOT_DIR/scripts/sync_iroh_example_extensions.sh" >/dev/null

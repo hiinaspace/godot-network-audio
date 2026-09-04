@@ -77,7 +77,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-source "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then
+  source "$HOME/.cargo/env"
+fi
 cargo build -p godot_network_audio --features iroh-transport >/dev/null
 bash "$ROOT_DIR/scripts/sync_iroh_example_extensions.sh" >/dev/null
 
@@ -120,10 +122,17 @@ ffmpeg -hide_banner -loglevel error -nostdin -y \
   >"$OUTPUT_DIR/output_capture.log" 2>&1 &
 OUTPUT_RECORDER_PID=$!
 
-if command -v fgvm >/dev/null 2>&1; then
+if [[ -n "${GODOT_BIN:-}" ]]; then
+  :
+elif command -v fgvm >/dev/null 2>&1; then
   GODOT_BIN="$(fgvm which | tail -n 1 | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $NF}')"
+elif command -v godot >/dev/null 2>&1; then
+  GODOT_BIN="$(command -v godot)"
+elif command -v godot4 >/dev/null 2>&1; then
+  GODOT_BIN="$(command -v godot4)"
 else
-  GODOT_BIN="$HOME/fgvm/4.6.1-stable-standard/Godot_v4.6.1-stable_linux.x86_64"
+  echo "Godot not found; set GODOT_BIN or install godot/godot4 on PATH" >&2
+  exit 1
 fi
 
 PULSE_SINK="$RECEIVER_OUTPUT_SINK" \
