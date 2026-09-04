@@ -244,13 +244,27 @@ loss produced 68 and 185 missing application datagrams; the burst profile
 produced 191. Kernel qdisc counters recorded 106, 312, and 319 drops because
 they also include QUIC/control packets. The runner restored `lo` to `noqueue`.
 
-The new 1 Hz timeline exposed a likely NetEq-fork issue: in a matched 5% uniform
-loss seed, target delay rose from 20 ms to 220 ms and stayed there, while the
-reported current buffer peaked at 1430 ms despite a configured 250 ms maximum.
-The clean control settled to 20 ms and the 300 ms outage recovered. Packet loss
-appears to leave repeated expansion transitions accumulating buffered packets;
-this needs a focused NetEq reproduction before interpreting higher-loss quality
-or adding more impairment dimensions.
+The new 1 Hz timeline exposed a 1430 ms receiver buffer peak in a 5% uniform-loss
+seed despite a configured 250 ms maximum. A direct NetEq-only periodic-loss
+reproduction remained bounded (162 ms peak and 17 ms final), which localized
+the runaway behavior to `VoiceReceiver`: after an end-of-talkspurt marker, loss
+of the next unreliable start marker left the receiver in intentional silence.
+Later voiced packets entered NetEq but playout did not drain them. The receiver
+now treats a newer nonempty packet as an implicit talkspurt start. With the same
+seed and the same 1045 deterministic drops, the overall buffer peak fell from
+1430 ms to 226 ms, and the post-startup peak fell from 1430 ms to 96 ms. Both
+runs had zero transport or NetEq errors.
+
+The investigation also found a separate issue suitable for the NetEq fork:
+delay estimation discarded each packet's recorded monotonic arrival time and
+used `Instant::now()` at insertion instead. A focused regression with perfectly
+paced transport timestamps and temporary listener scheduling stalls produced a
+60 ms target on the old code and 20 ms after the fix. The fork now propagates
+the packet arrival time through delay tracking and history expiry. This avoids
+classifying application scheduling delay as network jitter. The game-shaped
+5% loss run can still report a 220 ms target-delay maximum on some streams; that
+remaining adaptation should be evaluated independently, but it no longer causes
+unbounded buffering.
 
 Raw results are on `gna-sim` under:
 
@@ -269,4 +283,5 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/media-impairment-v2/
 /work/projects/godot-network-audio/target/voice-mesh/transport-netem-v1/
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v1/
+/work/projects/godot-network-audio/target/voice-mesh/media-timeline-v2/
 ```

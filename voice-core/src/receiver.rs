@@ -43,6 +43,7 @@ pub struct VoiceReceiver {
     sticky_error: Option<String>,
     pending_silence: bool,
     intentional_silence: bool,
+    end_of_talkspurt_seq: Option<u16>,
     resuming_talkspurt: bool,
     resumed_packet_count: u32,
 }
@@ -78,6 +79,7 @@ impl VoiceReceiver {
             sticky_error: None,
             pending_silence: false,
             intentional_silence: false,
+            end_of_talkspurt_seq: None,
             resuming_talkspurt: false,
             resumed_packet_count: 0,
         })
@@ -102,14 +104,19 @@ impl VoiceReceiver {
         arrival: PacketArrival,
         simulated_now_mono_us: u64,
     ) -> Result<()> {
-        if pkt
+        let explicit_start = pkt
             .flags
-            .contains(crate::packet::PacketFlags::START_OF_TALKSPURT)
-            && (self.pending_silence || self.intentional_silence)
+            .contains(crate::packet::PacketFlags::START_OF_TALKSPURT);
+        let implicit_start = !pkt.payload.is_empty()
+            && self
+                .end_of_talkspurt_seq
+                .is_some_and(|end_seq| sequence_is_newer(pkt.seq, end_seq));
+        if (explicit_start || implicit_start) && (self.pending_silence || self.intentional_silence)
         {
             self.inner.flush();
             self.pending_silence = false;
             self.intentional_silence = false;
+            self.end_of_talkspurt_seq = None;
             self.resuming_talkspurt = true;
             self.resumed_packet_count = 0;
         }
@@ -119,6 +126,7 @@ impl VoiceReceiver {
             .contains(crate::packet::PacketFlags::END_OF_TALKSPURT)
         {
             self.pending_silence = true;
+            self.end_of_talkspurt_seq = Some(pkt.seq);
         }
 
         if pkt.payload.is_empty() {
@@ -215,6 +223,7 @@ impl VoiceReceiver {
         self.inner.reset_decoders()?;
         self.pending_silence = false;
         self.intentional_silence = false;
+        self.end_of_talkspurt_seq = None;
         self.resuming_talkspurt = false;
         self.resumed_packet_count = 0;
         self.consecutive_failures = 0;
@@ -246,6 +255,11 @@ impl VoiceReceiver {
             self.sticky_error = Some(message);
         }
     }
+}
+
+fn sequence_is_newer(sequence: u16, reference: u16) -> bool {
+    let distance = sequence.wrapping_sub(reference);
+    distance != 0 && distance < (1 << 15)
 }
 
 #[cfg(test)]
@@ -383,6 +397,68 @@ mod tests {
         assert!(stats_after.intentional_silence);
 
         Ok(())
+    }
+
+    #[test]
+    fn nonempty_packet_resumes_when_start_marker_was_lost() -> AnyResult<()> {
+        let mut encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+
+        encoder.push_pcm(&vec![0.1; ENCODE_FRAME_SAMPLES]);
+        let start = encoder.poll_packet()?.expect("expected voiced packet");
+        let end = VoicePacket {
+            seq: start.seq.wrapping_add(1),
+            timestamp: start.timestamp.wrapping_add(ENCODE_FRAME_SAMPLES as u32),
+            flags: crate::packet::PacketFlags::from_bits(
+                crate::packet::PacketFlags::END_OF_TALKSPURT,
+            ),
+            payload: Vec::new(),
+        };
+        receiver.push_packet(
+            start,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+        receiver.push_packet(
+            end.clone(),
+            PacketArrival {
+                received_at_mono_us: 20_000,
+            },
+        )?;
+        for _ in 0..12 {
+            receiver.pull_frame(&mut vec![0.0; PULL_FRAME_SAMPLES]);
+        }
+        assert!(receiver.stats().intentional_silence);
+
+        // Model a lost START packet by sending only later, unflagged packets
+        // from the new talkspurt. Two packets satisfy the normal resume prebuffer.
+        for offset in 2..=3 {
+            encoder.push_pcm(&vec![0.1; ENCODE_FRAME_SAMPLES]);
+            let mut packet = encoder.poll_packet()?.expect("expected voiced packet");
+            packet.seq = end.seq.wrapping_add(offset);
+            packet.timestamp = end
+                .timestamp
+                .wrapping_add(offset as u32 * ENCODE_FRAME_SAMPLES as u32);
+            packet.flags = crate::packet::PacketFlags::default();
+            receiver.push_packet(
+                packet,
+                PacketArrival {
+                    received_at_mono_us: offset as u64 * 20_000,
+                },
+            )?;
+        }
+
+        assert!(!receiver.stats().intentional_silence);
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_newer_handles_wrap_and_rejects_old_packets() {
+        assert!(sequence_is_newer(0, u16::MAX));
+        assert!(sequence_is_newer(11, 10));
+        assert!(!sequence_is_newer(10, 10));
+        assert!(!sequence_is_newer(9, 10));
     }
 
     #[test]

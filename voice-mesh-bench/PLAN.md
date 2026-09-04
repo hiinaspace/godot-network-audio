@@ -170,9 +170,13 @@ output.
    loss, Gilbert-style burst loss, and clean-impaired-clean outages with explicit
    injected-drop counters, expanded NetEq lifetime metrics, and a 1 Hz recovery
    timeline. A guarded loopback-netem runner separately validates Iroh transport
-   delay/loss and qdisc counters. Initial replicated results reveal persistent
-   target-delay and buffer growth under 5% uniform loss; diagnose the NetEq fork
-   before adding delay/jitter, capacity, and larger matrices.
+   delay/loss and qdisc counters. The apparent 5% loss buffer runaway was a
+   wrapper talkspurt-state bug: a lost start marker prevented playout from
+   draining later voiced packets. Implicit restart on a newer nonempty packet
+   bounds the reproduced run at 226 ms overall and 96 ms after startup. A
+   separate fork fix now preserves transport arrival timestamps during NetEq
+   delay estimation. Continue with delay/jitter, recovery, capacity, and larger
+   replicated matrices while tracking the still-high target-delay tail.
 5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the
    recovering participant.
