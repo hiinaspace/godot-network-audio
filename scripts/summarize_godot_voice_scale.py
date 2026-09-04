@@ -23,6 +23,11 @@ last = rows[-1] if rows else {}
 receivers = last.get("receivers", {})
 deltas_ms = [row.get("delta_sec", 0.0) * 1000.0 for row in rows]
 receiver_values = list(receivers.values())
+all_receiver_values = [
+    value
+    for row in rows
+    for value in row.get("receivers", {}).values()
+]
 
 time_text = (output_dir / "receiver_time.txt").read_text() if (output_dir / "receiver_time.txt").exists() else ""
 user = re.search(r"User time \(seconds\): ([0-9.]+)", time_text)
@@ -39,9 +44,10 @@ summary = {
     "playing_streams": sum(bool(value.get("is_playing")) for value in receiver_values),
     "enqueued_packets": sum(int(value.get("enqueued_packets", 0)) for value in receiver_values),
     "queue_dropped_packets": sum(int(value.get("dropped_packets", 0)) for value in receiver_values),
+    "concealed_samples": sum(int(value.get("concealed_samples", 0)) for value in receiver_values),
     "consecutive_receiver_failures": sum(int(value.get("consecutive_failures", 0)) for value in receiver_values),
-    "max_current_buffer_ms": max((int(value.get("current_buffer_size_ms", 0)) for value in receiver_values), default=0),
-    "max_target_delay_ms": max((int(value.get("target_delay_ms", 0)) for value in receiver_values), default=0),
+    "max_current_buffer_ms": max((int(value.get("current_buffer_size_ms", 0)) for value in all_receiver_values), default=0),
+    "max_target_delay_ms": max((int(value.get("target_delay_ms", 0)) for value in all_receiver_values), default=0),
     "frame_delta_ms_p95": percentile(deltas_ms, 95),
     "frame_delta_ms_p99": percentile(deltas_ms, 99),
     "frame_delta_ms_max": max(deltas_ms, default=0.0),

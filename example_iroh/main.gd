@@ -81,7 +81,7 @@ func _ready() -> void:
 			if sender == null:
 				push_error("iroh demo: failed to instantiate sender")
 				return
-			sender.input_sample_rate_hz = int(AudioServer.get_input_mix_rate())
+			sender.input_sample_rate_hz = SAMPLE_RATE if force_synthetic else int(AudioServer.get_input_mix_rate())
 			sender.capture_audio_server_input = not force_synthetic
 			sender.microphone_frame_budget = FRAME_SAMPLES
 			add_child(sender)
