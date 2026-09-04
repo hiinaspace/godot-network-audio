@@ -65,6 +65,7 @@ func _ready() -> void:
 	add_child(transport)
 	transport.peer_connected.connect(_on_peer_connected)
 	transport.peer_replaced.connect(_on_peer_connected)
+	transport.peer_disconnected.connect(_on_peer_disconnected)
 	if not transport.start_endpoint():
 		push_error("iroh demo: failed to start endpoint")
 		return
@@ -195,6 +196,24 @@ func _on_peer_connected(connected_peer_id: String) -> void:
 		stream = peer_stream
 		player = peer_player
 	print("iroh demo: receive stream ready peer=", connected_peer_id, " count=", receive_streams.size())
+
+func _on_peer_disconnected(disconnected_peer_id: String) -> void:
+	if role != ROLE_RECEIVER or not receive_streams.has(disconnected_peer_id):
+		return
+	var peer_player = receive_players.get(disconnected_peer_id)
+	if peer_player != null:
+		peer_player.stop()
+		peer_player.stream = null
+	receive_players.erase(disconnected_peer_id)
+	receive_streams.erase(disconnected_peer_id)
+	transport.remove_receive_stream(disconnected_peer_id)
+	stream = null
+	player = null
+	if not receive_streams.is_empty():
+		var remaining_peer = receive_streams.keys()[0]
+		stream = receive_streams[remaining_peer]
+		player = receive_players[remaining_peer]
+	print("iroh demo: receive stream removed peer=", disconnected_peer_id, " count=", receive_streams.size())
 
 func _push_synthetic_frame() -> void:
 	var samples := PackedFloat32Array()

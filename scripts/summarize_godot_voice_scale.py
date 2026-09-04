@@ -28,6 +28,17 @@ all_receiver_values = [
     for row in rows
     for value in row.get("receivers", {}).values()
 ]
+peer_lifetime = {}
+for row in rows:
+    for peer, value in row.get("receivers", {}).items():
+        lifetime = peer_lifetime.setdefault(peer, {})
+        for key in (
+            "enqueued_packets",
+            "dropped_packets",
+            "concealed_samples",
+            "consecutive_failures",
+        ):
+            lifetime[key] = max(int(lifetime.get(key, 0)), int(value.get(key, 0)))
 
 time_text = (output_dir / "receiver_time.txt").read_text() if (output_dir / "receiver_time.txt").exists() else ""
 user = re.search(r"User time \(seconds\): ([0-9.]+)", time_text)
@@ -40,12 +51,12 @@ summary = {
     "connected_peers_requested": connected_peers,
     "active_speakers_requested": active_speakers,
     "run_seconds": run_seconds,
-    "receive_streams": last.get("receive_stream_count", 0),
-    "playing_streams": sum(bool(value.get("is_playing")) for value in receiver_values),
-    "enqueued_packets": sum(int(value.get("enqueued_packets", 0)) for value in receiver_values),
-    "queue_dropped_packets": sum(int(value.get("dropped_packets", 0)) for value in receiver_values),
-    "concealed_samples": sum(int(value.get("concealed_samples", 0)) for value in receiver_values),
-    "consecutive_receiver_failures": sum(int(value.get("consecutive_failures", 0)) for value in receiver_values),
+    "receive_streams": max((int(row.get("receive_stream_count", 0)) for row in rows), default=0),
+    "playing_streams": max((sum(bool(value.get("is_playing")) for value in row.get("receivers", {}).values()) for row in rows), default=0),
+    "enqueued_packets": sum(value.get("enqueued_packets", 0) for value in peer_lifetime.values()),
+    "queue_dropped_packets": sum(value.get("dropped_packets", 0) for value in peer_lifetime.values()),
+    "concealed_samples": sum(value.get("concealed_samples", 0) for value in peer_lifetime.values()),
+    "consecutive_receiver_failures": sum(value.get("consecutive_failures", 0) for value in peer_lifetime.values()),
     "max_current_buffer_ms": max((int(value.get("current_buffer_size_ms", 0)) for value in all_receiver_values), default=0),
     "max_target_delay_ms": max((int(value.get("target_delay_ms", 0)) for value in all_receiver_values), default=0),
     "frame_delta_ms_p95": percentile(deltas_ms, 95),
@@ -54,6 +65,7 @@ summary = {
     "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / run_seconds * 100.0,
     "receiver_max_rss_kib": int(rss.group(1)) if rss else 0,
     "receiver_error_lines": sum("ERROR:" in line or "SCRIPT ERROR:" in line for line in log_text.splitlines()),
+    "max_connected_peers": max((int(row.get("transport", {}).get("peers_connected", 0)) for row in rows), default=0),
     "transport": last.get("transport", {}),
 }
 print(json.dumps(summary, indent=2, sort_keys=True))

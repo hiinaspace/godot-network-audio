@@ -4320,7 +4320,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "godot_network_audio_iroh",
  "iroh",
+ "iroh-base",
  "libc",
  "serde",
  "serde_json",
