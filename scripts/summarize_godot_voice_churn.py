@@ -205,6 +205,23 @@ summary = {
     "consecutive_receiver_failures": sum(value.get("consecutive_failures", 0) for value in peer_lifetime.values()),
     "enqueued_packets": sum(value.get("enqueued_packets", 0) for value in peer_lifetime.values()),
     "max_receive_streams": max((int(row.get("receive_stream_count", 0)) for row in rows), default=0),
+    "max_playing_streams": max(
+        (
+            sum(bool(value.get("is_playing")) for value in row.get("receivers", {}).values())
+            for row in rows
+        ),
+        default=0,
+    ),
+    "max_unpaused_streams": max(
+        (
+            sum(
+                bool(value.get("is_playing")) and not bool(value.get("playout_paused"))
+                for value in row.get("receivers", {}).values()
+            )
+            for row in rows
+        ),
+        default=0,
+    ),
     "final_receive_streams": int(last.get("receive_stream_count", 0)),
     "frame_delta_ms_p95": percentile(deltas_ms, 95),
     "frame_delta_ms_p99": percentile(deltas_ms, 99),

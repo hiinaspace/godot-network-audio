@@ -22,6 +22,7 @@ const PLAYBACK_DRAIN_BUDGET: usize = 32;
 const RECEIVER_SAMPLE_RATE_HZ: u32 = 48_000;
 const RECEIVER_MIN_DELAY_MS: u32 = 20;
 const RECEIVER_FRAME_SAMPLES: usize = 480;
+const AUDIBLE_SAMPLE_FLOOR: f32 = 1.0e-3;
 
 #[derive(Debug)]
 struct QueuedPacket {
@@ -61,6 +62,7 @@ struct SharedStreamState {
     non_silent_output_frames: AtomicU64,
     consecutive_failures: AtomicU32,
     intentional_silence: AtomicBool,
+    playout_paused: AtomicBool,
     playing: AtomicBool,
 }
 
@@ -92,6 +94,7 @@ impl SharedStreamState {
             non_silent_output_frames: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             intentional_silence: AtomicBool::new(false),
+            playout_paused: AtomicBool::new(false),
             playing: AtomicBool::new(false),
         }
     }
@@ -119,6 +122,7 @@ impl SharedStreamState {
         self.non_silent_output_frames.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.intentional_silence.store(false, Ordering::Relaxed);
+        self.playout_paused.store(false, Ordering::Relaxed);
     }
 
     fn publish_stats(&self, stats: &ReceiverStats) {
@@ -160,6 +164,8 @@ impl SharedStreamState {
             .store(stats.consecutive_failures, Ordering::Relaxed);
         self.intentional_silence
             .store(stats.intentional_silence, Ordering::Relaxed);
+        self.playout_paused
+            .store(stats.playout_paused, Ordering::Relaxed);
     }
 
     fn enqueue_packet(&self, packet: VoicePacket, arrival: PacketArrival) -> bool {
@@ -416,6 +422,10 @@ impl AudioStreamNetwork {
             "intentional_silence",
             self.shared.intentional_silence.load(Ordering::Relaxed),
         );
+        dict.set(
+            "playout_paused",
+            self.shared.playout_paused.load(Ordering::Relaxed),
+        );
         dict.set("queued_packets", self.shared.queue.len() as i64);
         dict.set(
             "dropped_packets",
@@ -493,6 +503,19 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
             return frames;
         }
 
+        // Keep the Godot stream alive so a future talkspurt can resume without
+        // main-thread lifecycle work, but do no NetEq work once an explicit end
+        // marker has drained. Network ingress wakes this path by queueing a packet.
+        if self.shared.playout_paused.load(Ordering::Relaxed) && self.shared.queue.is_empty() {
+            self.shared
+                .mixed_output_frames
+                .fetch_add(frame_count as u64, Ordering::Relaxed);
+            self.playback_position_frames = self
+                .playback_position_frames
+                .saturating_add(frame_count as u64);
+            return frames;
+        }
+
         if self.detached_init {
             if !self.warned_detached_init {
                 godot_warn!(
@@ -510,7 +533,7 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
             .fetch_add(frame_count as u64, Ordering::Relaxed);
         let non_silent_frames = out
             .iter()
-            .filter(|frame| frame.left.abs().max(frame.right.abs()) > 1.0e-5)
+            .filter(|frame| frame.left.abs().max(frame.right.abs()) > AUDIBLE_SAMPLE_FLOOR)
             .count() as u64;
         self.shared
             .non_silent_output_frames

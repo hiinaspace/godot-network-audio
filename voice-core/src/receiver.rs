@@ -36,6 +36,7 @@ pub struct ReceiverStats {
     pub consecutive_failures: u32,
     pub sticky_error: Option<String>,
     pub intentional_silence: bool,
+    pub playout_paused: bool,
 }
 
 pub struct VoiceReceiver {
@@ -240,6 +241,7 @@ impl VoiceReceiver {
             consecutive_failures: self.consecutive_failures,
             sticky_error: self.sticky_error.clone(),
             intentional_silence: self.intentional_silence || self.pending_silence,
+            playout_paused: self.intentional_silence,
         }
     }
 
