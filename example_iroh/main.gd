@@ -7,7 +7,6 @@ const ROLE_SENDER := "sender"
 const ROLE_RECEIVER := "receiver"
 const DEFAULT_QUIT_SECONDS := 6.0
 const STARTUP_PREBUFFER_PACKETS := 4
-const DETAILED_TRACE_STRIDE := 5
 
 var role := ROLE_RECEIVER
 var quit_after_seconds := DEFAULT_QUIT_SECONDS
@@ -41,7 +40,6 @@ var quit_timer: Timer
 var trace_file: FileAccess = null
 var event_file: FileAccess = null
 var event_records := []
-var trace_records := PackedStringArray()
 var trace_frame := 0
 var input_mode := "microphone"
 var demo_start_msec := 0
@@ -277,11 +275,8 @@ func _open_trace_file() -> void:
 
 func _close_trace_file() -> void:
 	if trace_file != null:
-		for record in trace_records:
-			trace_file.store_line(record)
 		trace_file.flush()
 		trace_file = null
-	trace_records.clear()
 
 func _open_event_file() -> void:
 	if event_jsonl_path == "":
@@ -318,11 +313,6 @@ func _track_first_output() -> void:
 func _write_trace_row(delta: float) -> void:
 	if trace_file == null or transport == null:
 		return
-	# Per-frame synchronous writes of the full receiver population can stall the
-	# main thread for seconds on networked/overlay filesystems. Keep every frame
-	# delta, sample the large per-peer payload, and write the buffered JSONL only
-	# after the measurement has ended.
-	var include_details := trace_frame % DETAILED_TRACE_STRIDE == 0
 	var row := {
 		"frame": trace_frame,
 		"mono_usec": Time.get_ticks_usec(),
@@ -331,12 +321,12 @@ func _write_trace_row(delta: float) -> void:
 		"role": role,
 		"peer_id": peer_id,
 		"receive_stream_count": receive_streams.size(),
-		"receivers": _receiver_stats() if include_details else {},
+		"receivers": _receiver_stats(),
 		"transport": transport.get_stats(),
-		"receiver": stream.get_stats() if include_details and stream != null else {},
-		"sender": sender.get_stats() if include_details and sender != null else {},
+		"receiver": stream.get_stats() if stream != null else {},
+		"sender": sender.get_stats() if sender != null else {},
 	}
-	trace_records.append(JSON.stringify(row))
+	trace_file.store_line(JSON.stringify(row))
 	trace_frame += 1
 
 func _receiver_stats() -> Dictionary:

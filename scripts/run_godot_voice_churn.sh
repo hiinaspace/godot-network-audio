@@ -14,6 +14,7 @@ RECEIVER_SAFETY_SECONDS=120
 GODOT_BIN="${GODOT_BIN:-$(command -v godot || command -v godot4 || true)}"
 
 mkdir -p "$OUTPUT_DIR"
+runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/gna-churn.XXXXXX")"
 if [[ -f "$HOME/.cargo/env" ]]; then source "$HOME/.cargo/env"; fi
 cargo build -p godot_network_audio --features iroh-transport >/dev/null
 cargo build --release -p voice-mesh-bench --bin godot_voice_churn >/dev/null
@@ -33,6 +34,7 @@ cleanup() {
     [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
   done
   [[ -n "$module_id" ]] && pactl unload-module "$module_id" 2>/dev/null || true
+  rm -rf -- "$runtime_dir"
 }
 trap cleanup EXIT
 
@@ -43,7 +45,7 @@ ffmpeg -hide_banner -loglevel error -nostdin -y -f pulse -i "$sink.monitor" \
 capture_pid=$!
 
 endpoint="$OUTPUT_DIR/receiver_endpoint.json"
-trace="$OUTPUT_DIR/receiver_trace.jsonl"
+trace="$runtime_dir/receiver_trace.jsonl"
 receiver_events="$OUTPUT_DIR/receiver_events.jsonl"
 quit_file="$OUTPUT_DIR/receiver_done_${tag}"
 env PULSE_SINK="$sink" GNA_IROH_ROLE=receiver GNA_IROH_BIND_ADDR=127.0.0.1:0 \
@@ -95,6 +97,8 @@ kill -INT "$capture_pid" 2>/dev/null || true
 wait "$capture_pid" || true
 capture_pid=""
 
+cp "$trace" "$OUTPUT_DIR/receiver_trace.jsonl"
+
 python3 "$ROOT_DIR/scripts/summarize_godot_voice_churn.py" \
   "$OUTPUT_DIR" "$PEERS" "$ACTIVE" "$EXPECTED_SECONDS" >"$OUTPUT_DIR/summary.json"
 cat "$OUTPUT_DIR/summary.json"
@@ -102,3 +106,4 @@ cat "$OUTPUT_DIR/loadgen.json"
 
 trap - EXIT
 pactl unload-module "$module_id"
+rm -rf -- "$runtime_dir"
