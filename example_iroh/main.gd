@@ -216,13 +216,13 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 	if role != ROLE_RECEIVER or not receive_streams.has(disconnected_peer_id):
 		return
 	var peer_player = receive_players.get(disconnected_peer_id)
-	_record_event("peer_disconnected", disconnected_peer_id, receive_streams[disconnected_peer_id].get_stats())
+	var peer_stream = receive_streams[disconnected_peer_id]
+	_record_event("peer_disconnected", disconnected_peer_id, peer_stream.get_stats())
 	if peer_player != null:
-		peer_player.stop()
-		# Releasing a live custom AudioStream can make Godot synchronize with the
-		# audio server at the end of this frame. Under source churn that has taken
-		# seconds in headless runs. Remove it from routing now, but retain the
-		# stopped player until a non-interactive shutdown/reclamation point.
+		# Mutating a live AudioStreamPlayer can make Godot synchronize with the
+		# audio server at the end of this frame. Deactivate the stream atomically
+		# and retain its player until a non-interactive reclamation point.
+		peer_stream.deactivate()
 		retired_receive_players.append(peer_player)
 	receive_players.erase(disconnected_peer_id)
 	receive_streams.erase(disconnected_peer_id)

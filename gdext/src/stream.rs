@@ -63,6 +63,7 @@ struct SharedStreamState {
     consecutive_failures: AtomicU32,
     intentional_silence: AtomicBool,
     playout_paused: AtomicBool,
+    active: AtomicBool,
     playing: AtomicBool,
 }
 
@@ -95,6 +96,7 @@ impl SharedStreamState {
             consecutive_failures: AtomicU32::new(0),
             intentional_silence: AtomicBool::new(false),
             playout_paused: AtomicBool::new(false),
+            active: AtomicBool::new(true),
             playing: AtomicBool::new(false),
         }
     }
@@ -169,6 +171,9 @@ impl SharedStreamState {
     }
 
     fn enqueue_packet(&self, packet: VoicePacket, arrival: PacketArrival) -> bool {
+        if !self.active.load(Ordering::Relaxed) {
+            return false;
+        }
         let now_us = self.now_mono_us();
         let last_enqueue_us = self.last_enqueue_us.swap(now_us, Ordering::Relaxed);
         if last_enqueue_us != 0 {
@@ -324,6 +329,18 @@ impl AudioStreamNetwork {
         while self.shared.queue.pop().is_some() {}
     }
 
+    /// Stop playout work without asking Godot to mutate the audio graph.
+    ///
+    /// Disconnected streams may remain attached to a player until a safe
+    /// reclamation point. This call is lock-free and immediately makes the
+    /// audio callback return silence without advancing NetEq.
+    #[func]
+    fn deactivate(&mut self) {
+        self.shared.active.store(false, Ordering::Relaxed);
+        self.shared.playout_paused.store(true, Ordering::Relaxed);
+        while self.shared.queue.pop().is_some() {}
+    }
+
     #[func]
     fn get_buffer_ms(&self) -> i32 {
         self.shared.current_buffer_size_ms.load(Ordering::Relaxed) as i32
@@ -426,6 +443,7 @@ impl AudioStreamNetwork {
             "playout_paused",
             self.shared.playout_paused.load(Ordering::Relaxed),
         );
+        dict.set("active", self.shared.active.load(Ordering::Relaxed));
         dict.set("queued_packets", self.shared.queue.len() as i64);
         dict.set(
             "dropped_packets",
@@ -500,6 +518,16 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
         zero_frames(out);
 
         if !self.is_playing() {
+            return frames;
+        }
+
+        if !self.shared.active.load(Ordering::Relaxed) {
+            self.shared
+                .mixed_output_frames
+                .fetch_add(frame_count as u64, Ordering::Relaxed);
+            self.playback_position_frames = self
+                .playback_position_frames
+                .saturating_add(frame_count as u64);
             return frames;
         }
 
