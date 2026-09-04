@@ -1,5 +1,12 @@
 # godot-network-audio — tactical plan
 
+> This pre-scale plan is retained for historical detail. The headless Iroh,
+> NetEq, topology, impairment, churn, process-isolation, and Opus 1.6/DRED work
+> is now complete enough to begin the Godot scale gate. See
+> `voice-mesh-bench/GODOTLESS_REVIEW.md` for the corrected evidence, limits, and
+> ranked next work; do not treat the old "all testing so far" bullets below as
+> current status.
+
 This file tracks current status and the next implementation milestones.
 Durable architecture notes live in `DESIGN.md`.
 

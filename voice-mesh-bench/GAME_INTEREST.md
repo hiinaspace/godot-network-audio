@@ -3,6 +3,14 @@
 Date: 2026-09-03
 Runner: `gna-sim`, 8-CPU quota, 20 GiB memory limit
 
+> Review note (2026-09-04): the original DTX encoder compressed RTP timestamps
+> across no-send silence, and the original multiprocess CPU window included
+> delivery grace. Connection/setup, traffic, successful-delivery, and bounded
+> resource conclusions below remain useful, but do not use the older DTX
+> concealment/timing values or single-versus-multiprocess CPU ratios as final
+> evidence. Corrected controls and the full scope audit are in
+> `GODOTLESS_REVIEW.md`.
+
 ## Scenario
 
 The first game-shaped workload keeps a complete Iroh connection mesh while all
