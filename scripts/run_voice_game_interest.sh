@@ -11,6 +11,7 @@ SEEDS="${3:-5}"
 BINARY="$ROOT_DIR/target/release/voice-mesh-bench"
 PARTICIPANT_COUNTS="${PARTICIPANT_COUNTS:-8 16 32}"
 RECEIVER_POLICY="${RECEIVER_POLICY:-retire}"
+INTEREST_PROFILE="${INTEREST_PROFILE:-rotating}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -40,7 +41,7 @@ for participants in $PARTICIPANT_COUNTS; do
   fi
   for delivery in sender-filtered broadcast-discard; do
     for seed in $(seq 1 "$SEEDS"); do
-      name="${participants}p-4t-${interest_listeners}i-${delivery}-${RECEIVER_POLICY}-seed${seed}"
+      name="${participants}p-4t-${interest_listeners}i-${delivery}-${RECEIVER_POLICY}-${INTEREST_PROFILE}-seed${seed}"
       echo "running $name (${RUN_SECONDS}s)"
       "$BINARY" \
         --scenario game-interest \
@@ -49,6 +50,7 @@ for participants in $PARTICIPANT_COUNTS; do
         --interest-listeners "$interest_listeners" \
         --delivery "$delivery" \
         --receiver-policy "$RECEIVER_POLICY" \
+        --interest-profile "$INTEREST_PROFILE" \
         --seconds "$RUN_SECONDS" \
         --dtx on \
         --seed "$seed" \

@@ -141,9 +141,19 @@ output.
    current RSS plateaus under repeated interest changes before impairment.
    **In progress:** bounded reuse is implemented and reduced construction,
    CPU, and scheduling misses in a matched run, while retaining about 32 MiB
-   more RSS. Its longer-run RSS ceiling remains to be established.
+   more RSS. A ten-minute pooled run still rose from 121 to 277 MiB despite a
+   bounded receiver count; in-place decoder reset only slightly improved the
+   matched 180-second result. Investigate allocator/NetEq retention rather than
+   claiming a leak or a stable ceiling.
 3. Add a short crowd burst, group merge/split, and rapid interest-boundary
-   oscillation to expose correlated scheduling stalls.
+   oscillation to expose correlated scheduling stalls. **Complete:** all three
+   deterministic profiles and stress-window metrics are implemented; the
+   all-speaker burst is the first clean workload to produce a pronounced
+   correlated deadline spike. Follow-up timing showed that the severe
+   32-participant rate is predominantly a co-located-runtime scheduling effect;
+   an eight-client/all-seven-speakers endpoint control stayed near its
+   non-stress deadline rate. Keep aggregate transport and endpoint playout
+   interpretations separate.
 4. Apply selected steady, burst, outage, capacity, and recovery profiles.
 5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the

@@ -85,8 +85,8 @@ plateau.
 ## Immediate retirement versus bounded reuse
 
 The harness now supports both `--receiver-policy retire` and `pool`. A pooled
-receiver is flushed and given a fresh Opus decoder before it represents a new
-logical stream. Pools are local to each listener and bounded by that
+receiver is flushed and its Opus decoder state reset before it represents a
+new logical stream. Pools are local to each listener and bounded by that
 listener's peak inactive receiver count, rather than allocating every possible
 direction eagerly.
 
@@ -118,10 +118,104 @@ accounting fix counted only receivers still alive at the end. Transport,
 timing, CPU, and memory values from those runs remain usable, but their
 concealment percentages are not comparable with the matched run above.
 
+## Correlated-interest stress
+
+The first stress matrix below used the schema-v2 sender implementation, which
+encoded every virtual participant serially in one periodic task. Its delivery,
+traffic, lifecycle, and error counts remain valid. Its callback-deadline rates
+are useful as a single-process saturation signal, but are not a faithful model
+of independently clocked desktop senders; the harness-fidelity follow-up below
+corrects that design.
+
+Three deterministic profiles were compared with the rotating control at 32
+participants, sender-filtered delivery, and pooled receivers. Each of five
+36-second seeds contained three stress events:
+
+- `crowd-burst`: every participant speaks for one second;
+- `group-merge`: four groups of eight pair into two groups of sixteen, raising
+  each speaker's listener fanout from 7 to 15, then split again;
+- `boundary-oscillation`: every 100 ms, all speakers switch between two
+  disjoint seven-listener sets for four seconds.
+
+All 20 runs delivered all 2,104,012 datagrams with zero send, malformed, or
+NetEq errors. The cgroup accumulated four throttle events totaling only 12 ms
+over the roughly 12-minute matrix.
+
+| Profile | Median sent | Median CPU | Median current RSS | Median deadline misses | Stress / non-stress deadline misses | Worst participant stress rate | Receiver constructions / reuses | Concealment |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Rotating control | 89,600 | 163.4% | 212.1 MiB | 2.78% | n/a / 2.78% | n/a | 360 / 1,790 | 2.66% |
+| Crowd burst | 118,496 | 183.9% | 210.9 MiB | 4.39% | 18.88% / 3.08% | 28.0% | 360 / 1,776 | 3.62% |
+| Group merge | 122,908 | 182.7% | 231.4 MiB | 4.12% | 6.54% / 2.72% | 15.33% | 480 / 512 | 1.55% |
+| Boundary oscillation | 89,684 | 180.0% | 194.6 MiB | 3.50% | 3.13% / 3.74% | 14.17% | 261 / 10,474 | 5.72% |
+
+The crowd burst is the first clean-path workload to expose a pronounced
+correlated scheduling failure: its stress-window deadline rate is about six
+times its own non-stress rate. Fanout itself is still short (24 us stress p95),
+so the likely pressure comes from simultaneously encoding, delivering, and
+pulling 32 newly active streams. Group merge increases traffic and receiver
+cardinality but produces a smaller deadline step. Boundary oscillation spends
+more CPU and raises concealment through repeated stream startup/reset, yet does
+not make its stress-window deadline rate worse than its non-stress rate.
+
+These deadlines are virtual callback diagnostics, not direct audible-failure
+counts.
+
+### Harness-fidelity follow-up
+
+Schema v3 gives each virtual participant an independent, phase-staggered sender
+task and reports callback work time. In a three-seed 32-participant rerun on
+eight Tokio workers, the rotating control used 282% of one core and had 6.65%
+deadline misses. The crowd case used 294%, with 31.17% misses in the stress
+window versus 5.86% outside it. The formerly batched sender was not the direct
+cause: individual sender work was only 1.31 ms p95 in the control and 1.73 ms
+in the burst. Per-listener callback work rose from 0.90 ms to 4.61 ms p95 in
+the burst, almost entirely in NetEq pull/decode.
+
+Increasing the shared runtime to 32 workers made contention worse: crowd CPU
+rose to 408%, and stress-window deadline misses to 63.32%. This is not a
+runtime-width shortage.
+
+An endpoint-shaped control then used eight participants with all-to-all
+interest. Every listener still received the same seven simultaneous speakers,
+but the pod no longer simulated 24 unrelated desktops. Across three seeds it
+used 140% of one core, had zero sender skips, and measured 5.29% stress-window
+deadline misses versus 4.66% outside the burst. Sender work was 1.67 ms p95 and
+listener NetEq pull work 1.75 ms p95 during the burst. Every datagram arrived
+and no NetEq errors occurred.
+
+The severe 32-participant callback spike is therefore predominantly aggregate
+single-host scheduling contention, not evidence that one desktop cannot play
+seven active speakers. Use the 32-participant process for Iroh traffic,
+connection, and aggregate-resource stress; use the endpoint-shaped case for
+per-client decoder/playout budgets. A later multiprocess or multi-host run is
+required before treating 32-participant virtual callback deadlines as user
+experience.
+
+## Pooled-receiver RSS follow-up
+
+The ten-minute, 32-participant pooled run remained transport-clean: all
+1,468,138 datagrams arrived, with zero send/NetEq errors and zero cgroup
+throttling. It used 155% of one core, skipped four aggregate sender ticks, and
+had 2.66% aggregate deadline misses. Receiver allocation was bounded at 439
+constructions, 33,991 reuses, and a maximum per-listener pool of 15.
+
+Current RSS did not plateau. It rose from 121 MiB after setup to 239 MiB at 200
+seconds and 277 MiB at 600 seconds. Replacing decoder reallocation with an
+in-place Audiopus state reset reduced the matched 180-second endpoint only
+from 236 MiB to 231 MiB, so decoder construction is not the main explanation.
+The pool remains the lower-CPU policy, but memory growth needs allocator and
+NetEq-buffer investigation before it becomes a production recommendation.
+
 Raw results are on `gna-sim` under:
 
 ```text
 /work/projects/godot-network-audio/target/voice-mesh/game-interest-v1/
 /work/projects/godot-network-audio/target/voice-mesh/game-interest-v2-32/
 /work/projects/godot-network-audio/target/voice-mesh/game-interest-soak/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-v1/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-soak/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-instrumented/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-parallel-senders/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-workers32/
+/work/projects/godot-network-audio/target/voice-mesh/interest-stress-8p-all-interest/
 ```

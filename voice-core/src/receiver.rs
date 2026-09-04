@@ -202,10 +202,7 @@ impl VoiceReceiver {
     /// receiver to a new logical stream.
     pub fn reset_stream(&mut self) -> Result<()> {
         self.inner.flush();
-        self.inner.register_decoder(
-            PAYLOAD_TYPE_OPUS,
-            Box::new(OpusAudioDecoder::new(self.sample_rate, self.channels)?),
-        );
+        self.inner.reset_decoders()?;
         self.pending_silence = false;
         self.intentional_silence = false;
         self.resuming_talkspurt = false;

@@ -41,10 +41,25 @@ scripts/run_voice_game_interest.sh target/voice-mesh/game-interest 30 5
 
 Individual runs accept `--scenario game-interest`, `--delivery
 sender-filtered|broadcast-discard`, `--receiver-policy retire|pool`,
+`--interest-profile rotating|crowd-burst|group-merge|boundary-oscillation`,
 `--interest-listeners N`, and `--seed N`. The matrix script also accepts
-`RECEIVER_POLICY=retire|pool` (default `retire`). Result JSON includes
-per-participant metrics, receiver lifecycle counts, interest-entry-to-media
-delay, and talkspurt-start-to-audible-output delay.
+`RECEIVER_POLICY=retire|pool` (default `retire`) and `INTEREST_PROFILE`.
+Result JSON includes per-participant metrics, receiver lifecycle counts,
+interest-entry-to-media delay, and talkspurt-start-to-audible-output delay.
+
+Run the correlated 32-participant stress profiles with bounded receiver reuse:
+
+```sh
+scripts/run_voice_interest_stress.sh target/voice-mesh/interest-stress 36 5
+```
+
+This compares the rotating control with a one-second all-speaker burst, a
+split-to-merged group transition, and 100 ms oscillation between disjoint
+listener sets. Stress-window sender, fanout, queue, and playout metrics are
+reported separately from the full-run aggregates. Virtual participants use
+independent, phase-staggered sender tasks. `RUNTIME_WORKERS=N` controls the
+shared Tokio runtime for diagnosing harness contention; it does not model
+additional client machines.
 
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party

@@ -31,6 +31,12 @@ const GAME_TURN_FRAMES: u64 = 75;
 const GAME_TALK_FRAMES: u64 = 60;
 const GAME_OVERLAP_FRAMES: u64 = 5;
 const GAME_INTEREST_EPOCH_FRAMES: u64 = 150;
+const STRESS_CYCLE_FRAMES: u64 = 600;
+const STRESS_WINDOW_START_FRAMES: u64 = 200;
+const STRESS_WINDOW_END_FRAMES: u64 = 400;
+const CROWD_BURST_START_FRAMES: u64 = 250;
+const CROWD_BURST_END_FRAMES: u64 = 300;
+const BOUNDARY_OSCILLATION_FRAMES: u64 = 5;
 const NON_SILENT_RMS: f32 = 0.000_1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +66,25 @@ enum ReceiverPolicy {
     Pool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterestProfile {
+    Rotating,
+    CrowdBurst,
+    GroupMerge,
+    BoundaryOscillation,
+}
+
+impl InterestProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotating => "rotating",
+            Self::CrowdBurst => "crowd-burst",
+            Self::GroupMerge => "group-merge",
+            Self::BoundaryOscillation => "boundary-oscillation",
+        }
+    }
+}
+
 impl ReceiverPolicy {
     fn as_str(self) -> &'static str {
         match self {
@@ -87,8 +112,10 @@ struct Config {
     scenario: Scenario,
     delivery: Delivery,
     receiver_policy: ReceiverPolicy,
+    interest_profile: InterestProfile,
     interest_listeners: usize,
     seed: u64,
+    runtime_workers: usize,
     output: Option<PathBuf>,
 }
 
@@ -102,8 +129,12 @@ impl Default for Config {
             scenario: Scenario::Baseline,
             delivery: Delivery::SenderFiltered,
             receiver_policy: ReceiverPolicy::Retire,
+            interest_profile: InterestProfile::Rotating,
             interest_listeners: 7,
             seed: 1,
+            runtime_workers: std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
             output: None,
         }
     }
@@ -161,10 +192,25 @@ impl Config {
                         _ => bail!("--receiver-policy must be retire or pool, got {value}"),
                     };
                 }
+                "--interest-profile" => {
+                    let value = args.next().context("--interest-profile requires a value")?;
+                    config.interest_profile = match value.as_str() {
+                        "rotating" => InterestProfile::Rotating,
+                        "crowd-burst" => InterestProfile::CrowdBurst,
+                        "group-merge" => InterestProfile::GroupMerge,
+                        "boundary-oscillation" => InterestProfile::BoundaryOscillation,
+                        _ => bail!(
+                            "--interest-profile must be rotating, crowd-burst, group-merge, or boundary-oscillation, got {value}"
+                        ),
+                    };
+                }
                 "--interest-listeners" => {
                     config.interest_listeners = parse_next(&mut args, "--interest-listeners")?;
                 }
                 "--seed" => config.seed = parse_next(&mut args, "--seed")?,
+                "--runtime-workers" => {
+                    config.runtime_workers = parse_next(&mut args, "--runtime-workers")?;
+                }
                 "--output" => {
                     config.output = Some(PathBuf::from(
                         args.next().context("--output requires a path")?,
@@ -180,12 +226,22 @@ impl Config {
         if config.talkers == 0 || config.talkers > config.participants {
             bail!("--talkers must be between 1 and the participant count");
         }
+        if !(1..=128).contains(&config.runtime_workers) {
+            bail!("--runtime-workers must be between 1 and 128");
+        }
         if config.scenario == Scenario::GameInterest {
             if config.interest_listeners == 0 || config.interest_listeners >= config.participants {
                 bail!("--interest-listeners must be between 1 and participants - 1");
             }
             if config.talkers > 8 {
                 bail!("game-interest supports at most 8 simultaneous conversation slots");
+            }
+            if config.interest_profile == InterestProfile::BoundaryOscillation
+                && config.interest_listeners * 2 > config.participants - 1
+            {
+                bail!(
+                    "boundary-oscillation requires two disjoint listener sets; use --interest-listeners no greater than (participants - 1) / 2"
+                );
             }
         }
         Ok(Some(config))
@@ -247,10 +303,13 @@ struct Metrics {
     scenario: &'static str,
     delivery: &'static str,
     receiver_policy: &'static str,
+    interest_profile: &'static str,
     seed: u64,
+    runtime_worker_threads: usize,
     participants: usize,
     talkers: usize,
     interest_listeners: usize,
+    max_interest_listeners: usize,
     dtx: bool,
     requested_duration_seconds: f64,
     mesh_connections: usize,
@@ -267,6 +326,13 @@ struct Metrics {
     sender_ticks: u64,
     sender_callbacks: u64,
     sender_skipped_ticks: u64,
+    stress_events: u64,
+    stress_sender_ticks: u64,
+    stress_sender_skipped_ticks: u64,
+    stress_sent_datagrams: u64,
+    stress_fanout_span_us_p95: u64,
+    sender_callback_work_us_p95: u64,
+    stress_sender_callback_work_us_p95: u64,
     fanout_span_us_p50: u64,
     fanout_span_us_p95: u64,
     fanout_span_us_max: u64,
@@ -300,6 +366,17 @@ struct Metrics {
     playout_skipped_ticks: u64,
     playout_deadline_misses: u64,
     playout_deadline_miss_percent: f64,
+    stress_playout_ticks: u64,
+    stress_playout_deadline_misses: u64,
+    stress_playout_deadline_miss_percent: f64,
+    nonstress_playout_deadline_miss_percent: f64,
+    stress_receive_queue_delay_us_p95: u64,
+    listener_callback_work_us_p95: u64,
+    stress_listener_callback_work_us_p95: u64,
+    receive_drain_work_us_p95: u64,
+    stress_receive_drain_work_us_p95: u64,
+    playout_pull_work_us_p95: u64,
+    stress_playout_pull_work_us_p95: u64,
     playout_lateness_us_max: u64,
     neteq_concealed_samples: u64,
     neteq_concealed_percent: f64,
@@ -329,6 +406,7 @@ struct ParticipantMetrics {
     receive_queue_delay_us_p95: u64,
     playout_skipped_ticks: u64,
     playout_deadline_miss_percent: f64,
+    stress_playout_deadline_miss_percent: f64,
     playout_lateness_us_max: u64,
     interest_entry_to_first_media_us_p95: u64,
     interest_entry_events: usize,
@@ -347,6 +425,13 @@ struct RunCounters {
     received_bytes: u64,
     latencies_us: Vec<u64>,
     queue_delays_us: Vec<u64>,
+    stress_queue_delays_us: Vec<u64>,
+    listener_callback_work_us: Vec<u64>,
+    stress_listener_callback_work_us: Vec<u64>,
+    receive_drain_work_us: Vec<u64>,
+    stress_receive_drain_work_us: Vec<u64>,
+    playout_pull_work_us: Vec<u64>,
+    stress_playout_pull_work_us: Vec<u64>,
     interest_entry_to_first_media_us: Vec<u64>,
     talkspurt_start_to_audio_us: Vec<u64>,
     receiver_pull_samples: u64,
@@ -354,6 +439,8 @@ struct RunCounters {
     playout_callbacks: u64,
     playout_skipped_ticks: u64,
     playout_deadline_misses: u64,
+    stress_playout_ticks: u64,
+    stress_playout_deadline_misses: u64,
     playout_lateness_us_max: u64,
 }
 
@@ -362,11 +449,18 @@ struct SendCounters {
     sender_ticks: u64,
     sender_callbacks: u64,
     sender_skipped_ticks: u64,
+    stress_events: u64,
+    stress_sender_ticks: u64,
+    stress_sender_skipped_ticks: u64,
+    stress_sent_datagrams: u64,
     encoded_packets: u64,
     sent_datagrams: u64,
     send_errors: u64,
     sent_bytes: u64,
     fanout_spans_us: Vec<u64>,
+    stress_fanout_spans_us: Vec<u64>,
+    callback_work_us: Vec<u64>,
+    stress_callback_work_us: Vec<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -409,6 +503,20 @@ impl RunCounters {
         self.received_bytes += other.received_bytes;
         self.latencies_us.append(&mut other.latencies_us);
         self.queue_delays_us.append(&mut other.queue_delays_us);
+        self.stress_queue_delays_us
+            .append(&mut other.stress_queue_delays_us);
+        self.listener_callback_work_us
+            .append(&mut other.listener_callback_work_us);
+        self.stress_listener_callback_work_us
+            .append(&mut other.stress_listener_callback_work_us);
+        self.receive_drain_work_us
+            .append(&mut other.receive_drain_work_us);
+        self.stress_receive_drain_work_us
+            .append(&mut other.stress_receive_drain_work_us);
+        self.playout_pull_work_us
+            .append(&mut other.playout_pull_work_us);
+        self.stress_playout_pull_work_us
+            .append(&mut other.stress_playout_pull_work_us);
         self.interest_entry_to_first_media_us
             .append(&mut other.interest_entry_to_first_media_us);
         self.talkspurt_start_to_audio_us
@@ -418,9 +526,33 @@ impl RunCounters {
         self.playout_callbacks += other.playout_callbacks;
         self.playout_skipped_ticks += other.playout_skipped_ticks;
         self.playout_deadline_misses += other.playout_deadline_misses;
+        self.stress_playout_ticks += other.stress_playout_ticks;
+        self.stress_playout_deadline_misses += other.stress_playout_deadline_misses;
         self.playout_lateness_us_max = self
             .playout_lateness_us_max
             .max(other.playout_lateness_us_max);
+    }
+}
+
+impl SendCounters {
+    fn merge(&mut self, mut other: Self) {
+        self.sender_ticks += other.sender_ticks;
+        self.sender_callbacks += other.sender_callbacks;
+        self.sender_skipped_ticks += other.sender_skipped_ticks;
+        self.stress_events = self.stress_events.max(other.stress_events);
+        self.stress_sender_ticks += other.stress_sender_ticks;
+        self.stress_sender_skipped_ticks += other.stress_sender_skipped_ticks;
+        self.stress_sent_datagrams += other.stress_sent_datagrams;
+        self.encoded_packets += other.encoded_packets;
+        self.sent_datagrams += other.sent_datagrams;
+        self.send_errors += other.send_errors;
+        self.sent_bytes += other.sent_bytes;
+        self.fanout_spans_us.append(&mut other.fanout_spans_us);
+        self.stress_fanout_spans_us
+            .append(&mut other.stress_fanout_spans_us);
+        self.callback_work_us.append(&mut other.callback_work_us);
+        self.stress_callback_work_us
+            .append(&mut other.stress_callback_work_us);
     }
 }
 
@@ -430,6 +562,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let runtime = Builder::new_multi_thread()
+        .worker_threads(config.runtime_workers)
         .enable_all()
         .thread_name("voice-mesh-bench")
         .build()
@@ -461,8 +594,10 @@ fn print_help() {
          \x20 --scenario NAME   baseline or game-interest (default baseline)\n\
          \x20 --delivery NAME   sender-filtered or broadcast-discard\n\
          \x20 --receiver-policy NAME  retire or pool (default retire)\n\
+         \x20 --interest-profile NAME rotating, crowd-burst, group-merge, or boundary-oscillation\n\
          \x20 --interest-listeners N  Interested listeners per game talker (default 7)\n\
          \x20 --seed N          Deterministic game schedule seed (default 1)\n\
+         \x20 --runtime-workers N  Tokio worker threads (default available CPUs)\n\
          \x20 --output PATH     Also write pretty JSON metrics to PATH\n\
          \x20 -h, --help        Show this help"
     );
@@ -520,14 +655,23 @@ async fn run(config: Config) -> Result<Metrics> {
             ))
         })
         .collect::<Vec<_>>();
-    let sender = tokio::spawn(send_media(
-        config.duration,
-        mesh.connections.clone(),
-        encoders,
-        media_start,
-        clock_start,
-        config.clone(),
-    ));
+    let sender_count = encoders.len();
+    let sender_tasks = encoders
+        .into_iter()
+        .enumerate()
+        .map(|(speaker, encoder)| {
+            tokio::spawn(send_media(
+                speaker,
+                sender_count,
+                config.duration,
+                mesh.connections[speaker].clone(),
+                encoder,
+                media_start,
+                clock_start,
+                config.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut rss_samples = Vec::new();
     let mut next_rss_sample = media_start;
     while next_rss_sample < media_end {
@@ -546,7 +690,10 @@ async fn run(config: Config) -> Result<Metrics> {
     });
     let media_wall = media_start.elapsed();
     let after_media = process_usage()?;
-    let mut send_counters = sender.await.context("media sender task panicked")??;
+    let mut send_counters = SendCounters::default();
+    for task in sender_tasks {
+        send_counters.merge(task.await.context("media sender task panicked")??);
+    }
     let mut counters = RunCounters::default();
     let mut concealed_samples = 0_u64;
     let mut receiver_errors = 0_usize;
@@ -581,7 +728,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 2,
+        schema_version: 3,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
         delivery: match config.scenario {
@@ -589,12 +736,21 @@ async fn run(config: Config) -> Result<Metrics> {
             Scenario::GameInterest => config.delivery.as_str(),
         },
         receiver_policy: config.receiver_policy.as_str(),
+        interest_profile: match config.scenario {
+            Scenario::Baseline => "none",
+            Scenario::GameInterest => config.interest_profile.as_str(),
+        },
         seed: config.seed,
+        runtime_worker_threads: config.runtime_workers,
         participants: config.participants,
         talkers: config.talkers,
         interest_listeners: match config.scenario {
             Scenario::Baseline => config.participants - 1,
             Scenario::GameInterest => config.interest_listeners,
+        },
+        max_interest_listeners: match config.scenario {
+            Scenario::Baseline => config.participants - 1,
+            Scenario::GameInterest => max_interest_listeners(&config),
         },
         dtx: config.dtx,
         requested_duration_seconds: config.duration.as_secs_f64(),
@@ -616,6 +772,16 @@ async fn run(config: Config) -> Result<Metrics> {
         sender_ticks: send_counters.sender_ticks,
         sender_callbacks: send_counters.sender_callbacks,
         sender_skipped_ticks: send_counters.sender_skipped_ticks,
+        stress_events: send_counters.stress_events,
+        stress_sender_ticks: send_counters.stress_sender_ticks,
+        stress_sender_skipped_ticks: send_counters.stress_sender_skipped_ticks,
+        stress_sent_datagrams: send_counters.stress_sent_datagrams,
+        stress_fanout_span_us_p95: percentile(&mut send_counters.stress_fanout_spans_us, 95),
+        sender_callback_work_us_p95: percentile(&mut send_counters.callback_work_us, 95),
+        stress_sender_callback_work_us_p95: percentile(
+            &mut send_counters.stress_callback_work_us,
+            95,
+        ),
         fanout_span_us_p50: percentile(&mut send_counters.fanout_spans_us, 50),
         fanout_span_us_p95: percentile(&mut send_counters.fanout_spans_us, 95),
         fanout_span_us_max: send_counters
@@ -678,6 +844,33 @@ async fn run(config: Config) -> Result<Metrics> {
         } else {
             0.0
         },
+        stress_playout_ticks: counters.stress_playout_ticks,
+        stress_playout_deadline_misses: counters.stress_playout_deadline_misses,
+        stress_playout_deadline_miss_percent: percent(
+            counters.stress_playout_deadline_misses,
+            counters.stress_playout_ticks,
+        ),
+        nonstress_playout_deadline_miss_percent: percent(
+            counters
+                .playout_deadline_misses
+                .saturating_sub(counters.stress_playout_deadline_misses),
+            counters
+                .playout_ticks
+                .saturating_sub(counters.stress_playout_ticks),
+        ),
+        stress_receive_queue_delay_us_p95: percentile(&mut counters.stress_queue_delays_us, 95),
+        listener_callback_work_us_p95: percentile(&mut counters.listener_callback_work_us, 95),
+        stress_listener_callback_work_us_p95: percentile(
+            &mut counters.stress_listener_callback_work_us,
+            95,
+        ),
+        receive_drain_work_us_p95: percentile(&mut counters.receive_drain_work_us, 95),
+        stress_receive_drain_work_us_p95: percentile(
+            &mut counters.stress_receive_drain_work_us,
+            95,
+        ),
+        playout_pull_work_us_p95: percentile(&mut counters.playout_pull_work_us, 95),
+        stress_playout_pull_work_us_p95: percentile(&mut counters.stress_playout_pull_work_us, 95),
         playout_lateness_us_max: counters.playout_lateness_us_max,
         neteq_concealed_samples: concealed_samples,
         neteq_concealed_percent: {
@@ -863,6 +1056,7 @@ async fn run_listener(
     while Instant::now() < media_end {
         let scheduled = ticker.tick().await;
         let now = tokio::time::Instant::now();
+        let media_frame = media_frame_at(media_start, Instant::now());
         let skipped_ticks = previous_scheduled
             .map(|previous| {
                 scheduled
@@ -876,15 +1070,17 @@ async fn run_listener(
         counters.playout_callbacks += 1;
         counters.playout_ticks += skipped_ticks + 1;
         counters.playout_skipped_ticks += skipped_ticks;
-        counters.playout_deadline_misses += skipped_ticks;
-
         let lateness_us = now.saturating_duration_since(scheduled).as_micros() as u64;
         counters.playout_lateness_us_max = counters.playout_lateness_us_max.max(lateness_us);
-        if lateness_us > DEADLINE_LATE_US {
-            counters.playout_deadline_misses += 1;
+        let deadline_misses = skipped_ticks + u64::from(lateness_us > DEADLINE_LATE_US);
+        counters.playout_deadline_misses += deadline_misses;
+        if stress_active(&config, media_frame) {
+            counters.stress_playout_ticks += skipped_ticks + 1;
+            counters.stress_playout_deadline_misses += deadline_misses;
         }
 
-        let media_frame = media_frame_at(media_start, Instant::now());
+        let callback_work_start = Instant::now();
+        let stress = stress_active(&config, media_frame);
         sync_interest(
             listener,
             media_frame,
@@ -898,6 +1094,7 @@ async fn run_listener(
             &mut receiver_totals,
         )?;
 
+        let drain_work_start = Instant::now();
         drain_received(
             listener,
             &mut receive_rx,
@@ -911,6 +1108,12 @@ async fn run_listener(
             &mut receiver_reuses,
             &mut receiver_pool,
         )?;
+        let drain_work_us = drain_work_start.elapsed().as_micros() as u64;
+        counters.receive_drain_work_us.push(drain_work_us);
+        if stress {
+            counters.stress_receive_drain_work_us.push(drain_work_us);
+        }
+        let pull_work_start = Instant::now();
         pull_receivers(
             listener,
             media_frame,
@@ -919,6 +1122,18 @@ async fn run_listener(
             &mut receivers,
             &mut counters,
         );
+        let pull_work_us = pull_work_start.elapsed().as_micros() as u64;
+        counters.playout_pull_work_us.push(pull_work_us);
+        if stress {
+            counters.stress_playout_pull_work_us.push(pull_work_us);
+        }
+        let callback_work_us = callback_work_start.elapsed().as_micros() as u64;
+        counters.listener_callback_work_us.push(callback_work_us);
+        if stress {
+            counters
+                .stress_listener_callback_work_us
+                .push(callback_work_us);
+        }
         max_concurrent_receivers = max_concurrent_receivers.max(receivers.iter().flatten().count());
         max_receiver_pool = max_receiver_pool.max(receiver_pool.len());
     }
@@ -983,21 +1198,29 @@ async fn run_listener(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)] // Keep each independent sender's clock and transport explicit.
 async fn send_media(
+    speaker: usize,
+    sender_count: usize,
     duration: Duration,
-    connections: Vec<Vec<Option<Connection>>>,
-    mut encoders: Vec<VoiceEncoder>,
+    connections: Vec<Option<Connection>>,
+    mut encoder: VoiceEncoder,
     media_start: Instant,
     clock_start: Instant,
     config: Config,
 ) -> Result<SendCounters> {
     let media_end = media_start + duration;
+    // Independent clients do not share an encoder clock. Distribute their
+    // phases across a frame instead of serializing every encoder in one task.
+    let phase_nanos = SEND_TICK.as_nanos() * speaker as u128 / sender_count as u128;
+    let first_tick = media_start + Duration::from_nanos(phase_nanos as u64);
     let mut ticker =
-        tokio::time::interval_at(tokio::time::Instant::from_std(media_start), SEND_TICK);
+        tokio::time::interval_at(tokio::time::Instant::from_std(first_tick), SEND_TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_scheduled = None;
     let mut frame_index = 0_u64;
     let mut counters = SendCounters::default();
+    let mut previous_stress = false;
 
     while Instant::now() < media_end {
         let scheduled = ticker.tick().await;
@@ -1015,71 +1238,88 @@ async fn send_media(
         counters.sender_ticks += skipped_ticks + 1;
         counters.sender_skipped_ticks += skipped_ticks;
         frame_index += skipped_ticks;
+        let stress = stress_active(&config, frame_index);
+        if stress && !previous_stress {
+            counters.stress_events += 1;
+        }
+        if stress {
+            counters.stress_sender_ticks += skipped_ticks + 1;
+            counters.stress_sender_skipped_ticks += skipped_ticks;
+        }
+        let callback_work_start = Instant::now();
         encode_and_send(
+            speaker,
             &connections,
-            &mut encoders,
+            &mut encoder,
             frame_index,
             clock_start,
             &config,
             &mut counters,
         )?;
+        let callback_work_us = callback_work_start.elapsed().as_micros() as u64;
+        counters.callback_work_us.push(callback_work_us);
+        if stress {
+            counters.stress_callback_work_us.push(callback_work_us);
+        }
+        previous_stress = stress;
         frame_index += 1;
     }
     Ok(counters)
 }
 
 fn encode_and_send(
-    connections: &[Vec<Option<Connection>>],
-    encoders: &mut [VoiceEncoder],
+    speaker: usize,
+    connections: &[Option<Connection>],
+    encoder: &mut VoiceEncoder,
     frame_index: u64,
     clock_start: Instant,
     config: &Config,
     counters: &mut SendCounters,
 ) -> Result<()> {
-    for (speaker, encoder) in encoders.iter_mut().enumerate() {
-        let active = speaker_active(config, frame_index, speaker);
-        let pcm = speech_frame(frame_index, speaker, active);
-        encoder.push_pcm(&pcm);
-        let Some(packet) = encoder.poll_packet()? else {
-            continue;
-        };
-        counters.encoded_packets += 1;
+    let stress = stress_active(config, frame_index);
+    let active = speaker_active(config, frame_index, speaker);
+    let pcm = speech_frame(frame_index, speaker, active);
+    encoder.push_pcm(&pcm);
+    let Some(packet) = encoder.poll_packet()? else {
+        return Ok(());
+    };
+    counters.encoded_packets += 1;
 
-        let sent_at_us = clock_start.elapsed().as_micros() as u64;
-        let mut wire = Vec::with_capacity(ENVELOPE_HEADER_LEN + VoicePacket::HEADER_LEN + 512);
-        wire.extend_from_slice(&sent_at_us.to_be_bytes());
-        wire.extend_from_slice(&frame_index.to_be_bytes());
-        packet.encode_to_bytes(&mut wire);
-        let wire = Bytes::from(wire);
-        let fanout_start = Instant::now();
-        for (listener, connection) in connections[speaker]
-            .iter()
-            .enumerate()
-            .take(config.participants)
-        {
-            if listener == speaker {
-                continue;
-            }
-            if config.scenario == Scenario::GameInterest
-                && config.delivery == Delivery::SenderFiltered
-                && !listener_interested(config, frame_index, speaker, listener)
-            {
-                continue;
-            }
-            let connection = connection
-                .as_ref()
-                .context("missing full-mesh connection")?;
-            match connection.send_datagram(wire.clone()) {
-                Ok(()) => {
-                    counters.sent_datagrams += 1;
-                    counters.sent_bytes += wire.len() as u64;
-                }
-                Err(_) => counters.send_errors += 1,
-            }
+    let sent_at_us = clock_start.elapsed().as_micros() as u64;
+    let mut wire = Vec::with_capacity(ENVELOPE_HEADER_LEN + VoicePacket::HEADER_LEN + 512);
+    wire.extend_from_slice(&sent_at_us.to_be_bytes());
+    wire.extend_from_slice(&frame_index.to_be_bytes());
+    packet.encode_to_bytes(&mut wire);
+    let wire = Bytes::from(wire);
+    let fanout_start = Instant::now();
+    for (listener, connection) in connections.iter().enumerate().take(config.participants) {
+        if listener == speaker {
+            continue;
         }
-        counters
-            .fanout_spans_us
-            .push(fanout_start.elapsed().as_micros() as u64);
+        if config.scenario == Scenario::GameInterest
+            && config.delivery == Delivery::SenderFiltered
+            && !listener_interested(config, frame_index, speaker, listener)
+        {
+            continue;
+        }
+        let connection = connection
+            .as_ref()
+            .context("missing full-mesh connection")?;
+        match connection.send_datagram(wire.clone()) {
+            Ok(()) => {
+                counters.sent_datagrams += 1;
+                counters.sent_bytes += wire.len() as u64;
+                if stress {
+                    counters.stress_sent_datagrams += 1;
+                }
+            }
+            Err(_) => counters.send_errors += 1,
+        }
+    }
+    let fanout_span_us = fanout_start.elapsed().as_micros() as u64;
+    counters.fanout_spans_us.push(fanout_span_us);
+    if stress {
+        counters.stress_fanout_spans_us.push(fanout_span_us);
     }
     Ok(())
 }
@@ -1102,9 +1342,8 @@ fn drain_received(
         counters.received_datagrams += 1;
         counters.received_bytes += datagram.bytes.len() as u64;
         let processed_at_us = clock_start.elapsed().as_micros() as u64;
-        counters
-            .queue_delays_us
-            .push(processed_at_us.saturating_sub(datagram.received_at_us));
+        let queue_delay_us = processed_at_us.saturating_sub(datagram.received_at_us);
+        counters.queue_delays_us.push(queue_delay_us);
 
         if datagram.bytes.len() < ENVELOPE_HEADER_LEN {
             counters.malformed_datagrams += 1;
@@ -1120,6 +1359,9 @@ fn drain_received(
                 .try_into()
                 .expect("checked envelope length"),
         );
+        if stress_active(config, frame_index) {
+            counters.stress_queue_delays_us.push(queue_delay_us);
+        }
         counters
             .latencies_us
             .push(datagram.received_at_us.saturating_sub(sent_at_us));
@@ -1256,6 +1498,10 @@ fn speaker_active(config: &Config, frame_index: u64, speaker: usize) -> bool {
 }
 
 fn game_talker_active(config: &Config, frame_index: u64, speaker: usize) -> bool {
+    if config.interest_profile == InterestProfile::CrowdBurst && stress_active(config, frame_index)
+    {
+        return true;
+    }
     let turn = frame_index / GAME_TURN_FRAMES;
     let phase = frame_index % GAME_TURN_FRAMES;
     let transition = (turn + config.seed) % 3;
@@ -1289,18 +1535,78 @@ fn listener_interested(config: &Config, frame_index: u64, speaker: usize, listen
         return speaker < config.talkers;
     }
 
+    if config.interest_profile == InterestProfile::GroupMerge {
+        let group_size = config.interest_listeners + 1;
+        let speaker_group = speaker / group_size;
+        let listener_group = listener / group_size;
+        return if stress_active(config, frame_index) {
+            speaker_group / 2 == listener_group / 2
+        } else {
+            speaker_group == listener_group
+        };
+    }
+
     let available = config.participants - 1;
-    let epoch = frame_index / GAME_INTEREST_EPOCH_FRAMES;
-    let rotation = mix64(
-        config.seed
-            ^ (speaker as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ epoch.wrapping_mul(0xbf58_476d_1ce4_e5b9),
-    ) as usize
-        % available;
+    let rotation = match config.interest_profile {
+        InterestProfile::BoundaryOscillation => {
+            let base = mix64(config.seed ^ (speaker as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                as usize
+                % available;
+            if stress_active(config, frame_index) {
+                let phase = frame_index % STRESS_CYCLE_FRAMES;
+                let alternate =
+                    ((phase - STRESS_WINDOW_START_FRAMES) / BOUNDARY_OSCILLATION_FRAMES) % 2;
+                (base + alternate as usize * config.interest_listeners) % available
+            } else {
+                base
+            }
+        }
+        InterestProfile::Rotating | InterestProfile::CrowdBurst => {
+            let epoch = frame_index / GAME_INTEREST_EPOCH_FRAMES;
+            mix64(
+                config.seed
+                    ^ (speaker as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ epoch.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+            ) as usize
+                % available
+        }
+        InterestProfile::GroupMerge => unreachable!("handled above"),
+    };
     (0..config.interest_listeners).any(|rank| {
         let offset = 1 + (rotation + rank) % available;
         (speaker + offset) % config.participants == listener
     })
+}
+
+fn stress_active(config: &Config, frame_index: u64) -> bool {
+    if config.scenario != Scenario::GameInterest {
+        return false;
+    }
+    let phase = frame_index % STRESS_CYCLE_FRAMES;
+    match config.interest_profile {
+        InterestProfile::Rotating => false,
+        InterestProfile::CrowdBurst => {
+            (CROWD_BURST_START_FRAMES..CROWD_BURST_END_FRAMES).contains(&phase)
+        }
+        InterestProfile::GroupMerge | InterestProfile::BoundaryOscillation => {
+            (STRESS_WINDOW_START_FRAMES..STRESS_WINDOW_END_FRAMES).contains(&phase)
+        }
+    }
+}
+
+fn max_interest_listeners(config: &Config) -> usize {
+    let sample_frames = [0, STRESS_WINDOW_START_FRAMES, CROWD_BURST_START_FRAMES];
+    sample_frames
+        .into_iter()
+        .flat_map(|frame| {
+            (0..config.participants).map(move |speaker| {
+                (0..config.participants)
+                    .filter(|listener| listener_interested(config, frame, speaker, *listener))
+                    .count()
+            })
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -1339,6 +1645,10 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
         } else {
             0.0
         },
+        stress_playout_deadline_miss_percent: percent(
+            listener.counters.stress_playout_deadline_misses,
+            listener.counters.stress_playout_ticks,
+        ),
         playout_lateness_us_max: listener.counters.playout_lateness_us_max,
         interest_entry_to_first_media_us_p95: percentile(
             &mut listener.counters.interest_entry_to_first_media_us,
@@ -1386,6 +1696,14 @@ fn percentile(values: &mut [u64], percentile: usize) -> u64 {
     values.sort_unstable();
     let index = (values.len() - 1) * percentile / 100;
     values[index]
+}
+
+fn percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64 * 100.0
+    }
 }
 
 fn process_usage() -> Result<ProcessUsage> {
@@ -1483,6 +1801,85 @@ mod tests {
             assert_eq!(second.len(), config.interest_listeners);
             assert!(!first.contains(&speaker));
             assert_ne!(first, second);
+        }
+    }
+
+    #[test]
+    fn crowd_burst_activates_every_participant_for_one_second() {
+        let config = Config {
+            participants: 32,
+            talkers: 4,
+            scenario: Scenario::GameInterest,
+            interest_profile: InterestProfile::CrowdBurst,
+            ..Config::default()
+        };
+        let before = (0..config.participants)
+            .filter(|speaker| game_talker_active(&config, CROWD_BURST_START_FRAMES - 1, *speaker))
+            .count();
+        let during = (0..config.participants)
+            .filter(|speaker| game_talker_active(&config, CROWD_BURST_START_FRAMES, *speaker))
+            .count();
+        assert!(before <= config.talkers * 2);
+        assert_eq!(during, config.participants);
+        assert!(stress_active(&config, CROWD_BURST_END_FRAMES - 1));
+        assert!(!stress_active(&config, CROWD_BURST_END_FRAMES));
+    }
+
+    #[test]
+    fn group_merge_doubles_complete_group_interest() {
+        let config = Config {
+            participants: 32,
+            talkers: 4,
+            scenario: Scenario::GameInterest,
+            interest_profile: InterestProfile::GroupMerge,
+            interest_listeners: 7,
+            ..Config::default()
+        };
+        for speaker in 0..config.participants {
+            let split = (0..config.participants)
+                .filter(|listener| listener_interested(&config, 0, speaker, *listener))
+                .count();
+            let merged = (0..config.participants)
+                .filter(|listener| {
+                    listener_interested(&config, STRESS_WINDOW_START_FRAMES, speaker, *listener)
+                })
+                .count();
+            assert_eq!(split, 7);
+            assert_eq!(merged, 15);
+        }
+        assert_eq!(max_interest_listeners(&config), 15);
+    }
+
+    #[test]
+    fn boundary_oscillation_uses_disjoint_listener_sets() {
+        let config = Config {
+            participants: 32,
+            talkers: 4,
+            scenario: Scenario::GameInterest,
+            interest_profile: InterestProfile::BoundaryOscillation,
+            interest_listeners: 7,
+            seed: 9,
+            ..Config::default()
+        };
+        for speaker in 0..config.participants {
+            let first = (0..config.participants)
+                .filter(|listener| {
+                    listener_interested(&config, STRESS_WINDOW_START_FRAMES, speaker, *listener)
+                })
+                .collect::<Vec<_>>();
+            let second = (0..config.participants)
+                .filter(|listener| {
+                    listener_interested(
+                        &config,
+                        STRESS_WINDOW_START_FRAMES + BOUNDARY_OSCILLATION_FRAMES,
+                        speaker,
+                        *listener,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(first.len(), config.interest_listeners);
+            assert_eq!(second.len(), config.interest_listeners);
+            assert!(first.iter().all(|listener| !second.contains(listener)));
         }
     }
 }

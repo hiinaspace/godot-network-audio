@@ -34,4 +34,4 @@ tokio = { version = "1.44.1", features = ["rt-multi-thread", "sync", "time"] }
 web-time = "1.1.0"
 
 [patch.crates-io]
-neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "360d31ccf470bf4a062badc4ebcd36eac8c4b245" }
+neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "eb643944fcd0b84cb28ef0d2b4503dc5f275cb79" }

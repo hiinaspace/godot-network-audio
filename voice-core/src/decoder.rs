@@ -1,6 +1,6 @@
 use std::convert::TryInto;
 
-use audiopus::coder::Decoder as OpusDecoder;
+use audiopus::coder::{Decoder as OpusDecoder, GenericCtl};
 use audiopus::{Channels, SampleRate};
 
 use crate::error::{Error, Result};
@@ -74,5 +74,11 @@ impl neteq::codec::AudioDecoder for OpusAudioDecoder {
             .map_err(|e| neteq::NetEqError::DecoderError(format!("Opus decode: {e}")))?;
         out.truncate(decoded * self.channels as usize);
         Ok(out)
+    }
+
+    fn reset(&mut self) -> neteq::Result<()> {
+        self.inner
+            .reset_state()
+            .map_err(|e| neteq::NetEqError::DecoderError(format!("Opus reset: {e}")))
     }
 }
