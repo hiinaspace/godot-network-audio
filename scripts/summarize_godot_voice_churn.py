@@ -13,8 +13,8 @@ def percentile(values, rank):
     return values[(len(values) - 1) * rank // 100]
 
 
-def stats_at(rows, peer_id, mono_usec, after=False):
-    candidates = (row for row in rows if (row["mono_usec"] >= mono_usec) == after)
+def stats_at(rows, peer_id, unix_usec, after=False):
+    candidates = (row for row in rows if (row["unix_usec"] >= unix_usec) == after)
     selected = None
     for row in candidates:
         if after:
@@ -54,7 +54,7 @@ for event in (event for event in load_events if event["event"] == "talker_on"):
     if output is None:
         missing_first_output.append(event["peer_id"])
     else:
-        first_output_latencies.append((output["mono_usec"] - event["mono_usec"]) / 1000.0)
+        first_output_latencies.append((output["unix_usec"] - event["unix_usec"]) / 1000.0)
 
 disconnect_latencies = []
 missing_disconnect = []
@@ -64,38 +64,38 @@ for event in scheduled_leaves:
     if disconnected is None:
         missing_disconnect.append(event["peer_id"])
     else:
-        disconnect_latencies.append((disconnected["mono_usec"] - event["mono_usec"]) / 1000.0)
+        disconnect_latencies.append((disconnected["unix_usec"] - event["unix_usec"]) / 1000.0)
 
 def last_output_tail_ms(event, end_usec):
     peer = event["peer_id"]
-    previous = int(stats_at(rows, peer, event["mono_usec"]).get("non_silent_output_frames", 0))
+    previous = int(stats_at(rows, peer, event["unix_usec"]).get("non_silent_output_frames", 0))
     last_change = None
     for row in rows:
-        if row["mono_usec"] < event["mono_usec"] or row["mono_usec"] > end_usec:
+        if row["unix_usec"] < event["unix_usec"] or row["unix_usec"] > end_usec:
             continue
         value = int(row.get("receivers", {}).get(peer, {}).get("non_silent_output_frames", previous))
         if value > previous:
-            last_change = row["mono_usec"]
+            last_change = row["unix_usec"]
         previous = max(previous, value)
-    return max(0.0, ((last_change or event["mono_usec"]) - event["mono_usec"]) / 1000.0)
+    return max(0.0, ((last_change or event["unix_usec"]) - event["unix_usec"]) / 1000.0)
 
 
 graceful_tails = []
 for event in (event for event in load_events if event["event"] == "talker_off"):
     later_events = [
-        other["mono_usec"]
+        other["unix_usec"]
         for other in load_events
         if other["peer_id"] == event["peer_id"]
-        and other["mono_usec"] > event["mono_usec"]
+        and other["unix_usec"] > event["unix_usec"]
         and other["event"] in ("talker_on", "leave_requested", "shutdown_requested")
     ]
-    end_usec = min(later_events, default=rows[-1]["mono_usec"])
+    end_usec = min(later_events, default=rows[-1]["unix_usec"])
     graceful_tails.append(last_output_tail_ms(event, end_usec))
 
 abrupt_tails = []
 for event in (event for event in scheduled_leaves if event.get("active")):
     disconnected = receiver_by_kind_peer.get(("peer_disconnected", event["peer_id"]))
-    end_usec = disconnected["mono_usec"] if disconnected else rows[-1]["mono_usec"]
+    end_usec = disconnected["unix_usec"] if disconnected else rows[-1]["unix_usec"]
     abrupt_tails.append(last_output_tail_ms(event, end_usec))
 
 peer_lifetime = {}
@@ -130,17 +130,17 @@ for event in receiver_events:
 # talkers that remain active while another group departs.
 leave_batches = []
 for event in scheduled_leaves:
-    if not leave_batches or event["mono_usec"] - leave_batches[-1][-1]["mono_usec"] > 500_000:
+    if not leave_batches or event["unix_usec"] - leave_batches[-1][-1]["unix_usec"] > 500_000:
         leave_batches.append([event])
     else:
         leave_batches[-1].append(event)
 active_state = {}
 collateral_concealed = 0
 for batch in leave_batches:
-    start = batch[0]["mono_usec"]
+    start = batch[0]["unix_usec"]
     leaving = {event["peer_id"] for event in batch}
     for event in load_events:
-        if event["mono_usec"] > start:
+        if event["unix_usec"] > start:
             break
         if event["event"] == "talker_on":
             active_state[event["peer_id"]] = True
@@ -151,8 +151,8 @@ for batch in leave_batches:
         for event in batch
     ]
     end = max(
-        (event["mono_usec"] for event in disconnects if event is not None),
-        default=batch[-1]["mono_usec"],
+        (event["unix_usec"] for event in disconnects if event is not None),
+        default=batch[-1]["unix_usec"],
     ) + 200_000
     for peer, active in active_state.items():
         if not active or peer in leaving:

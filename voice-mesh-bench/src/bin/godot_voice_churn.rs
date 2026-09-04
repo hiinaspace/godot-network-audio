@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -39,6 +39,7 @@ struct Peer {
 #[derive(Serialize)]
 struct EventRecord<'a> {
     mono_usec: u64,
+    unix_usec: u64,
     event: &'a str,
     slot: usize,
     generation: u32,
@@ -243,6 +244,7 @@ fn log_event(events: &mut BufWriter<File>, event: &str, peer: &Peer) -> Result<(
         &mut *events,
         &EventRecord {
             mono_usec: monotonic_time_us(),
+            unix_usec: unix_time_us(),
             event,
             slot: peer.slot,
             generation: peer.generation,
@@ -269,6 +271,13 @@ fn monotonic_time_us() -> u64 {
     (time.tv_sec as u64)
         .saturating_mul(1_000_000)
         .saturating_add(time.tv_nsec as u64 / 1_000)
+}
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 fn parse_endpoint(path: &str) -> Result<EndpointAddr> {

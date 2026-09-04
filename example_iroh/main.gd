@@ -284,6 +284,7 @@ func _record_event(kind: String, connected_peer: String, details: Dictionary) ->
 	event_file.store_line(JSON.stringify({
 		"event": kind,
 		"mono_usec": Time.get_ticks_usec(),
+		"unix_usec": int(Time.get_unix_time_from_system() * 1_000_000.0),
 		"peer_id": connected_peer,
 		"details": details,
 	}))
@@ -304,6 +305,7 @@ func _write_trace_row(delta: float) -> void:
 	var row := {
 		"frame": trace_frame,
 		"mono_usec": Time.get_ticks_usec(),
+		"unix_usec": int(Time.get_unix_time_from_system() * 1_000_000.0),
 		"delta_sec": delta,
 		"role": role,
 		"peer_id": peer_id,
