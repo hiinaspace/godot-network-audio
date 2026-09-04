@@ -206,6 +206,13 @@ from 236 MiB to 231 MiB, so decoder construction is not the main explanation.
 The pool remains the lower-CPU policy, but memory growth needs allocator and
 NetEq-buffer investigation before it becomes a production recommendation.
 
+A schema-v4 180-second repeat sampled glibc `mallinfo2()` alongside RSS. RSS
+rose from 122 to 234 MiB and allocator in-use space from 121 to 234 MiB. Free
+arena space remained below 8 MiB and mmap allocation stayed flat at 92 MiB.
+The growth is therefore live heap allocation, not glibc merely retaining a
+large freed arena. Heaptrack is required to attribute call stacks; the current
+`gna-sim` image does not include it.
+
 Raw results are on `gna-sim` under:
 
 ```text

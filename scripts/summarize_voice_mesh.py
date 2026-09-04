@@ -14,6 +14,7 @@ FIELDS = [
     "interest_profile",
     "seed",
     "runtime_worker_threads",
+    "opus_version",
     "participants",
     "talkers",
     "interest_listeners",

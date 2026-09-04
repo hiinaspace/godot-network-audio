@@ -122,6 +122,16 @@ algorithm are trusted dependencies. Use it when timing/concealment metrics or
 listening reveal an unexplained audible regression, or when deliberately
 comparing codec/FEC choices such as experimental neural FEC.
 
+The Linux benchmark currently dynamically links the system libopus 1.5.2; the
+`audiopus_sys` fallback source is 1.3.1, so deployed versions differ by platform.
+Libopus 1.4 retuned in-band FEC and DTX, 1.5 introduced DRED and Deep PLC, and
+1.6 substantially improved DRED while adding speech bandwidth extension, Opus
+HD/96 kHz, and a 24-bit API. Before enabling new codec behavior, compare 1.5.2
+with stable 1.6.1 using identical 48 kHz mono settings, DRED disabled, and DTX
+both on and off. Record the runtime version in every result. Then evaluate DRED
+separately under burst loss; do not attribute a library upgrade and a feature
+toggle to one treatment.
+
 For that narrower lane, replay several 8-10-second clean speech fixtures
 through representative network treatments, write each decoded stream to WAV,
 and score it against the aligned clean reference with ViSQOL. Use multiple
@@ -143,8 +153,10 @@ output.
    CPU, and scheduling misses in a matched run, while retaining about 32 MiB
    more RSS. A ten-minute pooled run still rose from 121 to 277 MiB despite a
    bounded receiver count; in-place decoder reset only slightly improved the
-   matched 180-second result. Investigate allocator/NetEq retention rather than
-   claiming a leak or a stable ceiling.
+   matched 180-second result. Glibc counters confirmed that live allocated heap,
+   rather than retained free arenas, tracks the RSS rise. Use Heaptrack to
+   attribute allocator/NetEq retention rather than claiming a leak or a stable
+   ceiling.
 3. Add a short crowd burst, group merge/split, and rapid interest-boundary
    oscillation to expose correlated scheduling stalls. **Complete:** all three
    deterministic profiles and stress-window metrics are implemented; the

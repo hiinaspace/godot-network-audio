@@ -294,6 +294,18 @@ struct ProcessUsage {
 struct RssSample {
     elapsed_seconds: f64,
     current_rss_kib: i64,
+    allocator_arena_kib: u64,
+    allocator_in_use_kib: u64,
+    allocator_free_kib: u64,
+    allocator_mmap_kib: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AllocatorUsage {
+    arena_kib: u64,
+    in_use_kib: u64,
+    free_kib: u64,
+    mmap_kib: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +318,7 @@ struct Metrics {
     interest_profile: &'static str,
     seed: u64,
     runtime_worker_threads: usize,
+    opus_version: &'static str,
     participants: usize,
     talkers: usize,
     interest_listeners: usize,
@@ -676,17 +689,19 @@ async fn run(config: Config) -> Result<Metrics> {
     let mut next_rss_sample = media_start;
     while next_rss_sample < media_end {
         tokio::time::sleep_until(tokio::time::Instant::from_std(next_rss_sample)).await;
-        rss_samples.push(RssSample {
-            elapsed_seconds: media_start.elapsed().as_secs_f64(),
-            current_rss_kib: current_rss_kib()?,
-        });
+        rss_samples.push(rss_sample(media_start)?);
         next_rss_sample += Duration::from_secs(10);
     }
     tokio::time::sleep_until(tokio::time::Instant::from_std(media_end)).await;
     let current_rss_kib_after_media = current_rss_kib()?;
+    let allocator = allocator_usage();
     rss_samples.push(RssSample {
         elapsed_seconds: media_start.elapsed().as_secs_f64(),
         current_rss_kib: current_rss_kib_after_media,
+        allocator_arena_kib: allocator.arena_kib,
+        allocator_in_use_kib: allocator.in_use_kib,
+        allocator_free_kib: allocator.free_kib,
+        allocator_mmap_kib: allocator.mmap_kib,
     });
     let media_wall = media_start.elapsed();
     let after_media = process_usage()?;
@@ -728,7 +743,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 3,
+        schema_version: 4,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
         delivery: match config.scenario {
@@ -742,6 +757,7 @@ async fn run(config: Config) -> Result<Metrics> {
         },
         seed: config.seed,
         runtime_worker_threads: config.runtime_workers,
+        opus_version: voice_core::opus_version(),
         participants: config.participants,
         talkers: config.talkers,
         interest_listeners: match config.scenario {
@@ -1736,6 +1752,36 @@ fn current_rss_kib() -> Result<i64> {
         .parse::<i64>()
         .context("parse VmRSS")?;
     Ok(kib)
+}
+
+fn rss_sample(media_start: Instant) -> Result<RssSample> {
+    let allocator = allocator_usage();
+    Ok(RssSample {
+        elapsed_seconds: media_start.elapsed().as_secs_f64(),
+        current_rss_kib: current_rss_kib()?,
+        allocator_arena_kib: allocator.arena_kib,
+        allocator_in_use_kib: allocator.in_use_kib,
+        allocator_free_kib: allocator.free_kib,
+        allocator_mmap_kib: allocator.mmap_kib,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn allocator_usage() -> AllocatorUsage {
+    // SAFETY: mallinfo2 takes no pointers and returns a snapshot of glibc's
+    // process-global allocator counters.
+    let info = unsafe { libc::mallinfo2() };
+    AllocatorUsage {
+        arena_kib: (info.arena / 1024) as u64,
+        in_use_kib: (info.uordblks / 1024) as u64,
+        free_kib: (info.fordblks / 1024) as u64,
+        mmap_kib: (info.hblkhd / 1024) as u64,
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn allocator_usage() -> AllocatorUsage {
+    AllocatorUsage::default()
 }
 
 #[cfg(test)]

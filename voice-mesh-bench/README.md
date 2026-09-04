@@ -61,6 +61,10 @@ independent, phase-staggered sender tasks. `RUNTIME_WORKERS=N` controls the
 shared Tokio runtime for diagnosing harness contention; it does not model
 additional client machines.
 
+On glibc systems, schema-v4 RSS samples also include allocator arena, in-use,
+free, and mmap totals. These counters are diagnostic and report zero on other
+platforms.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.
