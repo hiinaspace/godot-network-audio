@@ -86,7 +86,11 @@ fi
 
 for peer in $(seq 1 "$CONNECTED_PEERS"); do
   active=0
-  if (( peer <= ACTIVE_SPEAKERS )); then active=1; fi
+  sender_max_fps=5
+  if (( peer <= ACTIVE_SPEAKERS )); then
+    active=1
+    sender_max_fps=60
+  fi
   frequency=$((180 + peer * 23))
   env \
     PULSE_SINK="$OUTPUT_SINK" \
@@ -96,6 +100,7 @@ for peer in $(seq 1 "$CONNECTED_PEERS"); do
     GNA_DEMO_FORCE_SYNTHETIC=1 \
     GNA_DEMO_SEND_AUDIO="$active" \
     GNA_DEMO_SYNTHETIC_FREQUENCY_HZ="$frequency" \
+    GNA_DEMO_MAX_FPS="$sender_max_fps" \
     GNA_DEMO_QUIT_SECONDS="$RUN_SECONDS" \
     "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
     --path "$ROOT_DIR/example_iroh" --scene res://main.tscn \
