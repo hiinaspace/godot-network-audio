@@ -129,7 +129,9 @@ func _process(delta: float) -> void:
 				sender.capture_audio_server_input = false
 				input_mode = "synthetic"
 		else:
-			send_accumulator += delta
+			# Connection establishment is synchronous in this spike. Do not turn a
+			# long connect frame into a synthetic packet burst afterward.
+			send_accumulator += min(delta, FRAME_SECONDS)
 			while send_accumulator >= FRAME_SECONDS:
 				send_accumulator -= FRAME_SECONDS
 				_push_synthetic_frame()
