@@ -294,7 +294,7 @@ to at most 93 ms in the delay/loss profile and 84 ms in the burst profile. All
 datagrams, every shaped profile had nonzero qdisc counters, and loopback was
 restored to `noqueue`.
 
-## Direct-mesh reconnect churn
+## Direct-mesh lifecycle churn
 
 Schema v8 replaces live connection handles so a participant can leave and
 reconnect without stopping sender or listener tasks. The first matrix used
@@ -316,9 +316,72 @@ before a connection close but did not arrive; all other successful sends were
 delivered. Unaffected-route gaps remained close to the clean scheduler tail,
 with no evidence that reconnecting one peer disrupted the rest of the mesh.
 NetEq reported zero errors, target delay stayed at or below 80 ms, and the worst
-buffer peak was 127 ms. Join with a new endpoint identity and permanent leave
-remain distinct lifecycle cases; this result covers temporary disconnect and
-same-endpoint reconnect.
+buffer peak was 127 ms.
+
+Schema v9 then added the distinct lifecycle cases. Across three seeds, a late
+participant created a fresh endpoint and all seven connections in a median 7
+ms; same-identity reconnect took 5 ms; and new-identity replacement took 31
+ms. Every requested link succeeded without reconnect errors. Permanent leave
+remained absent through the end as intended. Unaffected gaps stayed below 48
+ms, only two in-flight datagrams were lost across the complete lifecycle
+matrix, and NetEq stayed error-free at an 80 ms target.
+
+## Static authoritative star
+
+Schema v10 compares the sender-filtered direct mesh with an extra static Iroh
+endpoint that forwards unchanged encoded datagrams to interested listeners.
+Three 12-second seeds used four scheduled talkers, seven listeners per talker,
+DTX, and pooled receivers at each size. All direct and star runs delivered the
+exact intended downstream count with zero send, SFU, transport, or NetEq
+errors.
+
+| N | Topology | Connections | Setup | CPU | RSS | Client uplink | SFU egress | Latency p50 / p95 |
+|---:|:---|---:|---:|---:|---:|---:|---:|---:|
+| 8 | direct | 28 | 35 ms | 155% | 36.6 MiB | 0.91 Mbit/s | n/a | 0.34 / 0.57 ms |
+| 8 | star | 8 | 19 ms | 158% | 35.5 MiB | 0.13 Mbit/s | 0.91 Mbit/s | 0.49 / 0.84 ms |
+| 16 | direct | 120 | 121 ms | 201% | 74.3 MiB | 1.02 Mbit/s | n/a | 0.31 / 0.68 ms |
+| 16 | star | 16 | 34 ms | 215% | 51.6 MiB | 0.15 Mbit/s | 1.03 Mbit/s | 0.52 / 0.99 ms |
+| 32 | direct | 496 | 464 ms | 297% | 185.5 MiB | 1.24 Mbit/s | n/a | 0.36 / 4.69 ms |
+| 32 | star | 32 | 68 ms | 301% | 90.2 MiB | 0.18 Mbit/s | 1.24 Mbit/s | 0.56 / 4.95 ms |
+
+The star does not remove aggregate encryption or send work, so total CPU is
+similar. It does move fanout off clients, reduce client uplink by roughly 7x,
+and sharply reduce connection/setup state. The additional forwarding hop costs
+about 0.2 ms at low load; at N=32 both p95s are dominated by co-located host
+scheduling.
+
+## Same-pod multiprocess control
+
+Schema v11 runs each client in its own process with its own endpoint, encoder,
+NetEq set, packet queue, and one-thread runtime; star also uses a separate SFU
+process. Cross-process latency uses `CLOCK_MONOTONIC`. The corrected matrix has
+three seeds for every N/topology/layout combination. `TCP_NODELAY` is required
+on the setup control sockets: without it, one delayed-ACK interval per
+connection inflated N=32 direct setup to 24 seconds. Corrected setup is 603 ms
+direct and 77 ms star at N=32.
+
+| N | Topology | Layout | CPU | RSS (one heap / summed workers) | Latency p50 / p95 / p99 | Deadline misses |
+|---:|:---|:---|---:|---:|---:|---:|
+| 8 | direct | single | 160% | 36.6 MiB | 0.31 / 0.57 / 2.35 ms | 6.97% |
+| 8 | direct | multi | 141% | 147.1 MiB | 0.35 / 2.40 / 9.55 ms | 3.40% |
+| 8 | star | single | 167% | 34.1 MiB | 0.51 / 0.82 / 2.94 ms | 6.05% |
+| 8 | star | multi | 150% | 160.8 MiB | 0.60 / 2.59 / 10.55 ms | 4.47% |
+| 16 | direct | single | 214% | 74.4 MiB | 0.33 / 0.69 / 5.29 ms | 5.73% |
+| 16 | direct | multi | 201% | 306.7 MiB | 0.34 / 2.26 / 10.16 ms | 2.35% |
+| 16 | star | single | 212% | 52.6 MiB | 0.52 / 1.08 / 6.48 ms | 6.02% |
+| 16 | star | multi | 201% | 309.9 MiB | 0.48 / 2.09 / 9.12 ms | 1.98% |
+| 32 | direct | single | 277% | 186.1 MiB | 0.34 / 4.09 / 12.92 ms | 8.38% |
+| 32 | direct | multi | 302% | 670.0 MiB | 0.34 / 5.61 / 24.81 ms | 5.36% |
+| 32 | star | single | 298% | 91.2 MiB | 0.54 / 6.50 / 18.61 ms | 9.75% |
+| 32 | star | multi | 280% | 606.5 MiB | 0.43 / 5.36 / 25.83 ms | 4.21% |
+
+Process isolation roughly halves playback deadline misses, confirming that the
+shared-runtime wakeup pattern was a harness artifact. It does not eliminate
+whole-pod scheduling tails: low-N p95 latency is worse with many runtimes, and
+N=32 p99 remains about 25 ms. Aggregate CPU stays similar. Summed RSS is not a
+single-client production cost—each worker stays around 18-21 MiB—but it makes
+the per-process Iroh/runtime base cost explicit. Every run again had zero
+missing datagrams and zero send, SFU, or NetEq errors.
 
 Raw results are on `gna-sim` under:
 
@@ -340,4 +403,8 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v2/
 /work/projects/godot-network-audio/target/voice-mesh/recovery-netem-v3/
 /work/projects/godot-network-audio/target/voice-mesh/churn-v2/
+/work/projects/godot-network-audio/target/voice-mesh/churn-v3/
+/work/projects/godot-network-audio/target/voice-mesh/topology-v1/
+/work/projects/godot-network-audio/target/voice-mesh/process-layout-v1/
+/work/projects/godot-network-audio/target/voice-mesh/process-layout-v2/
 ```
