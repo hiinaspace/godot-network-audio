@@ -33,3 +33,6 @@ scripts/run_voice_mesh_baseline.sh target/voice-mesh/baseline-current 10
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.
+
+See [PLAN.md](PLAN.md) for the research-informed positional-interest,
+impairment, topology, churn, and perceptual-quality roadmap.
