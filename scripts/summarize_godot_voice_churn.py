@@ -14,7 +14,12 @@ def percentile(values, rank):
 
 
 def stats_at(rows, peer_id, unix_usec, after=False):
-    candidates = (row for row in rows if (row["unix_usec"] >= unix_usec) == after)
+    candidates = (
+        row
+        for row in rows
+        if (row["unix_usec"] >= unix_usec) == after
+        and peer_id in row.get("receivers", {})
+    )
     selected = None
     for row in candidates:
         if after:
