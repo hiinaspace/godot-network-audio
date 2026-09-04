@@ -218,12 +218,16 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 	_record_event("peer_disconnected", disconnected_peer_id, receive_streams[disconnected_peer_id].get_stats())
 	if peer_player != null:
 		peer_player.stop()
+		_record_event("peer_player_stopped", disconnected_peer_id, {})
 		peer_player.stream = null
+		_record_event("peer_player_detached", disconnected_peer_id, {})
 		peer_player.queue_free()
+		_record_event("peer_player_queued_free", disconnected_peer_id, {})
 	receive_players.erase(disconnected_peer_id)
 	receive_streams.erase(disconnected_peer_id)
 	peers_with_output.erase(disconnected_peer_id)
 	transport.remove_receive_stream(disconnected_peer_id)
+	_record_event("receive_stream_removed", disconnected_peer_id, {})
 	stream = null
 	player = null
 	if not receive_streams.is_empty():
