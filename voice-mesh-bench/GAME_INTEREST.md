@@ -210,8 +210,23 @@ A schema-v4 180-second repeat sampled glibc `mallinfo2()` alongside RSS. RSS
 rose from 122 to 234 MiB and allocator in-use space from 121 to 234 MiB. Free
 arena space remained below 8 MiB and mmap allocation stayed flat at 92 MiB.
 The growth is therefore live heap allocation, not glibc merely retaining a
-large freed arena. Heaptrack is required to attribute call stacks; the current
-`gna-sim` image does not include it.
+large freed arena.
+
+Heaptrack then attributed a 90-second, 32-participant run's largest retained
+blocks to three bounded categories: about 96 MiB for 32 Iroh endpoint interface
+discovery buffers, 51 MiB for 363 pooled Opus/NetEq receivers (about 141 KiB
+each), and 13 MiB for benchmark timing vectors. The receiver cost is the
+aggregate for 32 clients co-located in one process, or roughly 4-5 MiB per
+client at this workload's high-water mark. The vectors were a harness artifact:
+they retained every timing observation for the full run.
+
+Schema v5 replaces those vectors with deterministic, mergeable bottom-k samples
+capped at 4,096 observations per metric. Event counts and maxima remain exact.
+In a corrected five-minute run, current RSS rose from 125 MiB to 209 MiB at 60
+seconds, 219 MiB at 180 seconds, and 223 MiB at 300 seconds. Growth was about 4
+MiB over the final two minutes, consistent with bounded receiver-pool warm-up.
+All 734,692 datagrams arrived with no send or NetEq errors, and CPU remained at
+247% of one core, essentially unchanged from the schema-v4 180-second run.
 
 Raw results are on `gna-sim` under:
 
@@ -225,4 +240,6 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/interest-stress-parallel-senders/
 /work/projects/godot-network-audio/target/voice-mesh/interest-stress-workers32/
 /work/projects/godot-network-audio/target/voice-mesh/interest-stress-8p-all-interest/
+/work/projects/godot-network-audio/target/voice-mesh/heaptrack/
+/work/projects/godot-network-audio/target/voice-mesh/bounded-samples/
 ```

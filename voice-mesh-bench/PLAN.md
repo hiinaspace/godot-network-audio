@@ -149,14 +149,13 @@ output.
    traffic and CPU.
 2. Compare immediate receiver retirement with bounded warm reuse. Confirm that
    current RSS plateaus under repeated interest changes before impairment.
-   **In progress:** bounded reuse is implemented and reduced construction,
-   CPU, and scheduling misses in a matched run, while retaining about 32 MiB
-   more RSS. A ten-minute pooled run still rose from 121 to 277 MiB despite a
-   bounded receiver count; in-place decoder reset only slightly improved the
-   matched 180-second result. Glibc counters confirmed that live allocated heap,
-   rather than retained free arenas, tracks the RSS rise. Use Heaptrack to
-   attribute allocator/NetEq retention rather than claiming a leak or a stable
-   ceiling.
+   **Complete:** Heaptrack attributed the retained state to the simulator's 32
+   Iroh endpoints, pooled Opus/NetEq receivers, and unbounded diagnostic timing
+   vectors—not an allocator cache or NetEq leak. Schema v5 caps each mergeable
+   percentile sample at 4,096 observations while preserving exact counts and
+   maxima. A corrected five-minute soak rose from 125 MiB to 223 MiB, but growth
+   tapered to about 4 MiB over its final two minutes as receiver pools reached
+   their per-listener high-water marks; CPU and delivery remained clean.
 3. Add a short crowd burst, group merge/split, and rapid interest-boundary
    oscillation to expose correlated scheduling stalls. **Complete:** all three
    deterministic profiles and stress-window metrics are implemented; the

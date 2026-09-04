@@ -1,9 +1,12 @@
 use std::{
+    collections::BinaryHeap,
     env, fs,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+const METRIC_SAMPLE_CAPACITY: usize = 4_096;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -311,6 +314,7 @@ struct AllocatorUsage {
 #[derive(Debug, Serialize)]
 struct Metrics {
     schema_version: u32,
+    metric_sample_capacity: usize,
     topology: &'static str,
     scenario: &'static str,
     delivery: &'static str,
@@ -436,17 +440,17 @@ struct RunCounters {
     outside_interest_datagrams: u64,
     malformed_datagrams: u64,
     received_bytes: u64,
-    latencies_us: Vec<u64>,
-    queue_delays_us: Vec<u64>,
-    stress_queue_delays_us: Vec<u64>,
-    listener_callback_work_us: Vec<u64>,
-    stress_listener_callback_work_us: Vec<u64>,
-    receive_drain_work_us: Vec<u64>,
-    stress_receive_drain_work_us: Vec<u64>,
-    playout_pull_work_us: Vec<u64>,
-    stress_playout_pull_work_us: Vec<u64>,
-    interest_entry_to_first_media_us: Vec<u64>,
-    talkspurt_start_to_audio_us: Vec<u64>,
+    latencies_us: MetricSamples,
+    queue_delays_us: MetricSamples,
+    stress_queue_delays_us: MetricSamples,
+    listener_callback_work_us: MetricSamples,
+    stress_listener_callback_work_us: MetricSamples,
+    receive_drain_work_us: MetricSamples,
+    stress_receive_drain_work_us: MetricSamples,
+    playout_pull_work_us: MetricSamples,
+    stress_playout_pull_work_us: MetricSamples,
+    interest_entry_to_first_media_us: MetricSamples,
+    talkspurt_start_to_audio_us: MetricSamples,
     receiver_pull_samples: u64,
     playout_ticks: u64,
     playout_callbacks: u64,
@@ -470,10 +474,68 @@ struct SendCounters {
     sent_datagrams: u64,
     send_errors: u64,
     sent_bytes: u64,
-    fanout_spans_us: Vec<u64>,
-    stress_fanout_spans_us: Vec<u64>,
-    callback_work_us: Vec<u64>,
-    stress_callback_work_us: Vec<u64>,
+    fanout_spans_us: MetricSamples,
+    stress_fanout_spans_us: MetricSamples,
+    callback_work_us: MetricSamples,
+    stress_callback_work_us: MetricSamples,
+}
+
+#[derive(Debug, Default)]
+struct MetricSamples {
+    samples: BinaryHeap<(u64, u64)>,
+    seen: u64,
+    max: u64,
+    salt: u64,
+}
+
+impl MetricSamples {
+    fn with_salt(salt: u64) -> Self {
+        Self {
+            salt,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, value: u64) {
+        self.seen += 1;
+        self.max = self.max.max(value);
+        let priority = mix64(self.salt ^ self.seen.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        self.insert_candidate((priority, value));
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.seen += other.seen;
+        self.max = self.max.max(other.max);
+        for sample in other.samples {
+            self.insert_candidate(sample);
+        }
+    }
+
+    fn insert_candidate(&mut self, sample: (u64, u64)) {
+        if self.samples.len() < METRIC_SAMPLE_CAPACITY {
+            self.samples.push(sample);
+        } else if self.samples.peek().is_some_and(|largest| sample < *largest) {
+            self.samples.pop();
+            self.samples.push(sample);
+        }
+    }
+
+    fn percentile(&self, rank: usize) -> u64 {
+        let mut values = self
+            .samples
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        percentile(&mut values, rank)
+    }
+
+    fn count(&self) -> u64 {
+        self.seen
+    }
+
+    fn max(&self) -> u64 {
+        self.max
+    }
 }
 
 #[derive(Debug, Default)]
@@ -508,32 +570,48 @@ struct ReceiverTotals {
 }
 
 impl RunCounters {
-    fn merge(&mut self, mut other: Self) {
+    fn with_salt(salt: u64) -> Self {
+        Self {
+            latencies_us: MetricSamples::with_salt(salt ^ 1),
+            queue_delays_us: MetricSamples::with_salt(salt ^ 2),
+            stress_queue_delays_us: MetricSamples::with_salt(salt ^ 3),
+            listener_callback_work_us: MetricSamples::with_salt(salt ^ 4),
+            stress_listener_callback_work_us: MetricSamples::with_salt(salt ^ 5),
+            receive_drain_work_us: MetricSamples::with_salt(salt ^ 6),
+            stress_receive_drain_work_us: MetricSamples::with_salt(salt ^ 7),
+            playout_pull_work_us: MetricSamples::with_salt(salt ^ 8),
+            stress_playout_pull_work_us: MetricSamples::with_salt(salt ^ 9),
+            interest_entry_to_first_media_us: MetricSamples::with_salt(salt ^ 10),
+            talkspurt_start_to_audio_us: MetricSamples::with_salt(salt ^ 11),
+            ..Self::default()
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
         self.received_datagrams += other.received_datagrams;
         self.accepted_datagrams += other.accepted_datagrams;
         self.outside_interest_datagrams += other.outside_interest_datagrams;
         self.malformed_datagrams += other.malformed_datagrams;
         self.received_bytes += other.received_bytes;
-        self.latencies_us.append(&mut other.latencies_us);
-        self.queue_delays_us.append(&mut other.queue_delays_us);
+        self.latencies_us.merge(other.latencies_us);
+        self.queue_delays_us.merge(other.queue_delays_us);
         self.stress_queue_delays_us
-            .append(&mut other.stress_queue_delays_us);
+            .merge(other.stress_queue_delays_us);
         self.listener_callback_work_us
-            .append(&mut other.listener_callback_work_us);
+            .merge(other.listener_callback_work_us);
         self.stress_listener_callback_work_us
-            .append(&mut other.stress_listener_callback_work_us);
+            .merge(other.stress_listener_callback_work_us);
         self.receive_drain_work_us
-            .append(&mut other.receive_drain_work_us);
+            .merge(other.receive_drain_work_us);
         self.stress_receive_drain_work_us
-            .append(&mut other.stress_receive_drain_work_us);
-        self.playout_pull_work_us
-            .append(&mut other.playout_pull_work_us);
+            .merge(other.stress_receive_drain_work_us);
+        self.playout_pull_work_us.merge(other.playout_pull_work_us);
         self.stress_playout_pull_work_us
-            .append(&mut other.stress_playout_pull_work_us);
+            .merge(other.stress_playout_pull_work_us);
         self.interest_entry_to_first_media_us
-            .append(&mut other.interest_entry_to_first_media_us);
+            .merge(other.interest_entry_to_first_media_us);
         self.talkspurt_start_to_audio_us
-            .append(&mut other.talkspurt_start_to_audio_us);
+            .merge(other.talkspurt_start_to_audio_us);
         self.receiver_pull_samples += other.receiver_pull_samples;
         self.playout_ticks += other.playout_ticks;
         self.playout_callbacks += other.playout_callbacks;
@@ -548,7 +626,17 @@ impl RunCounters {
 }
 
 impl SendCounters {
-    fn merge(&mut self, mut other: Self) {
+    fn with_salt(salt: u64) -> Self {
+        Self {
+            fanout_spans_us: MetricSamples::with_salt(salt ^ 1),
+            stress_fanout_spans_us: MetricSamples::with_salt(salt ^ 2),
+            callback_work_us: MetricSamples::with_salt(salt ^ 3),
+            stress_callback_work_us: MetricSamples::with_salt(salt ^ 4),
+            ..Self::default()
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
         self.sender_ticks += other.sender_ticks;
         self.sender_callbacks += other.sender_callbacks;
         self.sender_skipped_ticks += other.sender_skipped_ticks;
@@ -560,12 +648,12 @@ impl SendCounters {
         self.sent_datagrams += other.sent_datagrams;
         self.send_errors += other.send_errors;
         self.sent_bytes += other.sent_bytes;
-        self.fanout_spans_us.append(&mut other.fanout_spans_us);
+        self.fanout_spans_us.merge(other.fanout_spans_us);
         self.stress_fanout_spans_us
-            .append(&mut other.stress_fanout_spans_us);
-        self.callback_work_us.append(&mut other.callback_work_us);
+            .merge(other.stress_fanout_spans_us);
+        self.callback_work_us.merge(other.callback_work_us);
         self.stress_callback_work_us
-            .append(&mut other.stress_callback_work_us);
+            .merge(other.stress_callback_work_us);
     }
 }
 
@@ -743,7 +831,8 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 4,
+        schema_version: 5,
+        metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
         delivery: match config.scenario {
@@ -792,20 +881,12 @@ async fn run(config: Config) -> Result<Metrics> {
         stress_sender_ticks: send_counters.stress_sender_ticks,
         stress_sender_skipped_ticks: send_counters.stress_sender_skipped_ticks,
         stress_sent_datagrams: send_counters.stress_sent_datagrams,
-        stress_fanout_span_us_p95: percentile(&mut send_counters.stress_fanout_spans_us, 95),
-        sender_callback_work_us_p95: percentile(&mut send_counters.callback_work_us, 95),
-        stress_sender_callback_work_us_p95: percentile(
-            &mut send_counters.stress_callback_work_us,
-            95,
-        ),
-        fanout_span_us_p50: percentile(&mut send_counters.fanout_spans_us, 50),
-        fanout_span_us_p95: percentile(&mut send_counters.fanout_spans_us, 95),
-        fanout_span_us_max: send_counters
-            .fanout_spans_us
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0),
+        stress_fanout_span_us_p95: send_counters.stress_fanout_spans_us.percentile(95),
+        sender_callback_work_us_p95: send_counters.callback_work_us.percentile(95),
+        stress_sender_callback_work_us_p95: send_counters.stress_callback_work_us.percentile(95),
+        fanout_span_us_p50: send_counters.fanout_spans_us.percentile(50),
+        fanout_span_us_p95: send_counters.fanout_spans_us.percentile(95),
+        fanout_span_us_max: send_counters.fanout_spans_us.max(),
         encoded_packets: send_counters.encoded_packets,
         sent_datagrams: send_counters.sent_datagrams,
         send_errors: send_counters.send_errors,
@@ -821,36 +902,24 @@ async fn run(config: Config) -> Result<Metrics> {
         } else {
             0.0
         },
-        latency_us_p50: percentile(&mut counters.latencies_us, 50),
-        latency_us_p95: percentile(&mut counters.latencies_us, 95),
-        latency_us_p99: percentile(&mut counters.latencies_us, 99),
-        latency_us_max: counters.latencies_us.iter().copied().max().unwrap_or(0),
-        receive_queue_delay_us_p95: percentile(&mut counters.queue_delays_us, 95),
-        receive_queue_delay_us_max: counters.queue_delays_us.iter().copied().max().unwrap_or(0),
-        interest_entry_to_first_media_us_p50: percentile(
-            &mut counters.interest_entry_to_first_media_us,
-            50,
-        ),
-        interest_entry_to_first_media_us_p95: percentile(
-            &mut counters.interest_entry_to_first_media_us,
-            95,
-        ),
-        interest_entry_to_first_media_us_max: counters
+        latency_us_p50: counters.latencies_us.percentile(50),
+        latency_us_p95: counters.latencies_us.percentile(95),
+        latency_us_p99: counters.latencies_us.percentile(99),
+        latency_us_max: counters.latencies_us.max(),
+        receive_queue_delay_us_p95: counters.queue_delays_us.percentile(95),
+        receive_queue_delay_us_max: counters.queue_delays_us.max(),
+        interest_entry_to_first_media_us_p50: counters
             .interest_entry_to_first_media_us
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0),
-        interest_entry_events: counters.interest_entry_to_first_media_us.len(),
-        talkspurt_start_to_audio_us_p50: percentile(&mut counters.talkspurt_start_to_audio_us, 50),
-        talkspurt_start_to_audio_us_p95: percentile(&mut counters.talkspurt_start_to_audio_us, 95),
-        talkspurt_start_to_audio_us_max: counters
-            .talkspurt_start_to_audio_us
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0),
-        talkspurt_audio_events: counters.talkspurt_start_to_audio_us.len(),
+            .percentile(50),
+        interest_entry_to_first_media_us_p95: counters
+            .interest_entry_to_first_media_us
+            .percentile(95),
+        interest_entry_to_first_media_us_max: counters.interest_entry_to_first_media_us.max(),
+        interest_entry_events: counters.interest_entry_to_first_media_us.count() as usize,
+        talkspurt_start_to_audio_us_p50: counters.talkspurt_start_to_audio_us.percentile(50),
+        talkspurt_start_to_audio_us_p95: counters.talkspurt_start_to_audio_us.percentile(95),
+        talkspurt_start_to_audio_us_max: counters.talkspurt_start_to_audio_us.max(),
+        talkspurt_audio_events: counters.talkspurt_start_to_audio_us.count() as usize,
         playout_ticks: counters.playout_ticks,
         playout_callbacks: counters.playout_callbacks,
         playout_skipped_ticks: counters.playout_skipped_ticks,
@@ -874,19 +943,15 @@ async fn run(config: Config) -> Result<Metrics> {
                 .playout_ticks
                 .saturating_sub(counters.stress_playout_ticks),
         ),
-        stress_receive_queue_delay_us_p95: percentile(&mut counters.stress_queue_delays_us, 95),
-        listener_callback_work_us_p95: percentile(&mut counters.listener_callback_work_us, 95),
-        stress_listener_callback_work_us_p95: percentile(
-            &mut counters.stress_listener_callback_work_us,
-            95,
-        ),
-        receive_drain_work_us_p95: percentile(&mut counters.receive_drain_work_us, 95),
-        stress_receive_drain_work_us_p95: percentile(
-            &mut counters.stress_receive_drain_work_us,
-            95,
-        ),
-        playout_pull_work_us_p95: percentile(&mut counters.playout_pull_work_us, 95),
-        stress_playout_pull_work_us_p95: percentile(&mut counters.stress_playout_pull_work_us, 95),
+        stress_receive_queue_delay_us_p95: counters.stress_queue_delays_us.percentile(95),
+        listener_callback_work_us_p95: counters.listener_callback_work_us.percentile(95),
+        stress_listener_callback_work_us_p95: counters
+            .stress_listener_callback_work_us
+            .percentile(95),
+        receive_drain_work_us_p95: counters.receive_drain_work_us.percentile(95),
+        stress_receive_drain_work_us_p95: counters.stress_receive_drain_work_us.percentile(95),
+        playout_pull_work_us_p95: counters.playout_pull_work_us.percentile(95),
+        stress_playout_pull_work_us_p95: counters.stress_playout_pull_work_us.percentile(95),
         playout_lateness_us_max: counters.playout_lateness_us_max,
         neteq_concealed_samples: concealed_samples,
         neteq_concealed_percent: {
@@ -1055,7 +1120,7 @@ async fn run_listener(
         tokio::time::interval_at(tokio::time::Instant::from_std(first_tick), PLAYOUT_TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_scheduled = None;
-    let mut counters = RunCounters::default();
+    let mut counters = RunCounters::with_salt(listener as u64);
     let mut interest_active = vec![false; receivers.len()];
     let mut interest_started_us = vec![None; receivers.len()];
     let mut receiver_creations = match config.scenario {
@@ -1235,7 +1300,7 @@ async fn send_media(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_scheduled = None;
     let mut frame_index = 0_u64;
-    let mut counters = SendCounters::default();
+    let mut counters = SendCounters::with_salt(speaker as u64);
     let mut previous_stress = false;
 
     while Instant::now() < media_end {
@@ -1652,7 +1717,7 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
         receiver_retirements: listener.receiver_retirements,
         max_concurrent_receivers: listener.max_concurrent_receivers,
         max_receiver_pool: listener.max_receiver_pool,
-        receive_queue_delay_us_p95: percentile(&mut listener.counters.queue_delays_us, 95),
+        receive_queue_delay_us_p95: listener.counters.queue_delays_us.percentile(95),
         playout_skipped_ticks: listener.counters.playout_skipped_ticks,
         playout_deadline_miss_percent: if listener.counters.playout_ticks > 0 {
             listener.counters.playout_deadline_misses as f64
@@ -1666,16 +1731,16 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
             listener.counters.stress_playout_ticks,
         ),
         playout_lateness_us_max: listener.counters.playout_lateness_us_max,
-        interest_entry_to_first_media_us_p95: percentile(
-            &mut listener.counters.interest_entry_to_first_media_us,
-            95,
-        ),
-        interest_entry_events: listener.counters.interest_entry_to_first_media_us.len(),
-        talkspurt_start_to_audio_us_p95: percentile(
-            &mut listener.counters.talkspurt_start_to_audio_us,
-            95,
-        ),
-        talkspurt_audio_events: listener.counters.talkspurt_start_to_audio_us.len(),
+        interest_entry_to_first_media_us_p95: listener
+            .counters
+            .interest_entry_to_first_media_us
+            .percentile(95),
+        interest_entry_events: listener.counters.interest_entry_to_first_media_us.count() as usize,
+        talkspurt_start_to_audio_us_p95: listener
+            .counters
+            .talkspurt_start_to_audio_us
+            .percentile(95),
+        talkspurt_audio_events: listener.counters.talkspurt_start_to_audio_us.count() as usize,
         neteq_concealed_samples: listener.concealed_samples,
         neteq_receiver_errors: listener.receiver_errors,
     }
@@ -1802,6 +1867,35 @@ mod tests {
         assert_eq!(percentile(&mut [9], 95), 9);
         assert_eq!(percentile(&mut [5, 1, 3, 2, 4], 50), 3);
         assert_eq!(percentile(&mut [5, 1, 3, 2, 4], 95), 4);
+    }
+
+    #[test]
+    fn metric_samples_are_bounded_with_exact_count_and_max() {
+        let mut samples = MetricSamples::with_salt(7);
+        for value in 0..(METRIC_SAMPLE_CAPACITY as u64 * 3) {
+            samples.push(value);
+        }
+
+        assert_eq!(samples.samples.len(), METRIC_SAMPLE_CAPACITY);
+        assert_eq!(samples.count(), METRIC_SAMPLE_CAPACITY as u64 * 3);
+        assert_eq!(samples.max(), METRIC_SAMPLE_CAPACITY as u64 * 3 - 1);
+        assert!(samples.percentile(50) > METRIC_SAMPLE_CAPACITY as u64);
+    }
+
+    #[test]
+    fn metric_sample_merge_remains_bounded() {
+        let mut left = MetricSamples::with_salt(1);
+        let mut right = MetricSamples::with_salt(2);
+        for value in 0..10_000 {
+            left.push(value);
+            right.push(value + 10_000);
+        }
+        left.merge(right);
+
+        assert_eq!(left.samples.len(), METRIC_SAMPLE_CAPACITY);
+        assert_eq!(left.count(), 20_000);
+        assert_eq!(left.max(), 19_999);
+        assert!((9_000..=11_000).contains(&left.percentile(50)));
     }
 
     #[test]

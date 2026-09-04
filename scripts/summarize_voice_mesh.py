@@ -8,6 +8,8 @@ import sys
 
 
 FIELDS = [
+    "schema_version",
+    "metric_sample_capacity",
     "scenario",
     "delivery",
     "receiver_policy",

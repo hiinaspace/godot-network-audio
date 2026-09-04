@@ -65,6 +65,11 @@ On glibc systems, schema-v4 RSS samples also include allocator arena, in-use,
 free, and mmap totals. These counters are diagnostic and report zero on other
 platforms.
 
+Schema v5 keeps exact metric event counts and maxima, but computes percentiles
+from mergeable deterministic samples capped at 4,096 observations per metric.
+This prevents the benchmark's diagnostics from growing with run duration; the
+JSON records the cap as `metric_sample_capacity`.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.
