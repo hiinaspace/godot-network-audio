@@ -4,6 +4,12 @@ Date: 2026-09-03
 Runner: `gna-sim`, 8-CPU quota, 20 GiB memory limit, no observed cgroup CPU
 throttling during the matrix
 
+Schema note: the original schema-v1 `neteq_concealed_percent` denominator
+multiplied the already aggregated playout-callback count by the aggregate
+receiver count. Those percentages are understated and should not be used for
+comparison. Raw concealed-sample counts and the other reported metrics remain
+valid. Schema v2 uses the actual number of samples pulled from receivers.
+
 ## Pre-upgrade baseline
 
 The first matrix used Iroh 0.97, patched NetEq 0.8.3 (`4ec2cc8`), release mode,

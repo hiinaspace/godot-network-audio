@@ -198,6 +198,22 @@ impl VoiceReceiver {
         }
     }
 
+    /// Discard buffered media and decoder history before assigning this
+    /// receiver to a new logical stream.
+    pub fn reset_stream(&mut self) -> Result<()> {
+        self.inner.flush();
+        self.inner.register_decoder(
+            PAYLOAD_TYPE_OPUS,
+            Box::new(OpusAudioDecoder::new(self.sample_rate, self.channels)?),
+        );
+        self.pending_silence = false;
+        self.intentional_silence = false;
+        self.resuming_talkspurt = false;
+        self.resumed_packet_count = 0;
+        self.consecutive_failures = 0;
+        Ok(())
+    }
+
     fn instant_for_arrival(
         &mut self,
         received_at_mono_us: u64,
@@ -359,6 +375,37 @@ mod tests {
         );
         assert!(stats_after.intentional_silence);
 
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_accepts_a_new_opus_sequence() -> AnyResult<()> {
+        let mut first_encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+
+        first_encoder.push_pcm(&vec![0.1; ENCODE_FRAME_SAMPLES]);
+        let first = first_encoder.poll_packet()?.expect("first packet");
+        receiver.push_packet(
+            first,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+        receiver.reset_stream()?;
+        assert_eq!(receiver.stats().current_buffer_size_ms, 0);
+
+        let mut second_encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        second_encoder.push_pcm(&vec![0.1; ENCODE_FRAME_SAMPLES]);
+        let second = second_encoder.poll_packet()?.expect("second packet");
+        receiver.push_packet(
+            second,
+            PacketArrival {
+                received_at_mono_us: 20_000,
+            },
+        )?;
+        let mut frame = vec![0.0; PULL_FRAME_SAMPLES];
+        receiver.pull_frame(&mut frame);
+        assert!(receiver.stats().sticky_error.is_none());
         Ok(())
     }
 

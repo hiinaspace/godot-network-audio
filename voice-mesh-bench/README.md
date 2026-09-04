@@ -30,9 +30,27 @@ Run that matrix and produce a CSV summary with:
 scripts/run_voice_mesh_baseline.sh target/voice-mesh/baseline-current 10
 ```
 
+The first game-shaped scenario keeps the complete connection mesh but rotates
+conversation ownership through every participant and changes each speaker's
+listener set on a deterministic timeline. Compare sender-side filtering with
+full broadcast followed by receiver-side interest discard using:
+
+```sh
+scripts/run_voice_game_interest.sh target/voice-mesh/game-interest 30 5
+```
+
+Individual runs accept `--scenario game-interest`, `--delivery
+sender-filtered|broadcast-discard`, `--receiver-policy retire|pool`,
+`--interest-listeners N`, and `--seed N`. The matrix script also accepts
+`RECEIVER_POLICY=retire|pool` (default `retire`). Result JSON includes
+per-participant metrics, receiver lifecycle counts, interest-entry-to-media
+delay, and talkspurt-start-to-audible-output delay.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.
 
 See [PLAN.md](PLAN.md) for the research-informed positional-interest,
 impairment, topology, churn, and perceptual-quality roadmap.
+The first direct-delivery results are recorded in
+[GAME_INTEREST.md](GAME_INTEREST.md).

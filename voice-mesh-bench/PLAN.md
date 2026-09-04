@@ -116,31 +116,45 @@ For every sender/listener direction, add:
 
 ## Quality lane
 
-Keep scale tests synthetic and deterministic. Separately replay several
-8-10-second clean speech fixtures through representative network treatments,
-write each decoded stream to WAV, and score it against the aligned clean
-reference with ViSQOL. Use multiple speakers/fixtures and retain the raw WAVs
-for listening when a metric regresses. Do not apply a single-source full-
-reference score to a mixed multi-speaker output.
+Keep Opus fixed for the primary scale, topology, and churn work. Perceptual
+scoring is an optional diagnostic, not a release gate while the codec and NetEq
+algorithm are trusted dependencies. Use it when timing/concealment metrics or
+listening reveal an unexplained audible regression, or when deliberately
+comparing codec/FEC choices such as experimental neural FEC.
+
+For that narrower lane, replay several 8-10-second clean speech fixtures
+through representative network treatments, write each decoded stream to WAV,
+and score it against the aligned clean reference with ViSQOL. Use multiple
+speakers/fixtures and retain the raw WAVs for listening. Include codec CPU,
+bitrate, algorithmic delay, and recovery from burst loss alongside quality.
+Do not apply a single-source full-reference score to a mixed multi-speaker
+output.
 
 ## Topology, churn, and realism sequence
 
 1. Run clean sender-filtered and broadcast-and-discard interest workloads for
    8, 16, and 32 participants; use at least five deterministic seeds and one
-   ten-minute 32-participant soak.
-2. Add a short crowd burst, group merge/split, and rapid interest-boundary
+   ten-minute 32-participant soak. **Complete:** all clean runs delivered every
+   datagram without send or NetEq errors; sender filtering materially reduced
+   traffic and CPU.
+2. Compare immediate receiver retirement with bounded warm reuse. Confirm that
+   current RSS plateaus under repeated interest changes before impairment.
+   **In progress:** bounded reuse is implemented and reduced construction,
+   CPU, and scheduling misses in a matched run, while retaining about 32 MiB
+   more RSS. Its longer-run RSS ceiling remains to be established.
+3. Add a short crowd burst, group merge/split, and rapid interest-boundary
    oscillation to expose correlated scheduling stalls.
-3. Apply selected steady, burst, outage, capacity, and recovery profiles.
-4. Join, leave, reconnect, and replace peers while unaffected conversations
+4. Apply selected steady, burst, outage, capacity, and recovery profiles.
+5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the
    recovering participant.
-5. Run the same timelines through a static forwarding node. Compare direct and
+6. Run the same timelines through a static forwarding node. Compare direct and
    forwarded end-to-playout delay, endpoint CPU/upload, forwarder CPU/traffic,
    collateral impact, and behavior when the forwarder stalls or disappears.
-6. Repeat selected cases as multiple processes and across real paths. Use the
+7. Repeat selected cases as multiple processes and across real paths. Use the
    existing WireGuard/NordVPN harness or recorded path traces to expose NAT,
    relay, socket-buffer, and host-scheduling behavior hidden by loopback.
-7. Only then add the Godot audio-thread, source-count, spatial-mixing, and
+8. Only then add the Godot audio-thread, source-count, spatial-mixing, and
    render-contention layer, preserving the same timelines and metrics.
 
 ## References

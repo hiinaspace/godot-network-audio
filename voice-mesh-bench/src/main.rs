@@ -13,18 +13,70 @@ use iroh::{
 };
 use serde::Serialize;
 use tokio::{runtime::Builder, sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
-use voice_core::{PacketArrival, VoiceEncoder, VoiceEncoderConfig, VoicePacket, VoiceReceiver};
+use voice_core::{
+    PacketArrival, PacketFlags, VoiceEncoder, VoiceEncoderConfig, VoicePacket, VoiceReceiver,
+};
 
 const ALPN: &[u8] = b"godot-network-audio/mesh-bench/0";
 const SAMPLE_RATE: u32 = 48_000;
 const ENCODE_FRAME_SAMPLES: usize = 960;
 const PULL_FRAME_SAMPLES: usize = 480;
-const ENVELOPE_HEADER_LEN: usize = 8;
+const ENVELOPE_HEADER_LEN: usize = 16;
 const PLAYOUT_TICK: Duration = Duration::from_millis(10);
 const SEND_TICK: Duration = Duration::from_millis(20);
 const STARTUP_SETTLE: Duration = Duration::from_millis(100);
 const DELIVERY_GRACE: Duration = Duration::from_millis(300);
 const DEADLINE_LATE_US: u64 = 2_000;
+const GAME_TURN_FRAMES: u64 = 75;
+const GAME_TALK_FRAMES: u64 = 60;
+const GAME_OVERLAP_FRAMES: u64 = 5;
+const GAME_INTEREST_EPOCH_FRAMES: u64 = 150;
+const NON_SILENT_RMS: f32 = 0.000_1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Baseline,
+    GameInterest,
+}
+
+impl Scenario {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::GameInterest => "game-interest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    SenderFiltered,
+    BroadcastDiscard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiverPolicy {
+    Retire,
+    Pool,
+}
+
+impl ReceiverPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retire => "retire",
+            Self::Pool => "pool",
+        }
+    }
+}
+
+impl Delivery {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SenderFiltered => "sender-filtered",
+            Self::BroadcastDiscard => "broadcast-discard",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -32,6 +84,11 @@ struct Config {
     talkers: usize,
     duration: Duration,
     dtx: bool,
+    scenario: Scenario,
+    delivery: Delivery,
+    receiver_policy: ReceiverPolicy,
+    interest_listeners: usize,
+    seed: u64,
     output: Option<PathBuf>,
 }
 
@@ -42,6 +99,11 @@ impl Default for Config {
             talkers: 1,
             duration: Duration::from_secs(5),
             dtx: true,
+            scenario: Scenario::Baseline,
+            delivery: Delivery::SenderFiltered,
+            receiver_policy: ReceiverPolicy::Retire,
+            interest_listeners: 7,
+            seed: 1,
             output: None,
         }
     }
@@ -73,6 +135,36 @@ impl Config {
                         _ => bail!("--dtx must be on or off, got {value}"),
                     };
                 }
+                "--scenario" => {
+                    let value = args.next().context("--scenario requires a value")?;
+                    config.scenario = match value.as_str() {
+                        "baseline" => Scenario::Baseline,
+                        "game-interest" => Scenario::GameInterest,
+                        _ => bail!("--scenario must be baseline or game-interest, got {value}"),
+                    };
+                }
+                "--delivery" => {
+                    let value = args.next().context("--delivery requires a value")?;
+                    config.delivery = match value.as_str() {
+                        "sender-filtered" => Delivery::SenderFiltered,
+                        "broadcast-discard" => Delivery::BroadcastDiscard,
+                        _ => bail!(
+                            "--delivery must be sender-filtered or broadcast-discard, got {value}"
+                        ),
+                    };
+                }
+                "--receiver-policy" => {
+                    let value = args.next().context("--receiver-policy requires a value")?;
+                    config.receiver_policy = match value.as_str() {
+                        "retire" => ReceiverPolicy::Retire,
+                        "pool" => ReceiverPolicy::Pool,
+                        _ => bail!("--receiver-policy must be retire or pool, got {value}"),
+                    };
+                }
+                "--interest-listeners" => {
+                    config.interest_listeners = parse_next(&mut args, "--interest-listeners")?;
+                }
+                "--seed" => config.seed = parse_next(&mut args, "--seed")?,
                 "--output" => {
                     config.output = Some(PathBuf::from(
                         args.next().context("--output requires a path")?,
@@ -87,6 +179,14 @@ impl Config {
         }
         if config.talkers == 0 || config.talkers > config.participants {
             bail!("--talkers must be between 1 and the participant count");
+        }
+        if config.scenario == Scenario::GameInterest {
+            if config.interest_listeners == 0 || config.interest_listeners >= config.participants {
+                bail!("--interest-listeners must be between 1 and participants - 1");
+            }
+            if config.talkers > 8 {
+                bail!("game-interest supports at most 8 simultaneous conversation slots");
+            }
         }
         Ok(Some(config))
     }
@@ -135,11 +235,22 @@ struct ProcessUsage {
 }
 
 #[derive(Debug, Serialize)]
+struct RssSample {
+    elapsed_seconds: f64,
+    current_rss_kib: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct Metrics {
     schema_version: u32,
     topology: &'static str,
+    scenario: &'static str,
+    delivery: &'static str,
+    receiver_policy: &'static str,
+    seed: u64,
     participants: usize,
     talkers: usize,
+    interest_listeners: usize,
     dtx: bool,
     requested_duration_seconds: f64,
     mesh_connections: usize,
@@ -150,13 +261,21 @@ struct Metrics {
     media_cpu_seconds: f64,
     media_cpu_percent_of_one_core: f64,
     max_rss_kib: i64,
+    current_rss_kib_after_setup: i64,
+    current_rss_kib_after_media: i64,
+    rss_samples: Vec<RssSample>,
     sender_ticks: u64,
     sender_callbacks: u64,
     sender_skipped_ticks: u64,
+    fanout_span_us_p50: u64,
+    fanout_span_us_p95: u64,
+    fanout_span_us_max: u64,
     encoded_packets: u64,
     sent_datagrams: u64,
     send_errors: u64,
     received_datagrams: u64,
+    accepted_datagrams: u64,
+    outside_interest_datagrams: u64,
     malformed_datagrams: u64,
     missing_datagrams: u64,
     sent_bytes: u64,
@@ -168,6 +287,14 @@ struct Metrics {
     latency_us_max: u64,
     receive_queue_delay_us_p95: u64,
     receive_queue_delay_us_max: u64,
+    interest_entry_to_first_media_us_p50: u64,
+    interest_entry_to_first_media_us_p95: u64,
+    interest_entry_to_first_media_us_max: u64,
+    interest_entry_events: usize,
+    talkspurt_start_to_audio_us_p50: u64,
+    talkspurt_start_to_audio_us_p95: u64,
+    talkspurt_start_to_audio_us_max: u64,
+    talkspurt_audio_events: usize,
     playout_ticks: u64,
     playout_callbacks: u64,
     playout_skipped_ticks: u64,
@@ -179,15 +306,50 @@ struct Metrics {
     neteq_receiver_errors: usize,
     neteq_max_current_buffer_ms: u32,
     neteq_max_target_delay_ms: u32,
+    receiver_creations: u64,
+    receiver_reuses: u64,
+    receiver_retirements: u64,
+    max_concurrent_receivers: usize,
+    max_receiver_pool: usize,
+    participants_metrics: Vec<ParticipantMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+struct ParticipantMetrics {
+    participant: usize,
+    received_datagrams: u64,
+    accepted_datagrams: u64,
+    outside_interest_datagrams: u64,
+    active_receiver_count: usize,
+    receiver_creations: u64,
+    receiver_reuses: u64,
+    receiver_retirements: u64,
+    max_concurrent_receivers: usize,
+    max_receiver_pool: usize,
+    receive_queue_delay_us_p95: u64,
+    playout_skipped_ticks: u64,
+    playout_deadline_miss_percent: f64,
+    playout_lateness_us_max: u64,
+    interest_entry_to_first_media_us_p95: u64,
+    interest_entry_events: usize,
+    talkspurt_start_to_audio_us_p95: u64,
+    talkspurt_audio_events: usize,
+    neteq_concealed_samples: u64,
+    neteq_receiver_errors: usize,
 }
 
 #[derive(Debug, Default)]
 struct RunCounters {
     received_datagrams: u64,
+    accepted_datagrams: u64,
+    outside_interest_datagrams: u64,
     malformed_datagrams: u64,
     received_bytes: u64,
     latencies_us: Vec<u64>,
     queue_delays_us: Vec<u64>,
+    interest_entry_to_first_media_us: Vec<u64>,
+    talkspurt_start_to_audio_us: Vec<u64>,
+    receiver_pull_samples: u64,
     playout_ticks: u64,
     playout_callbacks: u64,
     playout_skipped_ticks: u64,
@@ -204,11 +366,34 @@ struct SendCounters {
     sent_datagrams: u64,
     send_errors: u64,
     sent_bytes: u64,
+    fanout_spans_us: Vec<u64>,
 }
 
 #[derive(Debug, Default)]
 struct ListenerResult {
+    participant: usize,
     counters: RunCounters,
+    concealed_samples: u64,
+    receiver_errors: usize,
+    max_current_buffer_ms: u32,
+    max_target_delay_ms: u32,
+    active_receiver_count: usize,
+    receiver_creations: u64,
+    receiver_reuses: u64,
+    receiver_retirements: u64,
+    max_concurrent_receivers: usize,
+    max_receiver_pool: usize,
+}
+
+struct ReceiverSlot {
+    receiver: VoiceReceiver,
+    pending_talkspurt_start_us: Option<u64>,
+    reported_concealed_samples: u64,
+    reported_error: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReceiverTotals {
     concealed_samples: u64,
     receiver_errors: usize,
     max_current_buffer_ms: u32,
@@ -218,10 +403,17 @@ struct ListenerResult {
 impl RunCounters {
     fn merge(&mut self, mut other: Self) {
         self.received_datagrams += other.received_datagrams;
+        self.accepted_datagrams += other.accepted_datagrams;
+        self.outside_interest_datagrams += other.outside_interest_datagrams;
         self.malformed_datagrams += other.malformed_datagrams;
         self.received_bytes += other.received_bytes;
         self.latencies_us.append(&mut other.latencies_us);
         self.queue_delays_us.append(&mut other.queue_delays_us);
+        self.interest_entry_to_first_media_us
+            .append(&mut other.interest_entry_to_first_media_us);
+        self.talkspurt_start_to_audio_us
+            .append(&mut other.talkspurt_start_to_audio_us);
+        self.receiver_pull_samples += other.receiver_pull_samples;
         self.playout_ticks += other.playout_ticks;
         self.playout_callbacks += other.playout_callbacks;
         self.playout_skipped_ticks += other.playout_skipped_ticks;
@@ -266,6 +458,11 @@ fn print_help() {
          \x20 --talkers N       Scheduled talkers (default 1)\n\
          \x20 --seconds N       Media duration, at least 0.5 (default 5)\n\
          \x20 --dtx on|off      Opus discontinuous transmission (default on)\n\
+         \x20 --scenario NAME   baseline or game-interest (default baseline)\n\
+         \x20 --delivery NAME   sender-filtered or broadcast-discard\n\
+         \x20 --receiver-policy NAME  retire or pool (default retire)\n\
+         \x20 --interest-listeners N  Interested listeners per game talker (default 7)\n\
+         \x20 --seed N          Deterministic game schedule seed (default 1)\n\
          \x20 --output PATH     Also write pretty JSON metrics to PATH\n\
          \x20 -h, --help        Show this help"
     );
@@ -284,7 +481,11 @@ async fn run(config: Config) -> Result<Metrics> {
     }
     let mesh = build_mesh(config.participants, clock_start, receive_txs).await?;
 
-    let encoders = (0..config.talkers)
+    let encoder_count = match config.scenario {
+        Scenario::Baseline => config.talkers,
+        Scenario::GameInterest => config.participants,
+    };
+    let encoders = (0..encoder_count)
         .map(|_| {
             VoiceEncoder::new(VoiceEncoderConfig {
                 enable_dtx: config.dtx,
@@ -293,10 +494,11 @@ async fn run(config: Config) -> Result<Metrics> {
         })
         .collect::<voice_core::Result<Vec<_>>>()?;
     let receiver_rows = (0..config.participants)
-        .map(|listener| build_listener_receivers(listener, config.talkers))
+        .map(|listener| build_listener_receivers(listener, &config, encoder_count))
         .collect::<Result<Vec<_>>>()?;
     let setup_wall = setup_start.elapsed();
     let after_setup = process_usage()?;
+    let current_rss_kib_after_setup = current_rss_kib()?;
 
     tokio::time::sleep(STARTUP_SETTLE).await;
     let media_start = Instant::now() + Duration::from_millis(20);
@@ -314,28 +516,58 @@ async fn run(config: Config) -> Result<Metrics> {
                 media_start,
                 config.duration,
                 clock_start,
+                config.clone(),
             ))
         })
         .collect::<Vec<_>>();
     let sender = tokio::spawn(send_media(
-        config.participants,
         config.duration,
         mesh.connections.clone(),
         encoders,
         media_start,
         clock_start,
+        config.clone(),
     ));
+    let mut rss_samples = Vec::new();
+    let mut next_rss_sample = media_start;
+    while next_rss_sample < media_end {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(next_rss_sample)).await;
+        rss_samples.push(RssSample {
+            elapsed_seconds: media_start.elapsed().as_secs_f64(),
+            current_rss_kib: current_rss_kib()?,
+        });
+        next_rss_sample += Duration::from_secs(10);
+    }
     tokio::time::sleep_until(tokio::time::Instant::from_std(media_end)).await;
+    let current_rss_kib_after_media = current_rss_kib()?;
+    rss_samples.push(RssSample {
+        elapsed_seconds: media_start.elapsed().as_secs_f64(),
+        current_rss_kib: current_rss_kib_after_media,
+    });
     let media_wall = media_start.elapsed();
     let after_media = process_usage()?;
-    let send_counters = sender.await.context("media sender task panicked")??;
+    let mut send_counters = sender.await.context("media sender task panicked")??;
     let mut counters = RunCounters::default();
     let mut concealed_samples = 0_u64;
     let mut receiver_errors = 0_usize;
     let mut max_current_buffer_ms = 0_u32;
     let mut max_target_delay_ms = 0_u32;
+    let mut active_receiver_count = 0_usize;
+    let mut receiver_creations = 0_u64;
+    let mut receiver_reuses = 0_u64;
+    let mut receiver_retirements = 0_u64;
+    let mut max_concurrent_receivers = 0_usize;
+    let mut max_receiver_pool = 0_usize;
+    let mut participants_metrics = Vec::with_capacity(config.participants);
     for task in listener_tasks {
-        let listener = task.await.context("listener task panicked")??;
+        let mut listener = task.await.context("listener task panicked")??;
+        participants_metrics.push(participant_metrics(&mut listener));
+        active_receiver_count += listener.active_receiver_count;
+        receiver_creations += listener.receiver_creations;
+        receiver_reuses += listener.receiver_reuses;
+        receiver_retirements += listener.receiver_retirements;
+        max_concurrent_receivers = max_concurrent_receivers.max(listener.max_concurrent_receivers);
+        max_receiver_pool = max_receiver_pool.max(listener.max_receiver_pool);
         counters.merge(listener.counters);
         concealed_samples = concealed_samples.saturating_add(listener.concealed_samples);
         receiver_errors += listener.receiver_errors;
@@ -349,14 +581,25 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 1,
+        schema_version: 2,
         topology: "direct-full-mesh",
+        scenario: config.scenario.as_str(),
+        delivery: match config.scenario {
+            Scenario::Baseline => "full-broadcast",
+            Scenario::GameInterest => config.delivery.as_str(),
+        },
+        receiver_policy: config.receiver_policy.as_str(),
+        seed: config.seed,
         participants: config.participants,
         talkers: config.talkers,
+        interest_listeners: match config.scenario {
+            Scenario::Baseline => config.participants - 1,
+            Scenario::GameInterest => config.interest_listeners,
+        },
         dtx: config.dtx,
         requested_duration_seconds: config.duration.as_secs_f64(),
         mesh_connections: config.participants * (config.participants - 1) / 2,
-        active_receiver_count: config.talkers * (config.participants - 1),
+        active_receiver_count,
         setup_wall_ms: setup_wall.as_secs_f64() * 1_000.0,
         setup_cpu_seconds: after_setup.cpu_seconds - process_start.cpu_seconds,
         media_wall_ms: media_seconds * 1_000.0,
@@ -367,13 +610,26 @@ async fn run(config: Config) -> Result<Metrics> {
             0.0
         },
         max_rss_kib: after_media.max_rss_kib,
+        current_rss_kib_after_setup,
+        current_rss_kib_after_media,
+        rss_samples,
         sender_ticks: send_counters.sender_ticks,
         sender_callbacks: send_counters.sender_callbacks,
         sender_skipped_ticks: send_counters.sender_skipped_ticks,
+        fanout_span_us_p50: percentile(&mut send_counters.fanout_spans_us, 50),
+        fanout_span_us_p95: percentile(&mut send_counters.fanout_spans_us, 95),
+        fanout_span_us_max: send_counters
+            .fanout_spans_us
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
         encoded_packets: send_counters.encoded_packets,
         sent_datagrams: send_counters.sent_datagrams,
         send_errors: send_counters.send_errors,
         received_datagrams: counters.received_datagrams,
+        accepted_datagrams: counters.accepted_datagrams,
+        outside_interest_datagrams: counters.outside_interest_datagrams,
         malformed_datagrams: counters.malformed_datagrams,
         missing_datagrams,
         sent_bytes: send_counters.sent_bytes,
@@ -389,6 +645,30 @@ async fn run(config: Config) -> Result<Metrics> {
         latency_us_max: counters.latencies_us.iter().copied().max().unwrap_or(0),
         receive_queue_delay_us_p95: percentile(&mut counters.queue_delays_us, 95),
         receive_queue_delay_us_max: counters.queue_delays_us.iter().copied().max().unwrap_or(0),
+        interest_entry_to_first_media_us_p50: percentile(
+            &mut counters.interest_entry_to_first_media_us,
+            50,
+        ),
+        interest_entry_to_first_media_us_p95: percentile(
+            &mut counters.interest_entry_to_first_media_us,
+            95,
+        ),
+        interest_entry_to_first_media_us_max: counters
+            .interest_entry_to_first_media_us
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+        interest_entry_events: counters.interest_entry_to_first_media_us.len(),
+        talkspurt_start_to_audio_us_p50: percentile(&mut counters.talkspurt_start_to_audio_us, 50),
+        talkspurt_start_to_audio_us_p95: percentile(&mut counters.talkspurt_start_to_audio_us, 95),
+        talkspurt_start_to_audio_us_max: counters
+            .talkspurt_start_to_audio_us
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+        talkspurt_audio_events: counters.talkspurt_start_to_audio_us.len(),
         playout_ticks: counters.playout_ticks,
         playout_callbacks: counters.playout_callbacks,
         playout_skipped_ticks: counters.playout_skipped_ticks,
@@ -401,10 +681,7 @@ async fn run(config: Config) -> Result<Metrics> {
         playout_lateness_us_max: counters.playout_lateness_us_max,
         neteq_concealed_samples: concealed_samples,
         neteq_concealed_percent: {
-            let possible_samples = counters.playout_callbacks
-                * config.talkers as u64
-                * (config.participants - 1) as u64
-                * PULL_FRAME_SAMPLES as u64;
+            let possible_samples = counters.receiver_pull_samples;
             if possible_samples > 0 {
                 concealed_samples as f64 / possible_samples as f64 * 100.0
             } else {
@@ -414,6 +691,12 @@ async fn run(config: Config) -> Result<Metrics> {
         neteq_receiver_errors: receiver_errors,
         neteq_max_current_buffer_ms: max_current_buffer_ms,
         neteq_max_target_delay_ms: max_target_delay_ms,
+        receiver_creations,
+        receiver_reuses,
+        receiver_retirements,
+        max_concurrent_receivers,
+        max_receiver_pool,
+        participants_metrics,
     };
 
     mesh.close().await;
@@ -499,26 +782,59 @@ async fn build_mesh(
     })
 }
 
-fn build_listener_receivers(listener: usize, talkers: usize) -> Result<Vec<Option<VoiceReceiver>>> {
-    let mut receivers = Vec::with_capacity(talkers);
-    for speaker in 0..talkers {
-        if listener == speaker {
+fn build_listener_receivers(
+    listener: usize,
+    config: &Config,
+    encoder_count: usize,
+) -> Result<Vec<Option<ReceiverSlot>>> {
+    let mut receivers = Vec::with_capacity(encoder_count);
+    for speaker in 0..encoder_count {
+        if listener == speaker || config.scenario == Scenario::GameInterest {
             receivers.push(None);
         } else {
-            receivers.push(Some(VoiceReceiver::new(SAMPLE_RATE)?));
+            receivers.push(Some(new_receiver_slot()?));
         }
     }
     Ok(receivers)
 }
 
+fn new_receiver_slot() -> Result<ReceiverSlot> {
+    Ok(ReceiverSlot {
+        receiver: VoiceReceiver::new(SAMPLE_RATE)?,
+        pending_talkspurt_start_us: None,
+        reported_concealed_samples: 0,
+        reported_error: false,
+    })
+}
+
+fn collect_receiver_totals(slot: &mut ReceiverSlot, totals: &mut ReceiverTotals) {
+    let stats = slot.receiver.stats();
+    totals.concealed_samples = totals.concealed_samples.saturating_add(
+        stats
+            .concealed_samples
+            .saturating_sub(slot.reported_concealed_samples),
+    );
+    slot.reported_concealed_samples = stats.concealed_samples;
+    if stats.sticky_error.is_some() && !slot.reported_error {
+        totals.receiver_errors += 1;
+        slot.reported_error = true;
+    }
+    totals.max_current_buffer_ms = totals
+        .max_current_buffer_ms
+        .max(stats.current_buffer_size_ms);
+    totals.max_target_delay_ms = totals.max_target_delay_ms.max(stats.target_delay_ms);
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit task inputs keep virtual-client state visible.
 async fn run_listener(
     listener: usize,
     participants: usize,
     mut receive_rx: mpsc::UnboundedReceiver<ReceivedDatagram>,
-    mut receivers: Vec<Option<VoiceReceiver>>,
+    mut receivers: Vec<Option<ReceiverSlot>>,
     media_start: Instant,
     duration: Duration,
     clock_start: Instant,
+    config: Config,
 ) -> Result<ListenerResult> {
     let media_end = media_start + duration;
     // Independent clients do not share an audio clock. Stagger their callbacks
@@ -531,6 +847,18 @@ async fn run_listener(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_scheduled = None;
     let mut counters = RunCounters::default();
+    let mut interest_active = vec![false; receivers.len()];
+    let mut interest_started_us = vec![None; receivers.len()];
+    let mut receiver_creations = match config.scenario {
+        Scenario::Baseline => receivers.iter().flatten().count() as u64,
+        Scenario::GameInterest => 0,
+    };
+    let mut receiver_retirements = 0_u64;
+    let mut receiver_reuses = 0_u64;
+    let mut receiver_pool = Vec::new();
+    let mut receiver_totals = ReceiverTotals::default();
+    let mut max_concurrent_receivers = receivers.iter().flatten().count();
+    let mut max_receiver_pool = 0_usize;
 
     while Instant::now() < media_end {
         let scheduled = ticker.tick().await;
@@ -556,39 +884,69 @@ async fn run_listener(
             counters.playout_deadline_misses += 1;
         }
 
+        let media_frame = media_frame_at(media_start, Instant::now());
+        sync_interest(
+            listener,
+            media_frame,
+            &config,
+            clock_start,
+            &mut receivers,
+            &mut interest_active,
+            &mut interest_started_us,
+            &mut receiver_retirements,
+            &mut receiver_pool,
+            &mut receiver_totals,
+        )?;
+
         drain_received(
             listener,
             &mut receive_rx,
             &mut receivers,
+            &mut interest_started_us,
+            &config,
+            media_frame,
             clock_start,
             &mut counters,
+            &mut receiver_creations,
+            &mut receiver_reuses,
+            &mut receiver_pool,
         )?;
-        pull_receivers(&mut receivers);
+        pull_receivers(
+            listener,
+            media_frame,
+            &config,
+            clock_start,
+            &mut receivers,
+            &mut counters,
+        );
+        max_concurrent_receivers = max_concurrent_receivers.max(receivers.iter().flatten().count());
+        max_receiver_pool = max_receiver_pool.max(receiver_pool.len());
     }
 
     drain_received(
         listener,
         &mut receive_rx,
         &mut receivers,
+        &mut interest_started_us,
+        &config,
+        media_frame_at(media_start, Instant::now()),
         clock_start,
         &mut counters,
+        &mut receiver_creations,
+        &mut receiver_reuses,
+        &mut receiver_pool,
     )?;
     let mut result = ListenerResult {
+        participant: listener,
         counters,
+        active_receiver_count: receivers.iter().flatten().count(),
+        receiver_creations,
+        receiver_reuses,
+        receiver_retirements,
+        max_concurrent_receivers,
+        max_receiver_pool,
         ..Default::default()
     };
-    for receiver in receivers.iter().flatten() {
-        let stats = receiver.stats();
-        result.concealed_samples = result
-            .concealed_samples
-            .saturating_add(stats.concealed_samples);
-        result.receiver_errors += usize::from(stats.sticky_error.is_some());
-        result.max_current_buffer_ms = result
-            .max_current_buffer_ms
-            .max(stats.current_buffer_size_ms);
-        result.max_target_delay_ms = result.max_target_delay_ms.max(stats.target_delay_ms);
-    }
-
     let delivery_deadline = Instant::now() + DELIVERY_GRACE;
     while Instant::now() < delivery_deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -596,20 +954,42 @@ async fn run_listener(
             listener,
             &mut receive_rx,
             &mut receivers,
+            &mut interest_started_us,
+            &config,
+            media_frame_at(media_start, Instant::now()),
             clock_start,
             &mut result.counters,
+            &mut result.receiver_creations,
+            &mut result.receiver_reuses,
+            &mut receiver_pool,
         )?;
     }
+    result.active_receiver_count = receivers.iter().flatten().count();
+    result.max_concurrent_receivers = result
+        .max_concurrent_receivers
+        .max(result.active_receiver_count);
+    result.max_receiver_pool = result.max_receiver_pool.max(receiver_pool.len());
+    for slot in receivers
+        .iter_mut()
+        .flatten()
+        .chain(receiver_pool.iter_mut())
+    {
+        collect_receiver_totals(slot, &mut receiver_totals);
+    }
+    result.concealed_samples = receiver_totals.concealed_samples;
+    result.receiver_errors = receiver_totals.receiver_errors;
+    result.max_current_buffer_ms = receiver_totals.max_current_buffer_ms;
+    result.max_target_delay_ms = receiver_totals.max_target_delay_ms;
     Ok(result)
 }
 
 async fn send_media(
-    participants: usize,
     duration: Duration,
     connections: Vec<Vec<Option<Connection>>>,
     mut encoders: Vec<VoiceEncoder>,
     media_start: Instant,
     clock_start: Instant,
+    config: Config,
 ) -> Result<SendCounters> {
     let media_end = media_start + duration;
     let mut ticker =
@@ -636,11 +1016,11 @@ async fn send_media(
         counters.sender_skipped_ticks += skipped_ticks;
         frame_index += skipped_ticks;
         encode_and_send(
-            participants,
             &connections,
             &mut encoders,
             frame_index,
             clock_start,
+            &config,
             &mut counters,
         )?;
         frame_index += 1;
@@ -649,15 +1029,15 @@ async fn send_media(
 }
 
 fn encode_and_send(
-    participants: usize,
     connections: &[Vec<Option<Connection>>],
     encoders: &mut [VoiceEncoder],
     frame_index: u64,
     clock_start: Instant,
+    config: &Config,
     counters: &mut SendCounters,
 ) -> Result<()> {
     for (speaker, encoder) in encoders.iter_mut().enumerate() {
-        let active = talker_active(frame_index, speaker);
+        let active = speaker_active(config, frame_index, speaker);
         let pcm = speech_frame(frame_index, speaker, active);
         encoder.push_pcm(&pcm);
         let Some(packet) = encoder.poll_packet()? else {
@@ -668,10 +1048,22 @@ fn encode_and_send(
         let sent_at_us = clock_start.elapsed().as_micros() as u64;
         let mut wire = Vec::with_capacity(ENVELOPE_HEADER_LEN + VoicePacket::HEADER_LEN + 512);
         wire.extend_from_slice(&sent_at_us.to_be_bytes());
+        wire.extend_from_slice(&frame_index.to_be_bytes());
         packet.encode_to_bytes(&mut wire);
         let wire = Bytes::from(wire);
-        for (listener, connection) in connections[speaker].iter().enumerate().take(participants) {
+        let fanout_start = Instant::now();
+        for (listener, connection) in connections[speaker]
+            .iter()
+            .enumerate()
+            .take(config.participants)
+        {
             if listener == speaker {
+                continue;
+            }
+            if config.scenario == Scenario::GameInterest
+                && config.delivery == Delivery::SenderFiltered
+                && !listener_interested(config, frame_index, speaker, listener)
+            {
                 continue;
             }
             let connection = connection
@@ -685,16 +1077,26 @@ fn encode_and_send(
                 Err(_) => counters.send_errors += 1,
             }
         }
+        counters
+            .fanout_spans_us
+            .push(fanout_start.elapsed().as_micros() as u64);
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Hot-path state is borrowed separately to avoid hidden sharing.
 fn drain_received(
     listener: usize,
     receive_rx: &mut mpsc::UnboundedReceiver<ReceivedDatagram>,
-    receivers: &mut [Option<VoiceReceiver>],
+    receivers: &mut [Option<ReceiverSlot>],
+    interest_started_us: &mut [Option<u64>],
+    config: &Config,
+    current_frame_index: u64,
     clock_start: Instant,
     counters: &mut RunCounters,
+    receiver_creations: &mut u64,
+    receiver_reuses: &mut u64,
+    receiver_pool: &mut Vec<ReceiverSlot>,
 ) -> Result<()> {
     while let Ok(datagram) = receive_rx.try_recv() {
         counters.received_datagrams += 1;
@@ -709,7 +1111,12 @@ fn drain_received(
             continue;
         }
         let sent_at_us = u64::from_be_bytes(
-            datagram.bytes[..ENVELOPE_HEADER_LEN]
+            datagram.bytes[..8]
+                .try_into()
+                .expect("checked envelope length"),
+        );
+        let frame_index = u64::from_be_bytes(
+            datagram.bytes[8..ENVELOPE_HEADER_LEN]
                 .try_into()
                 .expect("checked envelope length"),
         );
@@ -723,13 +1130,44 @@ fn drain_received(
                 continue;
             }
         };
-        let Some(receiver) = receivers.get_mut(datagram.speaker).and_then(Option::as_mut) else {
-            if listener != datagram.speaker {
-                counters.malformed_datagrams += 1;
-            }
+        if !listener_interested(config, frame_index, datagram.speaker, listener)
+            || !listener_interested(config, current_frame_index, datagram.speaker, listener)
+        {
+            counters.outside_interest_datagrams += 1;
             continue;
-        };
-        receiver.push_packet_with_now_mono(
+        }
+        counters.accepted_datagrams += 1;
+
+        let slot = receivers
+            .get_mut(datagram.speaker)
+            .context("received speaker outside receiver table")?;
+        if slot.is_none() {
+            if config.receiver_policy == ReceiverPolicy::Pool {
+                if let Some(reused) = receiver_pool.pop() {
+                    *slot = Some(reused);
+                    *receiver_reuses += 1;
+                }
+            }
+            if slot.is_none() {
+                *slot = Some(new_receiver_slot()?);
+                *receiver_creations += 1;
+            }
+        }
+        let slot = slot.as_mut().expect("receiver was just initialized");
+        if !packet.payload.is_empty() {
+            if let Some(interest_start_us) = interest_started_us
+                .get_mut(datagram.speaker)
+                .and_then(Option::take)
+            {
+                counters
+                    .interest_entry_to_first_media_us
+                    .push(datagram.received_at_us.saturating_sub(interest_start_us));
+            }
+        }
+        if packet.flags.contains(PacketFlags::START_OF_TALKSPURT) {
+            slot.pending_talkspurt_start_us = Some(sent_at_us);
+        }
+        slot.receiver.push_packet_with_now_mono(
             packet,
             PacketArrival {
                 received_at_mono_us: datagram.received_at_us,
@@ -740,10 +1178,180 @@ fn drain_received(
     Ok(())
 }
 
-fn pull_receivers(receivers: &mut [Option<VoiceReceiver>]) {
+fn pull_receivers(
+    listener: usize,
+    frame_index: u64,
+    config: &Config,
+    clock_start: Instant,
+    receivers: &mut [Option<ReceiverSlot>],
+    counters: &mut RunCounters,
+) {
     let mut frame = [0.0_f32; PULL_FRAME_SAMPLES];
-    for receiver in receivers.iter_mut().flatten() {
-        receiver.pull_frame(&mut frame);
+    for (speaker, slot) in receivers.iter_mut().enumerate() {
+        if !listener_interested(config, frame_index, speaker, listener) {
+            continue;
+        }
+        let Some(slot) = slot else {
+            continue;
+        };
+        slot.receiver.pull_frame(&mut frame);
+        counters.receiver_pull_samples += frame.len() as u64;
+        if slot.pending_talkspurt_start_us.is_some() && rms(&frame) > NON_SILENT_RMS {
+            let started_us = slot
+                .pending_talkspurt_start_us
+                .take()
+                .expect("checked pending start");
+            counters
+                .talkspurt_start_to_audio_us
+                .push((clock_start.elapsed().as_micros() as u64).saturating_sub(started_us));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Interest transitions update several independent measurements.
+fn sync_interest(
+    listener: usize,
+    frame_index: u64,
+    config: &Config,
+    clock_start: Instant,
+    receivers: &mut [Option<ReceiverSlot>],
+    interest_active: &mut [bool],
+    interest_started_us: &mut [Option<u64>],
+    receiver_retirements: &mut u64,
+    receiver_pool: &mut Vec<ReceiverSlot>,
+    receiver_totals: &mut ReceiverTotals,
+) -> Result<()> {
+    for speaker in 0..receivers.len() {
+        let interested = listener_interested(config, frame_index, speaker, listener);
+        if interested && !interest_active[speaker] {
+            interest_started_us[speaker] = Some(clock_start.elapsed().as_micros() as u64);
+        } else if !interested && interest_active[speaker] {
+            interest_started_us[speaker] = None;
+            if let Some(mut retired) = receivers[speaker].take() {
+                *receiver_retirements += 1;
+                collect_receiver_totals(&mut retired, receiver_totals);
+                if config.receiver_policy == ReceiverPolicy::Pool {
+                    retired.receiver.reset_stream()?;
+                    retired.pending_talkspurt_start_us = None;
+                    receiver_pool.push(retired);
+                }
+            }
+        }
+        interest_active[speaker] = interested;
+    }
+    Ok(())
+}
+
+fn media_frame_at(media_start: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(media_start)
+        .as_micros()
+        .saturating_div(SEND_TICK.as_micros()) as u64
+}
+
+fn speaker_active(config: &Config, frame_index: u64, speaker: usize) -> bool {
+    match config.scenario {
+        Scenario::Baseline => talker_active(frame_index, speaker),
+        Scenario::GameInterest => game_talker_active(config, frame_index, speaker),
+    }
+}
+
+fn game_talker_active(config: &Config, frame_index: u64, speaker: usize) -> bool {
+    let turn = frame_index / GAME_TURN_FRAMES;
+    let phase = frame_index % GAME_TURN_FRAMES;
+    let transition = (turn + config.seed) % 3;
+    for slot in 0..config.talkers {
+        let current =
+            (config.seed as usize + slot + turn as usize * config.talkers) % config.participants;
+        let current_active = match transition {
+            0 => phase < GAME_TALK_FRAMES,
+            1 | 2 => true,
+            _ => unreachable!(),
+        };
+        if current == speaker && current_active {
+            return true;
+        }
+        if transition == 1 && phase >= GAME_TURN_FRAMES - GAME_OVERLAP_FRAMES {
+            let next = (config.seed as usize + slot + (turn as usize + 1) * config.talkers)
+                % config.participants;
+            if next == speaker {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn listener_interested(config: &Config, frame_index: u64, speaker: usize, listener: usize) -> bool {
+    if speaker == listener {
+        return false;
+    }
+    if config.scenario == Scenario::Baseline {
+        return speaker < config.talkers;
+    }
+
+    let available = config.participants - 1;
+    let epoch = frame_index / GAME_INTEREST_EPOCH_FRAMES;
+    let rotation = mix64(
+        config.seed
+            ^ (speaker as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ epoch.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+    ) as usize
+        % available;
+    (0..config.interest_listeners).any(|rank| {
+        let offset = 1 + (rotation + rank) % available;
+        (speaker + offset) % config.participants == listener
+    })
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
+    ParticipantMetrics {
+        participant: listener.participant,
+        received_datagrams: listener.counters.received_datagrams,
+        accepted_datagrams: listener.counters.accepted_datagrams,
+        outside_interest_datagrams: listener.counters.outside_interest_datagrams,
+        active_receiver_count: listener.active_receiver_count,
+        receiver_creations: listener.receiver_creations,
+        receiver_reuses: listener.receiver_reuses,
+        receiver_retirements: listener.receiver_retirements,
+        max_concurrent_receivers: listener.max_concurrent_receivers,
+        max_receiver_pool: listener.max_receiver_pool,
+        receive_queue_delay_us_p95: percentile(&mut listener.counters.queue_delays_us, 95),
+        playout_skipped_ticks: listener.counters.playout_skipped_ticks,
+        playout_deadline_miss_percent: if listener.counters.playout_ticks > 0 {
+            listener.counters.playout_deadline_misses as f64
+                / listener.counters.playout_ticks as f64
+                * 100.0
+        } else {
+            0.0
+        },
+        playout_lateness_us_max: listener.counters.playout_lateness_us_max,
+        interest_entry_to_first_media_us_p95: percentile(
+            &mut listener.counters.interest_entry_to_first_media_us,
+            95,
+        ),
+        interest_entry_events: listener.counters.interest_entry_to_first_media_us.len(),
+        talkspurt_start_to_audio_us_p95: percentile(
+            &mut listener.counters.talkspurt_start_to_audio_us,
+            95,
+        ),
+        talkspurt_audio_events: listener.counters.talkspurt_start_to_audio_us.len(),
+        neteq_concealed_samples: listener.concealed_samples,
+        neteq_receiver_errors: listener.receiver_errors,
     }
 }
 
@@ -797,6 +1405,21 @@ fn process_usage() -> Result<ProcessUsage> {
     })
 }
 
+fn current_rss_kib() -> Result<i64> {
+    let status = fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .context("VmRSS missing from /proc/self/status")?;
+    let kib = line
+        .split_whitespace()
+        .nth(1)
+        .context("VmRSS value missing")?
+        .parse::<i64>()
+        .context("parse VmRSS")?;
+    Ok(kib)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,5 +1438,51 @@ mod tests {
         assert_eq!(percentile(&mut [9], 95), 9);
         assert_eq!(percentile(&mut [5, 1, 3, 2, 4], 50), 3);
         assert_eq!(percentile(&mut [5, 1, 3, 2, 4], 95), 4);
+    }
+
+    #[test]
+    fn game_schedule_rotates_through_every_participant() {
+        let config = Config {
+            participants: 32,
+            talkers: 4,
+            scenario: Scenario::GameInterest,
+            ..Config::default()
+        };
+        let frames = GAME_TURN_FRAMES * (config.participants / config.talkers) as u64;
+        for speaker in 0..config.participants {
+            assert!((0..frames).any(|frame| game_talker_active(&config, frame, speaker)));
+        }
+        for frame in 0..frames {
+            let active = (0..config.participants)
+                .filter(|speaker| game_talker_active(&config, frame, *speaker))
+                .count();
+            assert!(active <= config.talkers * 2);
+        }
+    }
+
+    #[test]
+    fn game_interest_has_exact_fanout_and_changes() {
+        let config = Config {
+            participants: 32,
+            talkers: 4,
+            scenario: Scenario::GameInterest,
+            interest_listeners: 7,
+            seed: 9,
+            ..Config::default()
+        };
+        for speaker in 0..config.participants {
+            let first = (0..config.participants)
+                .filter(|listener| listener_interested(&config, 0, speaker, *listener))
+                .collect::<Vec<_>>();
+            let second = (0..config.participants)
+                .filter(|listener| {
+                    listener_interested(&config, GAME_INTEREST_EPOCH_FRAMES, speaker, *listener)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(first.len(), config.interest_listeners);
+            assert_eq!(second.len(), config.interest_listeners);
+            assert!(!first.contains(&speaker));
+            assert_ne!(first, second);
+        }
     }
 }
