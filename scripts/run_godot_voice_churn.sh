@@ -12,6 +12,9 @@ PHASE_SECONDS="${4:-3}"
 EXPECTED_SECONDS="$(python3 -c "print(float('$PHASE_SECONDS') * 5.0 + 2.0)")"
 RECEIVER_SAFETY_SECONDS=120
 GODOT_BIN="${GODOT_BIN:-$(command -v godot || command -v godot4 || true)}"
+RECEIVER_CPUSET="${GNA_CHURN_RECEIVER_CPUSET:-}"
+LOADGEN_CPUSET="${GNA_CHURN_LOADGEN_CPUSET:-}"
+LOADGEN_NICE="${GNA_CHURN_LOADGEN_NICE:-0}"
 
 mkdir -p "$OUTPUT_DIR"
 runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/gna-churn.XXXXXX")"
@@ -48,6 +51,10 @@ endpoint="$OUTPUT_DIR/receiver_endpoint.json"
 trace="$runtime_dir/receiver_trace.jsonl"
 receiver_events="$OUTPUT_DIR/receiver_events.jsonl"
 quit_file="$OUTPUT_DIR/receiver_done_${tag}"
+receiver_prefix=()
+if [[ -n "$RECEIVER_CPUSET" ]]; then
+  receiver_prefix=(taskset -c "$RECEIVER_CPUSET")
+fi
 env PULSE_SINK="$sink" GNA_IROH_ROLE=receiver GNA_IROH_BIND_ADDR=127.0.0.1:0 \
   GNA_IROH_ENDPOINT_INFO_PATH="$endpoint" GNA_DEMO_OUTPUT_DEVICE="$sink" \
   GNA_DEMO_SPATIALIZE="${GNA_CHURN_SPATIALIZE:-1}" \
@@ -56,7 +63,7 @@ env PULSE_SINK="$sink" GNA_IROH_ROLE=receiver GNA_IROH_BIND_ADDR=127.0.0.1:0 \
   GNA_DEMO_QUIT_FILE="$quit_file" \
   GNA_DEMO_TRACE_JSONL="$trace" GNA_DEMO_EVENT_JSONL="$receiver_events" \
   /usr/bin/time -v -o "$OUTPUT_DIR/receiver_time.txt" \
-  "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
+  "${receiver_prefix[@]}" "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
   --path "$ROOT_DIR/example_iroh" --scene res://main.tscn \
   >"$OUTPUT_DIR/receiver.log" 2>&1 &
 receiver_pid=$!
@@ -79,7 +86,11 @@ python3 "$ROOT_DIR/scripts/sample_process_resources.py" "$godot_pid" \
   "$OUTPUT_DIR/receiver_resources.jsonl" &
 sampler_pid=$!
 
-"$ROOT_DIR/target/release/godot_voice_churn" "$endpoint" \
+loadgen_prefix=(nice -n "$LOADGEN_NICE")
+if [[ -n "$LOADGEN_CPUSET" ]]; then
+  loadgen_prefix+=(taskset -c "$LOADGEN_CPUSET")
+fi
+"${loadgen_prefix[@]}" "$ROOT_DIR/target/release/godot_voice_churn" "$endpoint" \
   "$OUTPUT_DIR/loadgen_events.jsonl" "$PEERS" "$ACTIVE" "$PHASE_SECONDS" \
   >"$OUTPUT_DIR/loadgen.json" 2>"$OUTPUT_DIR/loadgen.log" &
 loadgen_pid=$!
