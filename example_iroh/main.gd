@@ -38,6 +38,7 @@ var stats_timer: Timer
 var quit_timer: Timer
 var trace_file: FileAccess = null
 var event_file: FileAccess = null
+var event_records := []
 var trace_frame := 0
 var input_mode := "microphone"
 var demo_start_msec := 0
@@ -280,19 +281,21 @@ func _open_event_file() -> void:
 
 func _close_event_file() -> void:
 	if event_file != null:
+		for record in event_records:
+			event_file.store_line(JSON.stringify(record))
 		event_file.flush()
 		event_file = null
 
 func _record_event(kind: String, connected_peer: String, details: Dictionary) -> void:
 	if event_file == null:
 		return
-	event_file.store_line(JSON.stringify({
+	event_records.append({
 		"event": kind,
 		"mono_usec": Time.get_ticks_usec(),
 		"unix_usec": int(Time.get_unix_time_from_system() * 1_000_000.0),
 		"peer_id": connected_peer,
 		"details": details,
-	}))
+	})
 
 func _track_first_output() -> void:
 	for connected_peer in receive_streams:

@@ -39,10 +39,10 @@ struct Peer {
 }
 
 #[derive(Serialize)]
-struct EventRecord<'a> {
+struct EventRecord {
     mono_usec: u64,
     unix_usec: u64,
-    event: &'a str,
+    event: String,
     slot: usize,
     generation: u32,
     peer_id: String,
@@ -69,9 +69,7 @@ fn main() -> Result<()> {
         bail!("require PEERS >= 3 * ACTIVE_SPEAKERS > 0 and PHASE_SECONDS >= 1");
     }
 
-    let mut events = BufWriter::new(
-        File::create(event_path).with_context(|| format!("create event log {event_path}"))?,
-    );
+    let mut events = Vec::new();
     let setup_start = Instant::now();
     let mut peers = Vec::with_capacity(peer_count);
     for slot in 0..peer_count {
@@ -200,7 +198,7 @@ fn main() -> Result<()> {
     for peer in peers.iter_mut().flatten() {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
-    events.flush()?;
+    write_events(event_path, &events)?;
     drop(retired_tx);
     retired_peers.extend(retired_rx);
     let mut shutdown_tasks = Vec::new();
@@ -259,7 +257,7 @@ fn set_group_active(
     group: usize,
     active_speakers: usize,
     active: bool,
-    events: &mut BufWriter<File>,
+    events: &mut Vec<EventRecord>,
 ) -> Result<()> {
     for slot in group_slots(group, active_speakers) {
         let peer = peers[slot]
@@ -283,7 +281,7 @@ fn set_group_active_if_present(
     group: usize,
     active_speakers: usize,
     active: bool,
-    events: &mut BufWriter<File>,
+    events: &mut Vec<EventRecord>,
 ) -> Result<()> {
     for slot in group_slots(group, active_speakers) {
         let Some(peer) = peers[slot].as_mut() else {
@@ -307,7 +305,7 @@ fn leave_group(
     group: usize,
     active_speakers: usize,
     event: &str,
-    events: &mut BufWriter<File>,
+    events: &mut Vec<EventRecord>,
     retired_tx: &mpsc::Sender<Peer>,
 ) -> Result<()> {
     let mut departing = Vec::with_capacity(active_speakers);
@@ -345,20 +343,27 @@ fn group_slots(group: usize, active_speakers: usize) -> std::ops::Range<usize> {
     start..start + active_speakers
 }
 
-fn log_event(events: &mut BufWriter<File>, event: &str, peer: &Peer) -> Result<()> {
-    serde_json::to_writer(
-        &mut *events,
-        &EventRecord {
-            mono_usec: monotonic_time_us(),
-            unix_usec: unix_time_us(),
-            event,
-            slot: peer.slot,
-            generation: peer.generation,
-            peer_id: peer.service.endpoint_id().to_string(),
-            active: peer.active,
-        },
-    )?;
-    events.write_all(b"\n")?;
+fn log_event(events: &mut Vec<EventRecord>, event: &str, peer: &Peer) -> Result<()> {
+    events.push(EventRecord {
+        mono_usec: monotonic_time_us(),
+        unix_usec: unix_time_us(),
+        event: event.to_owned(),
+        slot: peer.slot,
+        generation: peer.generation,
+        peer_id: peer.service.endpoint_id().to_string(),
+        active: peer.active,
+    });
+    Ok(())
+}
+
+fn write_events(path: &str, events: &[EventRecord]) -> Result<()> {
+    let mut output =
+        BufWriter::new(File::create(path).with_context(|| format!("create event log {path}"))?);
+    for event in events {
+        serde_json::to_writer(&mut output, event)?;
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
     Ok(())
 }
 
