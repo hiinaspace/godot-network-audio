@@ -84,7 +84,9 @@ if [[ ! -s "$ENDPOINT_INFO" ]]; then
   exit 1
 fi
 
-for peer in $(seq 1 "$CONNECTED_PEERS"); do
+# Start idle population peers first so active speakers are the last processes
+# launched and remain alive through the receiver's complete measurement window.
+for peer in $(seq "$CONNECTED_PEERS" -1 1); do
   active=0
   sender_max_fps=5
   if (( peer <= ACTIVE_SPEAKERS )); then
