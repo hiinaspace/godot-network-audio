@@ -32,6 +32,7 @@ var stream
 var player
 var receive_streams := {}
 var receive_players := {}
+var retired_receive_players := []
 var audio_listener: AudioListener3D
 var camera: Camera3D
 var transport
@@ -218,16 +219,15 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 	_record_event("peer_disconnected", disconnected_peer_id, receive_streams[disconnected_peer_id].get_stats())
 	if peer_player != null:
 		peer_player.stop()
-		_record_event("peer_player_stopped", disconnected_peer_id, {})
-		peer_player.stream = null
-		_record_event("peer_player_detached", disconnected_peer_id, {})
-		peer_player.queue_free()
-		_record_event("peer_player_queued_free", disconnected_peer_id, {})
+		# Releasing a live custom AudioStream can make Godot synchronize with the
+		# audio server at the end of this frame. Under source churn that has taken
+		# seconds in headless runs. Remove it from routing now, but retain the
+		# stopped player until a non-interactive shutdown/reclamation point.
+		retired_receive_players.append(peer_player)
 	receive_players.erase(disconnected_peer_id)
 	receive_streams.erase(disconnected_peer_id)
 	peers_with_output.erase(disconnected_peer_id)
 	transport.remove_receive_stream(disconnected_peer_id)
-	_record_event("receive_stream_removed", disconnected_peer_id, {})
 	stream = null
 	player = null
 	if not receive_streams.is_empty():
@@ -267,6 +267,10 @@ func _shutdown_demo() -> void:
 	for connected_peer in receive_players:
 		receive_players[connected_peer].stop()
 		receive_players[connected_peer].stream = null
+	for retired_player in retired_receive_players:
+		retired_player.stream = null
+		retired_player.queue_free()
+	retired_receive_players.clear()
 	receive_players.clear()
 	receive_streams.clear()
 	stream = null
