@@ -293,7 +293,6 @@ func _record_event(kind: String, connected_peer: String, details: Dictionary) ->
 		"peer_id": connected_peer,
 		"details": details,
 	}))
-	event_file.flush()
 
 func _track_first_output() -> void:
 	for connected_peer in receive_streams:

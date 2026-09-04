@@ -359,7 +359,6 @@ fn log_event(events: &mut BufWriter<File>, event: &str, peer: &Peer) -> Result<(
         },
     )?;
     events.write_all(b"\n")?;
-    events.flush()?;
     Ok(())
 }
 
