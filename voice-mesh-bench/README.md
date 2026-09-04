@@ -104,6 +104,18 @@ each threshold. Intentional DTX silence is excluded. The recovery runner records
 its transition times and qdisc counters and restores loopback on success or
 failure.
 
+Run real Iroh connection churn with continuous media using:
+
+```sh
+scripts/run_voice_churn.sh target/voice-mesh/churn 12 3
+```
+
+Schema v8 closes every connection for one participant, waits for the configured
+downtime, reconnects the same endpoint, and installs fresh datagram readers.
+Affected and unaffected route gaps are reported separately. The churn runner
+uses all participants as continuous senders so DTX and interest changes cannot
+be mistaken for transport gaps.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.

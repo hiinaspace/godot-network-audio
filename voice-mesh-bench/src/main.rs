@@ -3,6 +3,7 @@ use std::{
     env, fs,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -88,6 +89,21 @@ enum MediaImpairment {
     Outage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChurnProfile {
+    None,
+    Reconnect,
+}
+
+impl ChurnProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Reconnect => "reconnect",
+        }
+    }
+}
+
 impl MediaImpairment {
     fn as_str(self) -> &'static str {
         match self {
@@ -144,6 +160,10 @@ struct Config {
     media_burst_ms: u64,
     media_outage_start_ms: u64,
     media_outage_duration_ms: u64,
+    churn_profile: ChurnProfile,
+    churn_participant: usize,
+    churn_start_ms: u64,
+    churn_downtime_ms: u64,
     seed: u64,
     runtime_workers: usize,
     output: Option<PathBuf>,
@@ -166,6 +186,10 @@ impl Default for Config {
             media_burst_ms: 60,
             media_outage_start_ms: 3_000,
             media_outage_duration_ms: 300,
+            churn_profile: ChurnProfile::None,
+            churn_participant: 0,
+            churn_start_ms: 6_000,
+            churn_downtime_ms: 1_000,
             seed: 1,
             runtime_workers: std::thread::available_parallelism()
                 .map(usize::from)
@@ -268,6 +292,23 @@ impl Config {
                     config.media_outage_duration_ms =
                         parse_next(&mut args, "--media-outage-duration-ms")?;
                 }
+                "--churn" => {
+                    let value = args.next().context("--churn requires a value")?;
+                    config.churn_profile = match value.as_str() {
+                        "none" => ChurnProfile::None,
+                        "reconnect" => ChurnProfile::Reconnect,
+                        _ => bail!("--churn must be none or reconnect, got {value}"),
+                    };
+                }
+                "--churn-participant" => {
+                    config.churn_participant = parse_next(&mut args, "--churn-participant")?;
+                }
+                "--churn-start-ms" => {
+                    config.churn_start_ms = parse_next(&mut args, "--churn-start-ms")?;
+                }
+                "--churn-downtime-ms" => {
+                    config.churn_downtime_ms = parse_next(&mut args, "--churn-downtime-ms")?;
+                }
                 "--seed" => config.seed = parse_next(&mut args, "--seed")?,
                 "--runtime-workers" => {
                     config.runtime_workers = parse_next(&mut args, "--runtime-workers")?;
@@ -320,6 +361,21 @@ impl Config {
                 bail!(
                     "boundary-oscillation requires two disjoint listener sets; use --interest-listeners no greater than (participants - 1) / 2"
                 );
+            }
+        }
+        if config.churn_profile == ChurnProfile::Reconnect {
+            if config.churn_participant >= config.participants {
+                bail!("--churn-participant must be less than participants");
+            }
+            if config.churn_downtime_ms == 0 {
+                bail!("--churn-downtime-ms must be greater than zero");
+            }
+            if config
+                .churn_start_ms
+                .saturating_add(config.churn_downtime_ms)
+                >= config.duration.as_millis() as u64
+            {
+                bail!("churn start plus downtime must be shorter than the media duration");
             }
         }
         Ok(Some(config))
@@ -403,10 +459,13 @@ impl ImpairmentRouteState {
     }
 }
 
+type ConnectionSlot = Arc<RwLock<Option<Connection>>>;
+
 struct Mesh {
     endpoints: Vec<Endpoint>,
-    connections: Vec<Vec<Option<Connection>>>,
-    readers: Vec<JoinHandle<()>>,
+    connections: Vec<Vec<ConnectionSlot>>,
+    receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
+    readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Mesh {
@@ -414,10 +473,18 @@ impl Mesh {
         for endpoint in &self.endpoints {
             endpoint.close().await;
         }
-        for reader in self.readers {
+        for reader in self.readers.lock().expect("reader lock poisoned").drain(..) {
             reader.abort();
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct ChurnResult {
+    disconnects: u64,
+    reconnects: u64,
+    reconnect_errors: u64,
+    reconnect_duration_ms: f64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -468,6 +535,16 @@ struct Metrics {
     media_burst_ms: u64,
     media_outage_start_ms: u64,
     media_outage_duration_ms: u64,
+    churn_profile: &'static str,
+    churn_participant: usize,
+    churn_start_ms: u64,
+    churn_downtime_ms: u64,
+    churn_disconnects: u64,
+    churn_reconnects: u64,
+    churn_reconnect_errors: u64,
+    churn_reconnect_duration_ms: f64,
+    affected_route_max_transport_gap_ms: f64,
+    unaffected_route_max_transport_gap_ms: f64,
     seed: u64,
     runtime_worker_threads: usize,
     opus_version: &'static str,
@@ -579,6 +656,8 @@ struct ParticipantMetrics {
     media_impairment_attempted_datagrams: u64,
     media_impairment_delivered_datagrams: u64,
     media_impairment_dropped_datagrams: u64,
+    affected_route_max_transport_gap_ms: f64,
+    unaffected_route_max_transport_gap_ms: f64,
     active_receiver_count: usize,
     receiver_creations: u64,
     receiver_reuses: u64,
@@ -635,6 +714,8 @@ struct RunCounters {
     stress_playout_ticks: u64,
     stress_playout_deadline_misses: u64,
     playout_lateness_us_max: u64,
+    affected_route_max_transport_gap_us: u64,
+    unaffected_route_max_transport_gap_us: u64,
     target_delay_observations: u64,
     target_delay_ge_100_ms_observations: u64,
     target_delay_ge_150_ms_observations: u64,
@@ -826,6 +907,12 @@ impl RunCounters {
         self.playout_lateness_us_max = self
             .playout_lateness_us_max
             .max(other.playout_lateness_us_max);
+        self.affected_route_max_transport_gap_us = self
+            .affected_route_max_transport_gap_us
+            .max(other.affected_route_max_transport_gap_us);
+        self.unaffected_route_max_transport_gap_us = self
+            .unaffected_route_max_transport_gap_us
+            .max(other.unaffected_route_max_transport_gap_us);
         self.target_delay_observations += other.target_delay_observations;
         self.target_delay_ge_100_ms_observations += other.target_delay_ge_100_ms_observations;
         self.target_delay_ge_150_ms_observations += other.target_delay_ge_150_ms_observations;
@@ -921,6 +1008,10 @@ fn print_help() {
          \x20 --media-burst-ms N      Mean burst duration for burst-loss (default 60)\n\
          \x20 --media-outage-start-ms N  Outage start on media timeline (default 3000)\n\
          \x20 --media-outage-duration-ms N  Outage length (default 300)\n\
+         \x20 --churn NAME      none or reconnect (default none)\n\
+         \x20 --churn-participant N  Participant to disconnect (default 0)\n\
+         \x20 --churn-start-ms N  Disconnect time on media timeline (default 6000)\n\
+         \x20 --churn-downtime-ms N  Time before reconnecting (default 1000)\n\
          \x20 --seed N          Deterministic game schedule seed (default 1)\n\
          \x20 --runtime-workers N  Tokio worker threads (default available CPUs)\n\
          \x20 --output PATH     Also write pretty JSON metrics to PATH\n\
@@ -963,6 +1054,19 @@ async fn run(config: Config) -> Result<Metrics> {
     tokio::time::sleep(STARTUP_SETTLE).await;
     let media_start = Instant::now() + Duration::from_millis(20);
     let media_end = media_start + config.duration;
+    let churn_task = if config.churn_profile == ChurnProfile::Reconnect {
+        Some(tokio::spawn(run_reconnect_churn(
+            mesh.endpoints.clone(),
+            mesh.connections.clone(),
+            mesh.receive_txs.clone(),
+            Arc::clone(&mesh.readers),
+            media_start,
+            clock_start,
+            config.clone(),
+        )))
+    } else {
+        None
+    };
     let listener_tasks = receive_rxs
         .into_iter()
         .zip(receiver_rows)
@@ -1021,6 +1125,11 @@ async fn run(config: Config) -> Result<Metrics> {
     for task in sender_tasks {
         send_counters.merge(task.await.context("media sender task panicked")??);
     }
+    let churn_result = if let Some(task) = churn_task {
+        task.await.context("churn task panicked")??
+    } else {
+        ChurnResult::default()
+    };
     let mut counters = RunCounters::default();
     let mut concealed_samples = 0_u64;
     let mut concealment_events = 0_u64;
@@ -1076,7 +1185,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 7,
+        schema_version: 8,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
@@ -1094,6 +1203,19 @@ async fn run(config: Config) -> Result<Metrics> {
         media_burst_ms: config.media_burst_ms,
         media_outage_start_ms: config.media_outage_start_ms,
         media_outage_duration_ms: config.media_outage_duration_ms,
+        churn_profile: config.churn_profile.as_str(),
+        churn_participant: config.churn_participant,
+        churn_start_ms: config.churn_start_ms,
+        churn_downtime_ms: config.churn_downtime_ms,
+        churn_disconnects: churn_result.disconnects,
+        churn_reconnects: churn_result.reconnects,
+        churn_reconnect_errors: churn_result.reconnect_errors,
+        churn_reconnect_duration_ms: churn_result.reconnect_duration_ms,
+        affected_route_max_transport_gap_ms: counters.affected_route_max_transport_gap_us as f64
+            / 1_000.0,
+        unaffected_route_max_transport_gap_ms: counters.unaffected_route_max_transport_gap_us
+            as f64
+            / 1_000.0,
         seed: config.seed,
         runtime_worker_threads: config.runtime_workers,
         opus_version: voice_core::opus_version(),
@@ -1269,7 +1391,13 @@ async fn build_mesh(
         endpoints.push(endpoint);
     }
 
-    let mut connections = vec![vec![None; participants]; participants];
+    let connections = (0..participants)
+        .map(|_| {
+            (0..participants)
+                .map(|_| Arc::new(RwLock::new(None)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     for connector in 0..participants {
         for acceptor in (connector + 1)..participants {
             let accepting_endpoint = endpoints[acceptor].clone();
@@ -1293,41 +1421,157 @@ async fn build_mesh(
             })
             .await
             .context("timed out building mesh connection")??;
-            connections[connector][acceptor] = Some(outbound);
-            connections[acceptor][connector] = Some(inbound);
+            *connections[connector][acceptor]
+                .write()
+                .expect("connection lock poisoned") = Some(outbound);
+            *connections[acceptor][connector]
+                .write()
+                .expect("connection lock poisoned") = Some(inbound);
         }
     }
 
-    let mut readers = Vec::with_capacity(participants * (participants - 1));
+    let readers = Arc::new(Mutex::new(Vec::with_capacity(
+        participants * (participants - 1),
+    )));
     for (listener, listener_connections) in connections.iter().enumerate() {
-        for (speaker, connection) in listener_connections.iter().enumerate() {
-            let Some(connection) = connection.clone() else {
+        for (speaker, slot) in listener_connections.iter().enumerate() {
+            let Some(connection) = slot.read().expect("connection lock poisoned").clone() else {
                 continue;
             };
-            let tx = receive_txs[listener].clone();
-            readers.push(tokio::spawn(async move {
-                while let Ok(bytes) = connection.read_datagram().await {
-                    let received_at_us = clock_start.elapsed().as_micros() as u64;
-                    if tx
-                        .send(ReceivedDatagram {
-                            speaker,
-                            bytes,
-                            received_at_us,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
+            spawn_datagram_reader(
+                connection,
+                speaker,
+                receive_txs[listener].clone(),
+                clock_start,
+                &readers,
+            );
         }
     }
 
     Ok(Mesh {
         endpoints,
         connections,
+        receive_txs,
         readers,
     })
+}
+
+fn spawn_datagram_reader(
+    connection: Connection,
+    speaker: usize,
+    tx: mpsc::UnboundedSender<ReceivedDatagram>,
+    clock_start: Instant,
+    readers: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    let reader = tokio::spawn(async move {
+        while let Ok(bytes) = connection.read_datagram().await {
+            let received_at_us = clock_start.elapsed().as_micros() as u64;
+            if tx
+                .send(ReceivedDatagram {
+                    speaker,
+                    bytes,
+                    received_at_us,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    readers.lock().expect("reader lock poisoned").push(reader);
+}
+
+async fn run_reconnect_churn(
+    endpoints: Vec<Endpoint>,
+    connections: Vec<Vec<ConnectionSlot>>,
+    receive_txs: Vec<mpsc::UnboundedSender<ReceivedDatagram>>,
+    readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    media_start: Instant,
+    clock_start: Instant,
+    config: Config,
+) -> Result<ChurnResult> {
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        media_start + Duration::from_millis(config.churn_start_ms),
+    ))
+    .await;
+
+    let participant = config.churn_participant;
+    let mut result = ChurnResult::default();
+    for (peer, peer_connections) in connections.iter().enumerate().take(config.participants) {
+        if peer == participant {
+            continue;
+        }
+        let local = connections[participant][peer]
+            .write()
+            .expect("connection lock poisoned")
+            .take();
+        let remote = peer_connections[participant]
+            .write()
+            .expect("connection lock poisoned")
+            .take();
+        if let Some(connection) = local.or(remote) {
+            connection.close(0u8.into(), b"benchmark churn");
+            result.disconnects += 1;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(config.churn_downtime_ms)).await;
+    let reconnect_start = Instant::now();
+    for (peer, peer_connections) in connections.iter().enumerate().take(config.participants) {
+        if peer == participant {
+            continue;
+        }
+        let accepting_endpoint = endpoints[peer].clone();
+        let accepting = async move {
+            let incoming = accepting_endpoint
+                .accept()
+                .await
+                .context("endpoint closed while reconnecting")?;
+            incoming.await.context("accept reconnected peer")
+        };
+        let connecting_endpoint = endpoints[participant].clone();
+        let accepting_addr = endpoints[peer].addr();
+        let connecting = async move {
+            connecting_endpoint
+                .connect(accepting_addr, ALPN)
+                .await
+                .context("reconnect churn participant")
+        };
+        let pair = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(connecting, accepting)
+        })
+        .await;
+        let (local, remote) = match pair {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(_)) | Err(_) => {
+                result.reconnect_errors += 1;
+                continue;
+            }
+        };
+        *connections[participant][peer]
+            .write()
+            .expect("connection lock poisoned") = Some(local.clone());
+        *peer_connections[participant]
+            .write()
+            .expect("connection lock poisoned") = Some(remote.clone());
+        spawn_datagram_reader(
+            local,
+            peer,
+            receive_txs[participant].clone(),
+            clock_start,
+            &readers,
+        );
+        spawn_datagram_reader(
+            remote,
+            participant,
+            receive_txs[peer].clone(),
+            clock_start,
+            &readers,
+        );
+        result.reconnects += 1;
+    }
+    result.reconnect_duration_ms = reconnect_start.elapsed().as_secs_f64() * 1_000.0;
+    Ok(result)
 }
 
 fn build_listener_receivers(
@@ -1446,6 +1690,7 @@ async fn run_listener(
     let mut impairment_routes = (0..receivers.len())
         .map(|speaker| ImpairmentRouteState::new(config.seed, speaker, listener))
         .collect::<Vec<_>>();
+    let mut last_transport_received_us = vec![None; receivers.len()];
     let mut receiver_totals = ReceiverTotals::default();
     let mut max_concurrent_receivers = receivers.iter().flatten().count();
     let mut max_receiver_pool = 0_usize;
@@ -1507,6 +1752,7 @@ async fn run_listener(
             &mut receiver_reuses,
             &mut receiver_pool,
             &mut impairment_routes,
+            &mut last_transport_received_us,
         )?;
         let drain_work_us = drain_work_start.elapsed().as_micros() as u64;
         counters.receive_drain_work_us.push(drain_work_us);
@@ -1564,6 +1810,7 @@ async fn run_listener(
         &mut receiver_reuses,
         &mut receiver_pool,
         &mut impairment_routes,
+        &mut last_transport_received_us,
     )?;
     let mut result = ListenerResult {
         participant: listener,
@@ -1593,6 +1840,7 @@ async fn run_listener(
             &mut result.receiver_reuses,
             &mut receiver_pool,
             &mut impairment_routes,
+            &mut last_transport_received_us,
         )?;
     }
     result.active_receiver_count = receivers.iter().flatten().count();
@@ -1628,7 +1876,7 @@ async fn send_media(
     speaker: usize,
     sender_count: usize,
     duration: Duration,
-    connections: Vec<Option<Connection>>,
+    connections: Vec<ConnectionSlot>,
     mut encoder: VoiceEncoder,
     media_start: Instant,
     clock_start: Instant,
@@ -1694,7 +1942,7 @@ async fn send_media(
 
 fn encode_and_send(
     speaker: usize,
-    connections: &[Option<Connection>],
+    connections: &[ConnectionSlot],
     encoder: &mut VoiceEncoder,
     frame_index: u64,
     clock_start: Instant,
@@ -1727,9 +1975,11 @@ fn encode_and_send(
         {
             continue;
         }
-        let connection = connection
-            .as_ref()
-            .context("missing full-mesh connection")?;
+        let connection = connection.read().expect("connection lock poisoned").clone();
+        let Some(connection) = connection else {
+            counters.send_errors += 1;
+            continue;
+        };
         match connection.send_datagram(wire.clone()) {
             Ok(()) => {
                 counters.sent_datagrams += 1;
@@ -1763,10 +2013,27 @@ fn drain_received(
     receiver_reuses: &mut u64,
     receiver_pool: &mut Vec<ReceiverSlot>,
     impairment_routes: &mut [ImpairmentRouteState],
+    last_transport_received_us: &mut [Option<u64>],
 ) -> Result<()> {
     while let Ok(datagram) = receive_rx.try_recv() {
         counters.received_datagrams += 1;
         counters.received_bytes += datagram.bytes.len() as u64;
+        let last_received = last_transport_received_us
+            .get_mut(datagram.speaker)
+            .context("received speaker outside transport gap table")?;
+        if let Some(previous_us) = last_received.replace(datagram.received_at_us) {
+            let gap_us = datagram.received_at_us.saturating_sub(previous_us);
+            if config.churn_profile == ChurnProfile::Reconnect
+                && (listener == config.churn_participant
+                    || datagram.speaker == config.churn_participant)
+            {
+                counters.affected_route_max_transport_gap_us =
+                    counters.affected_route_max_transport_gap_us.max(gap_us);
+            } else {
+                counters.unaffected_route_max_transport_gap_us =
+                    counters.unaffected_route_max_transport_gap_us.max(gap_us);
+            }
+        }
         let processed_at_us = clock_start.elapsed().as_micros() as u64;
         let queue_delay_us = processed_at_us.saturating_sub(datagram.received_at_us);
         counters.queue_delays_us.push(queue_delay_us);
@@ -2135,6 +2402,14 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
             .counters
             .media_impairment_delivered_datagrams,
         media_impairment_dropped_datagrams: listener.counters.media_impairment_dropped_datagrams,
+        affected_route_max_transport_gap_ms: listener.counters.affected_route_max_transport_gap_us
+            as f64
+            / 1_000.0,
+        unaffected_route_max_transport_gap_ms: listener
+            .counters
+            .unaffected_route_max_transport_gap_us
+            as f64
+            / 1_000.0,
         active_receiver_count: listener.active_receiver_count,
         receiver_creations: listener.receiver_creations,
         receiver_reuses: listener.receiver_reuses,

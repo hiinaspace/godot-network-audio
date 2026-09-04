@@ -294,6 +294,32 @@ to at most 93 ms in the delay/loss profile and 84 ms in the burst profile. All
 datagrams, every shaped profile had nonzero qdisc counters, and loopback was
 restored to `noqueue`.
 
+## Direct-mesh reconnect churn
+
+Schema v8 replaces live connection handles so a participant can leave and
+reconnect without stopping sender or listener tasks. The first matrix used
+eight continuous, non-DTX senders for 12 seconds, disconnected participant 0
+at four seconds, and tested three downtime values across three seeds. Keeping
+every route active makes transport gaps independent of game-interest and
+talkspurt schedules.
+
+| Downtime | Median reconnect | Median affected-route maximum gap | Worst unaffected-route gap | Median send errors while absent | Median concealment |
+|---:|---:|---:|---:|---:|---:|
+| none | n/a | n/a | 46 ms | 0 | 0.53% |
+| 250 ms | 16 ms | 299 ms | 46 ms | 187 | 1.10% |
+| 1000 ms | 20 ms | 1059 ms | 47 ms | 716 | 2.67% |
+| 3000 ms | 28 ms | 3059 ms | 54 ms | 2116 | 6.83% |
+
+Every churn run closed and rebuilt all seven participant connections with zero
+reconnect errors. Three datagrams total were accepted for sending immediately
+before a connection close but did not arrive; all other successful sends were
+delivered. Unaffected-route gaps remained close to the clean scheduler tail,
+with no evidence that reconnecting one peer disrupted the rest of the mesh.
+NetEq reported zero errors, target delay stayed at or below 80 ms, and the worst
+buffer peak was 127 ms. Join with a new endpoint identity and permanent leave
+remain distinct lifecycle cases; this result covers temporary disconnect and
+same-endpoint reconnect.
+
 Raw results are on `gna-sim` under:
 
 ```text
@@ -313,4 +339,5 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v1/
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v2/
 /work/projects/godot-network-audio/target/voice-mesh/recovery-netem-v3/
+/work/projects/godot-network-audio/target/voice-mesh/churn-v2/
 ```

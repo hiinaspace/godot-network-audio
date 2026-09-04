@@ -183,7 +183,11 @@ output.
    node turnover is now the higher-value next test.
 5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the
-   recovering participant.
+   recovering participant. **In progress:** schema v8 closes and replaces live
+   connection handles. Across nine eight-peer reconnect runs, all seven links
+   rebuilt in 16-28 ms median with zero reconnect/NetEq errors. Affected gaps
+   tracked configured downtime while the worst unaffected gap was 54 ms versus
+   46 ms clean. Add new-identity join/replacement and permanent leave next.
 6. Run the same timelines through a static forwarding node. Compare direct and
    forwarded end-to-playout delay, endpoint CPU/upload, forwarder CPU/traffic,
    collateral impact, and behavior when the forwarder stalls or disappears.
