@@ -57,6 +57,8 @@ struct SharedStreamState {
     preemptive_expand_per_sec_milli: AtomicU32,
     normal_per_sec_milli: AtomicU32,
     concealed_samples: AtomicU64,
+    mixed_output_frames: AtomicU64,
+    non_silent_output_frames: AtomicU64,
     consecutive_failures: AtomicU32,
     intentional_silence: AtomicBool,
     playing: AtomicBool,
@@ -86,6 +88,8 @@ impl SharedStreamState {
             preemptive_expand_per_sec_milli: AtomicU32::new(0),
             normal_per_sec_milli: AtomicU32::new(0),
             concealed_samples: AtomicU64::new(0),
+            mixed_output_frames: AtomicU64::new(0),
+            non_silent_output_frames: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             intentional_silence: AtomicBool::new(false),
             playing: AtomicBool::new(false),
@@ -111,6 +115,8 @@ impl SharedStreamState {
             .store(0, Ordering::Relaxed);
         self.normal_per_sec_milli.store(0, Ordering::Relaxed);
         self.concealed_samples.store(0, Ordering::Relaxed);
+        self.mixed_output_frames.store(0, Ordering::Relaxed);
+        self.non_silent_output_frames.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.intentional_silence.store(false, Ordering::Relaxed);
     }
@@ -395,6 +401,14 @@ impl AudioStreamNetwork {
             self.shared.concealed_samples.load(Ordering::Relaxed) as i64,
         );
         dict.set(
+            "mixed_output_frames",
+            self.shared.mixed_output_frames.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "non_silent_output_frames",
+            self.shared.non_silent_output_frames.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
             "consecutive_failures",
             self.shared.consecutive_failures.load(Ordering::Relaxed),
         );
@@ -491,6 +505,16 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
 
         self.drain_packets_into_receiver();
         self.fill_output_frames(out);
+        self.shared
+            .mixed_output_frames
+            .fetch_add(frame_count as u64, Ordering::Relaxed);
+        let non_silent_frames = out
+            .iter()
+            .filter(|frame| frame.left.abs().max(frame.right.abs()) > 1.0e-5)
+            .count() as u64;
+        self.shared
+            .non_silent_output_frames
+            .fetch_add(non_silent_frames, Ordering::Relaxed);
 
         if let Some(receiver) = self.receiver.as_ref() {
             let stats = receiver.stats();

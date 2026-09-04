@@ -16,6 +16,7 @@ var selected_output_device := ""
 var endpoint_info_path := ""
 var remote_endpoint_info_path := ""
 var trace_jsonl_path := ""
+var event_jsonl_path := ""
 var allow_synthetic_fallback := true
 var force_synthetic := false
 var send_audio := true
@@ -35,12 +36,14 @@ var transport
 var stats_timer: Timer
 var quit_timer: Timer
 var trace_file: FileAccess = null
+var event_file: FileAccess = null
 var trace_frame := 0
 var input_mode := "microphone"
 var demo_start_msec := 0
 var phase := 0.0
 var send_accumulator := 0.0
 var peer_id := ""
+var peers_with_output := {}
 
 func _ready() -> void:
 	demo_start_msec = Time.get_ticks_msec()
@@ -49,6 +52,7 @@ func _ready() -> void:
 	# delivery still depends on _process(). Override with GNA_DEMO_MAX_FPS.
 	Engine.max_fps = max_fps
 	_open_trace_file()
+	_open_event_file()
 	print("iroh demo: ready role=", role)
 	print("iroh demo: current output device=", AudioServer.output_device)
 	print("iroh demo: output devices=", AudioServer.get_output_device_list())
@@ -119,6 +123,7 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if role == ROLE_RECEIVER:
 		_maybe_start_playback()
+		_track_first_output()
 	else:
 		if peer_id == "" and remote_endpoint_info_path != "":
 			_connect_remote_from_file()
@@ -164,6 +169,7 @@ func _maybe_start_playback() -> void:
 		var peer_stream = receive_streams[connected_peer]
 		if not peer_player.playing and peer_stream.queued_packet_count() >= startup_prebuffer_packets:
 			peer_player.play()
+			_record_event("playback_started", connected_peer, peer_stream.get_stats())
 
 func _on_peer_connected(connected_peer_id: String) -> void:
 	if role != ROLE_RECEIVER or receive_streams.has(connected_peer_id):
@@ -192,6 +198,7 @@ func _on_peer_connected(connected_peer_id: String) -> void:
 	add_child(peer_player)
 	receive_streams[connected_peer_id] = peer_stream
 	receive_players[connected_peer_id] = peer_player
+	_record_event("peer_connected", connected_peer_id, {})
 	if stream == null:
 		stream = peer_stream
 		player = peer_player
@@ -201,11 +208,13 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 	if role != ROLE_RECEIVER or not receive_streams.has(disconnected_peer_id):
 		return
 	var peer_player = receive_players.get(disconnected_peer_id)
+	_record_event("peer_disconnected", disconnected_peer_id, receive_streams[disconnected_peer_id].get_stats())
 	if peer_player != null:
 		peer_player.stop()
 		peer_player.stream = null
 	receive_players.erase(disconnected_peer_id)
 	receive_streams.erase(disconnected_peer_id)
+	peers_with_output.erase(disconnected_peer_id)
 	transport.remove_receive_stream(disconnected_peer_id)
 	stream = null
 	player = null
@@ -238,6 +247,7 @@ func _print_stats() -> void:
 
 func _shutdown_demo() -> void:
 	_close_trace_file()
+	_close_event_file()
 	if sender != null:
 		pass  # direct send handler is owned by the closure, nothing to disconnect
 	for connected_peer in receive_players:
@@ -257,6 +267,36 @@ func _close_trace_file() -> void:
 	if trace_file != null:
 		trace_file.flush()
 		trace_file = null
+
+func _open_event_file() -> void:
+	if event_jsonl_path == "":
+		return
+	event_file = FileAccess.open(event_jsonl_path, FileAccess.WRITE)
+
+func _close_event_file() -> void:
+	if event_file != null:
+		event_file.flush()
+		event_file = null
+
+func _record_event(kind: String, connected_peer: String, details: Dictionary) -> void:
+	if event_file == null:
+		return
+	event_file.store_line(JSON.stringify({
+		"event": kind,
+		"mono_usec": Time.get_ticks_usec(),
+		"peer_id": connected_peer,
+		"details": details,
+	}))
+	event_file.flush()
+
+func _track_first_output() -> void:
+	for connected_peer in receive_streams:
+		if peers_with_output.has(connected_peer):
+			continue
+		var peer_stats: Dictionary = receive_streams[connected_peer].get_stats()
+		if int(peer_stats.get("non_silent_output_frames", 0)) > 0:
+			peers_with_output[connected_peer] = true
+			_record_event("first_non_silent_output", connected_peer, peer_stats)
 
 func _write_trace_row(delta: float) -> void:
 	if trace_file == null or transport == null:
@@ -342,6 +382,9 @@ func _load_env_config() -> void:
 	value = OS.get_environment("GNA_DEMO_TRACE_JSONL")
 	if value != "":
 		trace_jsonl_path = value
+	value = OS.get_environment("GNA_DEMO_EVENT_JSONL")
+	if value != "":
+		event_jsonl_path = value
 	value = OS.get_environment("GNA_DEMO_INPUT_DEVICE")
 	if value != "":
 		selected_input_device = value
