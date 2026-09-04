@@ -8,6 +8,7 @@ use crate::packet::{PacketArrival, VoicePacket};
 const PAYLOAD_TYPE_OPUS: u8 = 96;
 const SSRC_FIXED: u32 = 0x474e_6175;
 const OUTPUT_FRAME_MS: u32 = 10;
+const TALKSPURT_DRAIN_ROUNDING_TOLERANCE_MS: u32 = 2;
 const TALKSPURT_RESUME_PREBUFFER_PACKETS: u32 = 2;
 const OPUS_PACKET_SAMPLES: u32 = 960;
 const DTX_DISCONTINUITY_MIN_MISSING_FRAMES: u32 = 5;
@@ -173,7 +174,12 @@ impl VoiceReceiver {
     pub fn pull_frame(&mut self, out: &mut [f32]) {
         if self.pending_silence {
             let stats = self.inner.get_statistics();
-            if stats.current_buffer_size_ms <= OUTPUT_FRAME_MS && stats.packets_awaiting_decode == 0
+            // NetEq's integer delay estimate can settle one millisecond above a
+            // nominal 10 ms frame. Do not turn that rounding residue into
+            // unbounded PLC after an explicit end marker.
+            if stats.current_buffer_size_ms
+                <= OUTPUT_FRAME_MS + TALKSPURT_DRAIN_ROUNDING_TOLERANCE_MS
+                && stats.packets_awaiting_decode == 0
             {
                 self.pending_silence = false;
                 self.intentional_silence = true;
@@ -435,6 +441,61 @@ mod tests {
         );
         assert!(stats_after.intentional_silence);
 
+        Ok(())
+    }
+
+    #[test]
+    fn long_talkspurt_does_not_stick_in_concealment_at_eleven_ms() -> AnyResult<()> {
+        let mut encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        let mut receiver = VoiceReceiver::new_with_delay_bounds(SAMPLE_RATE, 80, 120)?;
+        let mut now_us = 0_u64;
+
+        for _ in 0..150 {
+            encoder.push_pcm(&[0.1; ENCODE_FRAME_SAMPLES]);
+            if let Some(packet) = encoder.poll_packet()? {
+                receiver.push_packet_with_now_mono(
+                    packet,
+                    PacketArrival {
+                        received_at_mono_us: now_us,
+                    },
+                    now_us,
+                )?;
+            }
+            for _ in 0..2 {
+                receiver.pull_frame(&mut [0.0; PULL_FRAME_SAMPLES]);
+            }
+            now_us += 20_000;
+        }
+
+        let mut saw_end = false;
+        for _ in 0..50 {
+            encoder.push_pcm(&[0.0; ENCODE_FRAME_SAMPLES]);
+            if let Some(packet) = encoder.poll_packet()? {
+                saw_end |= packet
+                    .flags
+                    .contains(crate::packet::PacketFlags::END_OF_TALKSPURT);
+                receiver.push_packet_with_now_mono(
+                    packet,
+                    PacketArrival {
+                        received_at_mono_us: now_us,
+                    },
+                    now_us,
+                )?;
+            }
+            for _ in 0..2 {
+                receiver.pull_frame(&mut [0.0; PULL_FRAME_SAMPLES]);
+            }
+            now_us += 20_000;
+            if saw_end && receiver.stats().intentional_silence {
+                break;
+            }
+        }
+
+        assert!(saw_end, "Opus DTX never emitted an end marker");
+        assert!(
+            receiver.stats().intentional_silence,
+            "receiver kept treating an 11 ms drain residue as missing media"
+        );
         Ok(())
     }
 
