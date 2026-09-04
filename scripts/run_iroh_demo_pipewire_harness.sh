@@ -144,7 +144,8 @@ GNA_DEMO_OUTPUT_DEVICE="$RECEIVER_OUTPUT_SINK" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$TOTAL_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$RECEIVER_TRACE" \
 GNA_DEMO_MAX_FPS="${GNA_IROH_RECEIVER_MAX_FPS:-5}" \
-  "$GODOT_BIN" --path "$ROOT_DIR/example_iroh" --scene res://main.tscn --verbose \
+  "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
+  --path "$ROOT_DIR/example_iroh" --scene res://main.tscn --verbose \
   >"$RECEIVER_LOG" 2>&1 &
 RECEIVER_PID=$!
 
@@ -170,7 +171,8 @@ GNA_DEMO_OUTPUT_DEVICE="$SENDER_OUTPUT_SINK" \
 GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$TOTAL_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$SENDER_TRACE" \
-  "$GODOT_BIN" --path "$ROOT_DIR/example_iroh" --scene res://main.tscn --verbose \
+  "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
+  --path "$ROOT_DIR/example_iroh" --scene res://main.tscn --verbose \
   >"$SENDER_LOG" 2>&1 &
 SENDER_PID=$!
 

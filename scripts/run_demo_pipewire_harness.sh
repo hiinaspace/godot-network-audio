@@ -139,7 +139,8 @@ GNA_DEMO_OUTPUT_DEVICE="$OUTPUT_SINK" \
 GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK="${GNA_DEMO_ALLOW_SYNTHETIC_FALLBACK:-0}" \
 GNA_DEMO_QUIT_SECONDS="${GNA_DEMO_QUIT_SECONDS:-$RUN_SECONDS}" \
 GNA_DEMO_TRACE_JSONL="$TRACE_JSONL_PATH" \
-  "$GODOT_BIN" --path "$ROOT_DIR/example" --scene res://main.tscn --verbose \
+  "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
+  --path "$ROOT_DIR/example" --scene res://main.tscn --verbose \
   >"$LOG_PATH" 2>&1 &
 GODOT_PID=$!
 
