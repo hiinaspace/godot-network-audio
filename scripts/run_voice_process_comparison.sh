@@ -13,6 +13,9 @@ BINARY="$ROOT_DIR/target/release/voice-mesh-bench"
 RUNTIME_WORKERS="${RUNTIME_WORKERS:-8}"
 TALKERS="${TALKERS:-4}"
 INTEREST_LISTENERS="${INTEREST_LISTENERS:-7}"
+PARTICIPANT_COUNTS="${PARTICIPANT_COUNTS:-8 16 32}"
+TOPOLOGIES="${TOPOLOGIES:-direct star}"
+PROCESS_LAYOUTS="${PROCESS_LAYOUTS:-single multi}"
 
 mkdir -p "$OUTPUT_DIR"
 cargo build --release -p voice-mesh-bench
@@ -51,11 +54,12 @@ run_case() {
 }
 
 seed_end=$((SEED_START + SEEDS - 1))
-for participants in 8 16 32; do
+for participants in $PARTICIPANT_COUNTS; do
   for seed in $(seq "$SEED_START" "$seed_end"); do
-    for topology in direct star; do
-      run_case "$participants" "$topology" single "$seed"
-      run_case "$participants" "$topology" multi "$seed"
+    for topology in $TOPOLOGIES; do
+      for layout in $PROCESS_LAYOUTS; do
+        run_case "$participants" "$topology" "$layout" "$seed"
+      done
     done
   done
 done
