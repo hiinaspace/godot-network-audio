@@ -11,7 +11,7 @@ use godot_network_audio_iroh::{RemotePeer, VoiceIrohConfig, VoiceIrohService};
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use iroh_base::TransportAddr;
 use serde::{Deserialize, Serialize};
-use voice_core::{VoiceEncoder, VoiceEncoderConfig};
+use voice_core::{PacketFlags, VoiceEncoder, VoiceEncoderConfig};
 
 const FRAME_SAMPLES: usize = 960;
 const SAMPLE_RATE: f32 = 48_000.0;
@@ -34,6 +34,7 @@ struct Peer {
     slot: usize,
     generation: u32,
     active: bool,
+    closing_talkspurt: bool,
 }
 
 #[derive(Serialize)]
@@ -127,6 +128,10 @@ fn main() -> Result<()> {
         }
 
         for peer in peers.iter_mut().flatten() {
+            if !peer.active && !peer.closing_talkspurt {
+                peer.encoder.advance_dropped_frames(1);
+                continue;
+            }
             let frame = (0..FRAME_SAMPLES)
                 .map(|sample| {
                     if peer.active {
@@ -140,12 +145,16 @@ fn main() -> Result<()> {
             peer.phase_samples += FRAME_SAMPLES as u64;
             peer.encoder.push_pcm(&frame);
             if let Some(packet) = peer.encoder.poll_packet()? {
+                let ended_talkspurt = packet.flags.contains(PacketFlags::END_OF_TALKSPURT);
                 match peer
                     .service
                     .send_datagram(peer.remote, Bytes::from(packet.to_bytes()))
                 {
                     Ok(()) => sent_datagrams += 1,
                     Err(_) => send_errors += 1,
+                }
+                if ended_talkspurt {
+                    peer.closing_talkspurt = false;
                 }
             }
         }
@@ -190,6 +199,7 @@ fn connect_peer(
         slot,
         generation,
         active: false,
+        closing_talkspurt: false,
     };
     log_event(events, "joined", &peer)?;
     Ok(peer)
@@ -207,6 +217,7 @@ fn set_group_active(
             .as_mut()
             .with_context(|| format!("missing peer in slot {slot}"))?;
         if peer.active != active {
+            peer.closing_talkspurt = !active;
             peer.active = active;
             log_event(
                 events,
