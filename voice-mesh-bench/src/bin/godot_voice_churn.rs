@@ -83,6 +83,7 @@ fn main() -> Result<()> {
     let mut next_deadline = Instant::now();
     let mut sent_datagrams = 0_u64;
     let mut send_errors = 0_u64;
+    let mut shutdown_tasks = Vec::new();
 
     for tick in 0..total_frames {
         if tick == 0 {
@@ -97,6 +98,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
+                &mut shutdown_tasks,
             )?;
         } else if tick == phase_frames * 2 + 25 {
             for slot in group_slots(0, active_speakers) {
@@ -113,6 +115,7 @@ fn main() -> Result<()> {
                 active_speakers,
                 "leave_requested",
                 &mut events,
+                &mut shutdown_tasks,
             )?;
         } else if tick == phase_frames * 5 {
             set_group_active(&mut peers, 2, active_speakers, false, &mut events)?;
@@ -165,7 +168,10 @@ fn main() -> Result<()> {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
     events.flush()?;
-    shutdown_peers(peers.into_iter().flatten().collect());
+    spawn_shutdowns(peers.into_iter().flatten().collect(), &mut shutdown_tasks);
+    for task in shutdown_tasks {
+        let _ = task.join();
+    }
 
     println!(
         "{{\"peers\":{peer_count},\"active_speakers\":{active_speakers},\"phase_seconds\":{phase_seconds},\"setup_ms\":{setup_ms:.3},\"ticks\":{total_frames},\"sent_datagrams\":{sent_datagrams},\"send_errors\":{send_errors}}}"
@@ -235,6 +241,7 @@ fn leave_group(
     active_speakers: usize,
     event: &str,
     events: &mut BufWriter<File>,
+    shutdown_tasks: &mut Vec<thread::JoinHandle<()>>,
 ) -> Result<()> {
     let mut departing = Vec::with_capacity(active_speakers);
     for slot in group_slots(group, active_speakers) {
@@ -245,19 +252,19 @@ fn leave_group(
             departing.push(peer);
         }
     }
-    shutdown_peers(departing);
+    spawn_shutdowns(departing, shutdown_tasks);
     Ok(())
 }
 
-fn shutdown_peers(peers: Vec<Peer>) {
+fn spawn_shutdowns(peers: Vec<Peer>, tasks: &mut Vec<thread::JoinHandle<()>>) {
     // Each sidecar owns a runtime whose graceful endpoint close may take a few
     // hundred milliseconds. Closing a population serially makes the scenario
     // duration depend on N and can outlive the receiver gate.
-    thread::scope(|scope| {
-        for peer in peers {
-            scope.spawn(move || drop(peer));
-        }
-    });
+    tasks.extend(
+        peers
+            .into_iter()
+            .map(|peer| thread::spawn(move || drop(peer))),
+    );
 }
 
 fn group_slots(group: usize, active_speakers: usize) -> std::ops::Range<usize> {

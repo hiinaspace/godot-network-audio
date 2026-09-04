@@ -43,6 +43,11 @@ receiver_events = [
     for line in (output_dir / "receiver_events.jsonl").read_text().splitlines()
     if line
 ]
+resource_rows = [
+    json.loads(line)
+    for line in (output_dir / "receiver_resources.jsonl").read_text().splitlines()
+    if line
+]
 
 receiver_by_kind_peer = {
     (event["event"], event["peer_id"]): event for event in receiver_events
@@ -174,6 +179,21 @@ def duration_seconds(value):
 
 
 observed_seconds = duration_seconds(elapsed.group(1)) if elapsed else run_seconds
+scenario_start = min(
+    event["unix_usec"] for event in load_events if event["event"] == "talker_on"
+)
+scenario_end = min(
+    event["unix_usec"] for event in load_events if event["event"] == "shutdown_requested"
+)
+scenario_resources = [
+    row for row in resource_rows if scenario_start <= row["unix_usec"] <= scenario_end
+]
+scenario_wall_seconds = (scenario_end - scenario_start) / 1_000_000.0
+scenario_cpu_percent = 0.0
+if len(scenario_resources) >= 2 and scenario_wall_seconds > 0:
+    scenario_cpu_percent = (
+        scenario_resources[-1]["cpu_seconds"] - scenario_resources[0]["cpu_seconds"]
+    ) / scenario_wall_seconds * 100.0
 log_text = (output_dir / "receiver.log").read_text(errors="replace")
 deltas_ms = [row.get("delta_sec", 0.0) * 1000.0 for row in rows]
 last = rows[-1] if rows else {}
@@ -227,6 +247,11 @@ summary = {
     "frame_delta_ms_p99": percentile(deltas_ms, 99),
     "frame_delta_ms_max": max(deltas_ms, default=0.0),
     "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / observed_seconds * 100.0,
+    "scenario_cpu_percent_of_one_core": scenario_cpu_percent,
+    "scenario_wall_seconds": scenario_wall_seconds,
+    "scenario_max_rss_kib": max(
+        (int(row["rss_kib"]) for row in scenario_resources), default=0
+    ),
     "receiver_max_rss_kib": int(rss.group(1)) if rss else 0,
     "receiver_error_lines": sum("ERROR:" in line or "SCRIPT ERROR:" in line for line in log_text.splitlines()),
     "transport": last.get("transport", {}),

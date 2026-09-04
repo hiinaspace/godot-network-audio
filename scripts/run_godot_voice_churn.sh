@@ -25,9 +25,10 @@ module_id=""
 receiver_pid=""
 capture_pid=""
 loadgen_pid=""
+sampler_pid=""
 cleanup() {
   set +e
-  for pid in "$loadgen_pid" "$receiver_pid" "$capture_pid"; do
+  for pid in "$loadgen_pid" "$receiver_pid" "$capture_pid" "$sampler_pid"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
   done
@@ -63,6 +64,17 @@ for _ in $(seq 1 300); do
 done
 [[ -s "$endpoint" ]] || { echo "receiver endpoint unavailable" >&2; exit 1; }
 
+godot_pid=""
+for _ in $(seq 1 100); do
+  godot_pid="$(pgrep -P "$receiver_pid" | head -1 || true)"
+  [[ -n "$godot_pid" ]] && break
+  sleep 0.01
+done
+[[ -n "$godot_pid" ]] || { echo "Godot child process unavailable" >&2; exit 1; }
+python3 "$ROOT_DIR/scripts/sample_process_resources.py" "$godot_pid" \
+  "$OUTPUT_DIR/receiver_resources.jsonl" &
+sampler_pid=$!
+
 "$ROOT_DIR/target/release/godot_voice_churn" "$endpoint" \
   "$OUTPUT_DIR/loadgen_events.jsonl" "$PEERS" "$ACTIVE" "$PHASE_SECONDS" \
   >"$OUTPUT_DIR/loadgen.json" 2>"$OUTPUT_DIR/loadgen.log" &
@@ -75,6 +87,8 @@ sleep 1
 touch "$quit_file"
 wait "$receiver_pid"
 receiver_pid=""
+wait "$sampler_pid" || true
+sampler_pid=""
 kill -INT "$capture_pid" 2>/dev/null || true
 wait "$capture_pid" || true
 capture_pid=""
