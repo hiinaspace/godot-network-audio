@@ -92,6 +92,18 @@ The runner refuses to replace an unexpected loopback qdisc, checks that shaped
 profiles count packets, verifies application-observed delay, and restores
 loopback to `noqueue` even on failure.
 
+Run the game-shaped static-delay and clean-impaired-clean recovery lane with:
+
+```sh
+scripts/run_voice_recovery_netem.sh target/voice-mesh/recovery-netem 24 3
+```
+
+Schema v7 measures the percentage of active NetEq playout observations at or
+above 100 ms and 150 ms target delay, plus the longest continuous interval at
+each threshold. Intentional DTX silence is excluded. The recovery runner records
+its transition times and qdisc counters and restores loopback on success or
+failure.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.

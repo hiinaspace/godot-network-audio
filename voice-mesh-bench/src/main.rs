@@ -31,6 +31,8 @@ const SEND_TICK: Duration = Duration::from_millis(20);
 const STARTUP_SETTLE: Duration = Duration::from_millis(100);
 const DELIVERY_GRACE: Duration = Duration::from_millis(300);
 const DEADLINE_LATE_US: u64 = 2_000;
+const TARGET_DELAY_NOTICEABLE_MS: u32 = 100;
+const TARGET_DELAY_HIGH_MS: u32 = 150;
 const GAME_TURN_FRAMES: u64 = 75;
 const GAME_TALK_FRAMES: u64 = 60;
 const GAME_OVERLAP_FRAMES: u64 = 5;
@@ -555,6 +557,11 @@ struct Metrics {
     neteq_receiver_errors: usize,
     neteq_max_current_buffer_ms: u32,
     neteq_max_target_delay_ms: u32,
+    neteq_target_delay_observations: u64,
+    neteq_target_delay_ge_100_ms_percent: f64,
+    neteq_target_delay_ge_150_ms_percent: f64,
+    neteq_target_delay_ge_100_ms_max_continuous_ms: u64,
+    neteq_target_delay_ge_150_ms_max_continuous_ms: u64,
     receiver_creations: u64,
     receiver_reuses: u64,
     receiver_retirements: u64,
@@ -592,6 +599,11 @@ struct ParticipantMetrics {
     neteq_silent_concealed_samples: u64,
     neteq_late_packets_discarded: u64,
     neteq_receiver_errors: usize,
+    neteq_target_delay_observations: u64,
+    neteq_target_delay_ge_100_ms_percent: f64,
+    neteq_target_delay_ge_150_ms_percent: f64,
+    neteq_target_delay_ge_100_ms_max_continuous_ms: u64,
+    neteq_target_delay_ge_150_ms_max_continuous_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -623,6 +635,13 @@ struct RunCounters {
     stress_playout_ticks: u64,
     stress_playout_deadline_misses: u64,
     playout_lateness_us_max: u64,
+    target_delay_observations: u64,
+    target_delay_ge_100_ms_observations: u64,
+    target_delay_ge_150_ms_observations: u64,
+    target_delay_ge_100_ms_max_continuous_ticks: u64,
+    target_delay_ge_150_ms_max_continuous_ticks: u64,
+    neteq_max_current_buffer_ms: u32,
+    neteq_max_target_delay_ms: u32,
 }
 
 #[derive(Debug, Default)]
@@ -734,6 +753,8 @@ struct ReceiverSlot {
     reported_inserted_samples_for_deceleration: u64,
     reported_removed_samples_for_acceleration: u64,
     reported_error: bool,
+    target_delay_ge_100_ms_continuous_ticks: u64,
+    target_delay_ge_150_ms_continuous_ticks: u64,
 }
 
 #[derive(Debug, Default)]
@@ -805,6 +826,21 @@ impl RunCounters {
         self.playout_lateness_us_max = self
             .playout_lateness_us_max
             .max(other.playout_lateness_us_max);
+        self.target_delay_observations += other.target_delay_observations;
+        self.target_delay_ge_100_ms_observations += other.target_delay_ge_100_ms_observations;
+        self.target_delay_ge_150_ms_observations += other.target_delay_ge_150_ms_observations;
+        self.target_delay_ge_100_ms_max_continuous_ticks = self
+            .target_delay_ge_100_ms_max_continuous_ticks
+            .max(other.target_delay_ge_100_ms_max_continuous_ticks);
+        self.target_delay_ge_150_ms_max_continuous_ticks = self
+            .target_delay_ge_150_ms_max_continuous_ticks
+            .max(other.target_delay_ge_150_ms_max_continuous_ticks);
+        self.neteq_max_current_buffer_ms = self
+            .neteq_max_current_buffer_ms
+            .max(other.neteq_max_current_buffer_ms);
+        self.neteq_max_target_delay_ms = self
+            .neteq_max_target_delay_ms
+            .max(other.neteq_max_target_delay_ms);
     }
 }
 
@@ -1040,7 +1076,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 6,
+        schema_version: 7,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
@@ -1188,6 +1224,21 @@ async fn run(config: Config) -> Result<Metrics> {
         neteq_receiver_errors: receiver_errors,
         neteq_max_current_buffer_ms: max_current_buffer_ms,
         neteq_max_target_delay_ms: max_target_delay_ms,
+        neteq_target_delay_observations: counters.target_delay_observations,
+        neteq_target_delay_ge_100_ms_percent: percent(
+            counters.target_delay_ge_100_ms_observations,
+            counters.target_delay_observations,
+        ),
+        neteq_target_delay_ge_150_ms_percent: percent(
+            counters.target_delay_ge_150_ms_observations,
+            counters.target_delay_observations,
+        ),
+        neteq_target_delay_ge_100_ms_max_continuous_ms: counters
+            .target_delay_ge_100_ms_max_continuous_ticks
+            * PLAYOUT_TICK.as_millis() as u64,
+        neteq_target_delay_ge_150_ms_max_continuous_ms: counters
+            .target_delay_ge_150_ms_max_continuous_ticks
+            * PLAYOUT_TICK.as_millis() as u64,
         receiver_creations,
         receiver_reuses,
         receiver_retirements,
@@ -1306,6 +1357,8 @@ fn new_receiver_slot() -> Result<ReceiverSlot> {
         reported_inserted_samples_for_deceleration: 0,
         reported_removed_samples_for_acceleration: 0,
         reported_error: false,
+        target_delay_ge_100_ms_continuous_ticks: 0,
+        target_delay_ge_150_ms_continuous_ticks: 0,
     })
 }
 
@@ -1561,8 +1614,12 @@ async fn run_listener(
     result.inserted_samples_for_deceleration = receiver_totals.inserted_samples_for_deceleration;
     result.removed_samples_for_acceleration = receiver_totals.removed_samples_for_acceleration;
     result.receiver_errors = receiver_totals.receiver_errors;
-    result.max_current_buffer_ms = receiver_totals.max_current_buffer_ms;
-    result.max_target_delay_ms = receiver_totals.max_target_delay_ms;
+    result.max_current_buffer_ms = receiver_totals
+        .max_current_buffer_ms
+        .max(result.counters.neteq_max_current_buffer_ms);
+    result.max_target_delay_ms = receiver_totals
+        .max_target_delay_ms
+        .max(result.counters.neteq_max_target_delay_ms);
     Ok(result)
 }
 
@@ -1816,6 +1873,37 @@ fn pull_receivers(
         };
         slot.receiver.pull_frame(&mut frame);
         counters.receiver_pull_samples += frame.len() as u64;
+        let stats = slot.receiver.stats();
+        counters.neteq_max_current_buffer_ms = counters
+            .neteq_max_current_buffer_ms
+            .max(stats.current_buffer_size_ms);
+        counters.neteq_max_target_delay_ms = counters
+            .neteq_max_target_delay_ms
+            .max(stats.target_delay_ms);
+        if stats.intentional_silence {
+            slot.target_delay_ge_100_ms_continuous_ticks = 0;
+            slot.target_delay_ge_150_ms_continuous_ticks = 0;
+        } else {
+            counters.target_delay_observations += 1;
+            if stats.target_delay_ms >= TARGET_DELAY_NOTICEABLE_MS {
+                counters.target_delay_ge_100_ms_observations += 1;
+                slot.target_delay_ge_100_ms_continuous_ticks += 1;
+                counters.target_delay_ge_100_ms_max_continuous_ticks = counters
+                    .target_delay_ge_100_ms_max_continuous_ticks
+                    .max(slot.target_delay_ge_100_ms_continuous_ticks);
+            } else {
+                slot.target_delay_ge_100_ms_continuous_ticks = 0;
+            }
+            if stats.target_delay_ms >= TARGET_DELAY_HIGH_MS {
+                counters.target_delay_ge_150_ms_observations += 1;
+                slot.target_delay_ge_150_ms_continuous_ticks += 1;
+                counters.target_delay_ge_150_ms_max_continuous_ticks = counters
+                    .target_delay_ge_150_ms_max_continuous_ticks
+                    .max(slot.target_delay_ge_150_ms_continuous_ticks);
+            } else {
+                slot.target_delay_ge_150_ms_continuous_ticks = 0;
+            }
+        }
         if slot.pending_talkspurt_start_us.is_some() && rms(&frame) > NON_SILENT_RMS {
             let started_us = slot
                 .pending_talkspurt_start_us
@@ -1883,6 +1971,8 @@ fn sync_interest(
                 if config.receiver_policy == ReceiverPolicy::Pool {
                     retired.receiver.reset_stream()?;
                     retired.pending_talkspurt_start_us = None;
+                    retired.target_delay_ge_100_ms_continuous_ticks = 0;
+                    retired.target_delay_ge_150_ms_continuous_ticks = 0;
                     receiver_pool.push(retired);
                 }
             }
@@ -2080,6 +2170,23 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
         neteq_silent_concealed_samples: listener.silent_concealed_samples,
         neteq_late_packets_discarded: listener.late_packets_discarded,
         neteq_receiver_errors: listener.receiver_errors,
+        neteq_target_delay_observations: listener.counters.target_delay_observations,
+        neteq_target_delay_ge_100_ms_percent: percent(
+            listener.counters.target_delay_ge_100_ms_observations,
+            listener.counters.target_delay_observations,
+        ),
+        neteq_target_delay_ge_150_ms_percent: percent(
+            listener.counters.target_delay_ge_150_ms_observations,
+            listener.counters.target_delay_observations,
+        ),
+        neteq_target_delay_ge_100_ms_max_continuous_ms: listener
+            .counters
+            .target_delay_ge_100_ms_max_continuous_ticks
+            * PLAYOUT_TICK.as_millis() as u64,
+        neteq_target_delay_ge_150_ms_max_continuous_ms: listener
+            .counters
+            .target_delay_ge_150_ms_max_continuous_ticks
+            * PLAYOUT_TICK.as_millis() as u64,
     }
 }
 

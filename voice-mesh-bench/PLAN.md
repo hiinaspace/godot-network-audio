@@ -175,8 +175,12 @@ output.
    draining later voiced packets. Implicit restart on a newer nonempty packet
    bounds the reproduced run at 226 ms overall and 96 ms after startup. A
    separate fork fix now preserves transport arrival timestamps during NetEq
-   delay estimation. Continue with delay/jitter, recovery, capacity, and larger
-   replicated matrices while tracking the still-high target-delay tail.
+   delay estimation. Schema v7 then found and fixed an empty-histogram startup
+   bug behind the remaining target-delay tail. Across 15 clean/static-jitter/
+   recovery runs, only one 80±30 ms seed reached a 100 ms target briefly; none
+   reached 150 ms, buffers remained bounded, and recovery completed without
+   NetEq errors. Continue with capacity only when topology traffic requires it;
+   node turnover is now the higher-value next test.
 5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the
    recovering participant.

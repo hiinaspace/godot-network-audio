@@ -261,10 +261,38 @@ used `Instant::now()` at insertion instead. A focused regression with perfectly
 paced transport timestamps and temporary listener scheduling stalls produced a
 60 ms target on the old code and 20 ms after the fix. The fork now propagates
 the packet arrival time through delay tracking and history expiry. This avoids
-classifying application scheduling delay as network jitter. The game-shaped
-5% loss run can still report a 220 ms target-delay maximum on some streams; that
-remaining adaptation should be evaluated independently, but it no longer causes
-unbounded buffering.
+classifying application scheduling delay as network jitter.
+
+A schema-v7 follow-up localized the remaining 220-250 ms target-delay tail to a
+second fork issue rather than loss adaptation. The first packet recomputed the
+80 ms startup target from an empty delay histogram, whose uninitialized
+quantile selected the configured maximum until the first 500 ms resample. Fork
+commit `69c6ccb` preserves the startup target until a real sample exists. A
+clean two-second smoke changed from about half its active observations at or
+above 150 ms to zero, with a 20 ms final target.
+
+## Static jitter and recovery follow-up
+
+The guarded schema-v7 runner used three 24-second seeds per profile. Recovery
+runs were clean for six seconds, impaired for eight, then clean for ten. Target
+occupancy excludes intentional DTX silence, and buffer maxima are now sampled
+on every 10 ms playout callback rather than only at receiver retirement.
+
+| Profile | Median latency p50 / p95 | Median missing datagrams | Median concealment | Worst buffer | Worst target |
+|:---|---:|---:|---:|---:|---:|
+| Clean | 0.34 / 0.58 ms | 0 | 0.94% | 118 ms | 80 ms |
+| Static 40±10 ms | 40.22 / 56.50 ms | 0 | 1.72% | 130 ms | 80 ms |
+| Static 80±30 ms | 80.07 / 128.51 ms | 0 | 3.29% | 183 ms | 100 ms |
+| Recovery 60±20 ms + 1% loss | 0.44 / 80.37 ms | 222 | 2.41% | 148 ms | 80 ms |
+| Recovery 40±10 ms + burst loss | 0.43 / 50.50 ms | 470 | 2.90% | 128 ms | 80 ms |
+
+Only one 80±30 ms seed reached 100 ms target delay: 0.63% of its active
+observations, with a longest continuous interval of 1.27 seconds. No run
+reached 150 ms. After impairment removal, one-second buffer samples returned
+to at most 93 ms in the delay/loss profile and 84 ms in the burst profile. All
+15 runs had zero NetEq errors, pure-jitter profiles lost no application
+datagrams, every shaped profile had nonzero qdisc counters, and loopback was
+restored to `noqueue`.
 
 Raw results are on `gna-sim` under:
 
@@ -284,4 +312,5 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/transport-netem-v1/
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v1/
 /work/projects/godot-network-audio/target/voice-mesh/media-timeline-v2/
+/work/projects/godot-network-audio/target/voice-mesh/recovery-netem-v3/
 ```

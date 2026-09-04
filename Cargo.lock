@@ -974,7 +974,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2395,7 +2395,7 @@ dependencies = [
 [[package]]
 name = "neteq"
 version = "0.9.1"
-source = "git+https://github.com/hiinaspace/videocall-rs.git?rev=6e5be751964fd66376264642992662997b537e1b#6e5be751964fd66376264642992662997b537e1b"
+source = "git+https://github.com/hiinaspace/videocall-rs.git?rev=69c6ccb08afe56d0d1b1cd9e5a7de011679fa152#69c6ccb08afe56d0d1b1cd9e5a7de011679fa152"
 dependencies = [
  "axum",
  "clap",
