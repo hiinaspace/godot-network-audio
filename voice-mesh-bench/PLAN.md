@@ -166,6 +166,13 @@ output.
    non-stress deadline rate. Keep aggregate transport and endpoint playout
    interpretations separate.
 4. Apply selected steady, burst, outage, capacity, and recovery profiles.
+   **In progress:** schema v6 implements deterministic media-boundary uniform
+   loss, Gilbert-style burst loss, and clean-impaired-clean outages with explicit
+   injected-drop counters, expanded NetEq lifetime metrics, and a 1 Hz recovery
+   timeline. A guarded loopback-netem runner separately validates Iroh transport
+   delay/loss and qdisc counters. Initial replicated results reveal persistent
+   target-delay and buffer growth under 5% uniform loss; diagnose the NetEq fork
+   before adding delay/jitter, capacity, and larger matrices.
 5. Join, leave, reconnect, and replace peers while unaffected conversations
    continue. Measure collateral gaps on healthy routes separately from the
    recovering participant.

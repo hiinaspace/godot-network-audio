@@ -7,6 +7,7 @@ use std::{
 };
 
 const METRIC_SAMPLE_CAPACITY: usize = 4_096;
+const NETEQ_TIMELINE_CAPACITY_PER_PARTICIPANT: usize = 3_600;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -77,6 +78,25 @@ enum InterestProfile {
     BoundaryOscillation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaImpairment {
+    None,
+    UniformLoss,
+    BurstLoss,
+    Outage,
+}
+
+impl MediaImpairment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::UniformLoss => "uniform-loss",
+            Self::BurstLoss => "burst-loss",
+            Self::Outage => "outage",
+        }
+    }
+}
+
 impl InterestProfile {
     fn as_str(self) -> &'static str {
         match self {
@@ -117,6 +137,11 @@ struct Config {
     receiver_policy: ReceiverPolicy,
     interest_profile: InterestProfile,
     interest_listeners: usize,
+    media_impairment: MediaImpairment,
+    media_loss_percent: f64,
+    media_burst_ms: u64,
+    media_outage_start_ms: u64,
+    media_outage_duration_ms: u64,
     seed: u64,
     runtime_workers: usize,
     output: Option<PathBuf>,
@@ -134,6 +159,11 @@ impl Default for Config {
             receiver_policy: ReceiverPolicy::Retire,
             interest_profile: InterestProfile::Rotating,
             interest_listeners: 7,
+            media_impairment: MediaImpairment::None,
+            media_loss_percent: 3.0,
+            media_burst_ms: 60,
+            media_outage_start_ms: 3_000,
+            media_outage_duration_ms: 300,
             seed: 1,
             runtime_workers: std::thread::available_parallelism()
                 .map(usize::from)
@@ -210,6 +240,32 @@ impl Config {
                 "--interest-listeners" => {
                     config.interest_listeners = parse_next(&mut args, "--interest-listeners")?;
                 }
+                "--media-impairment" => {
+                    let value = args.next().context("--media-impairment requires a value")?;
+                    config.media_impairment = match value.as_str() {
+                        "none" => MediaImpairment::None,
+                        "uniform-loss" => MediaImpairment::UniformLoss,
+                        "burst-loss" => MediaImpairment::BurstLoss,
+                        "outage" => MediaImpairment::Outage,
+                        _ => bail!(
+                            "--media-impairment must be none, uniform-loss, burst-loss, or outage, got {value}"
+                        ),
+                    };
+                }
+                "--media-loss-percent" => {
+                    config.media_loss_percent = parse_next(&mut args, "--media-loss-percent")?;
+                }
+                "--media-burst-ms" => {
+                    config.media_burst_ms = parse_next(&mut args, "--media-burst-ms")?;
+                }
+                "--media-outage-start-ms" => {
+                    config.media_outage_start_ms =
+                        parse_next(&mut args, "--media-outage-start-ms")?;
+                }
+                "--media-outage-duration-ms" => {
+                    config.media_outage_duration_ms =
+                        parse_next(&mut args, "--media-outage-duration-ms")?;
+                }
                 "--seed" => config.seed = parse_next(&mut args, "--seed")?,
                 "--runtime-workers" => {
                     config.runtime_workers = parse_next(&mut args, "--runtime-workers")?;
@@ -231,6 +287,23 @@ impl Config {
         }
         if !(1..=128).contains(&config.runtime_workers) {
             bail!("--runtime-workers must be between 1 and 128");
+        }
+        if !config.media_loss_percent.is_finite()
+            || !(0.0..=100.0).contains(&config.media_loss_percent)
+        {
+            bail!("--media-loss-percent must be finite and between 0 and 100");
+        }
+        if config.media_impairment == MediaImpairment::BurstLoss
+            && (config.media_loss_percent <= 0.0
+                || config.media_loss_percent >= 100.0
+                || config.media_burst_ms < SEND_TICK.as_millis() as u64)
+        {
+            bail!("burst loss requires 0 < --media-loss-percent < 100 and --media-burst-ms >= 20");
+        }
+        if config.media_impairment == MediaImpairment::Outage
+            && config.media_outage_duration_ms == 0
+        {
+            bail!("outage requires --media-outage-duration-ms greater than zero");
         }
         if config.scenario == Scenario::GameInterest {
             if config.interest_listeners == 0 || config.interest_listeners >= config.participants {
@@ -270,6 +343,64 @@ struct ReceivedDatagram {
     received_at_us: u64,
 }
 
+#[derive(Debug)]
+struct ImpairmentRouteState {
+    rng_state: u64,
+    burst_bad: bool,
+}
+
+impl ImpairmentRouteState {
+    fn new(seed: u64, speaker: usize, listener: usize) -> Self {
+        Self {
+            rng_state: mix64(
+                seed ^ (speaker as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ (listener as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9),
+            ),
+            burst_bad: false,
+        }
+    }
+
+    fn should_drop(&mut self, config: &Config, frame_index: u64) -> bool {
+        match config.media_impairment {
+            MediaImpairment::None => false,
+            MediaImpairment::UniformLoss => self.random_unit() < config.media_loss_percent / 100.0,
+            MediaImpairment::BurstLoss => {
+                let mean_burst_packets =
+                    (config.media_burst_ms as f64 / SEND_TICK.as_millis() as f64).max(1.0);
+                let exit_probability = 1.0 / mean_burst_packets;
+                let loss_fraction = config.media_loss_percent / 100.0;
+                let enter_probability =
+                    (loss_fraction * exit_probability / (1.0 - loss_fraction)).min(1.0);
+                if self.burst_bad {
+                    if self.random_unit() < exit_probability {
+                        self.burst_bad = false;
+                        false
+                    } else {
+                        true
+                    }
+                } else if self.random_unit() < enter_probability {
+                    self.burst_bad = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            MediaImpairment::Outage => {
+                let packet_time_ms = frame_index.saturating_mul(SEND_TICK.as_millis() as u64);
+                let outage_end = config
+                    .media_outage_start_ms
+                    .saturating_add(config.media_outage_duration_ms);
+                (config.media_outage_start_ms..outage_end).contains(&packet_time_ms)
+            }
+        }
+    }
+
+    fn random_unit(&mut self) -> f64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mix64(self.rng_state) as f64 / u64::MAX as f64
+    }
+}
+
 struct Mesh {
     endpoints: Vec<Endpoint>,
     connections: Vec<Vec<Option<Connection>>>,
@@ -303,6 +434,16 @@ struct RssSample {
     allocator_mmap_kib: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct NetEqTimelineSample {
+    participant: usize,
+    elapsed_seconds: f64,
+    active_receivers: usize,
+    current_buffer_ms_max: u32,
+    target_delay_ms_max: u32,
+    concealed_samples: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct AllocatorUsage {
     arena_kib: u64,
@@ -320,6 +461,11 @@ struct Metrics {
     delivery: &'static str,
     receiver_policy: &'static str,
     interest_profile: &'static str,
+    media_impairment: &'static str,
+    media_loss_percent: f64,
+    media_burst_ms: u64,
+    media_outage_start_ms: u64,
+    media_outage_duration_ms: u64,
     seed: u64,
     runtime_worker_threads: usize,
     opus_version: &'static str,
@@ -340,6 +486,7 @@ struct Metrics {
     current_rss_kib_after_setup: i64,
     current_rss_kib_after_media: i64,
     rss_samples: Vec<RssSample>,
+    neteq_timeline: Vec<NetEqTimelineSample>,
     sender_ticks: u64,
     sender_callbacks: u64,
     sender_skipped_ticks: u64,
@@ -359,6 +506,9 @@ struct Metrics {
     received_datagrams: u64,
     accepted_datagrams: u64,
     outside_interest_datagrams: u64,
+    media_impairment_attempted_datagrams: u64,
+    media_impairment_delivered_datagrams: u64,
+    media_impairment_dropped_datagrams: u64,
     malformed_datagrams: u64,
     missing_datagrams: u64,
     sent_bytes: u64,
@@ -397,6 +547,11 @@ struct Metrics {
     playout_lateness_us_max: u64,
     neteq_concealed_samples: u64,
     neteq_concealed_percent: f64,
+    neteq_concealment_events: u64,
+    neteq_silent_concealed_samples: u64,
+    neteq_late_packets_discarded: u64,
+    neteq_inserted_samples_for_deceleration: u64,
+    neteq_removed_samples_for_acceleration: u64,
     neteq_receiver_errors: usize,
     neteq_max_current_buffer_ms: u32,
     neteq_max_target_delay_ms: u32,
@@ -414,6 +569,9 @@ struct ParticipantMetrics {
     received_datagrams: u64,
     accepted_datagrams: u64,
     outside_interest_datagrams: u64,
+    media_impairment_attempted_datagrams: u64,
+    media_impairment_delivered_datagrams: u64,
+    media_impairment_dropped_datagrams: u64,
     active_receiver_count: usize,
     receiver_creations: u64,
     receiver_reuses: u64,
@@ -430,6 +588,9 @@ struct ParticipantMetrics {
     talkspurt_start_to_audio_us_p95: u64,
     talkspurt_audio_events: usize,
     neteq_concealed_samples: u64,
+    neteq_concealment_events: u64,
+    neteq_silent_concealed_samples: u64,
+    neteq_late_packets_discarded: u64,
     neteq_receiver_errors: usize,
 }
 
@@ -440,6 +601,9 @@ struct RunCounters {
     outside_interest_datagrams: u64,
     malformed_datagrams: u64,
     received_bytes: u64,
+    media_impairment_attempted_datagrams: u64,
+    media_impairment_delivered_datagrams: u64,
+    media_impairment_dropped_datagrams: u64,
     latencies_us: MetricSamples,
     queue_delays_us: MetricSamples,
     stress_queue_delays_us: MetricSamples,
@@ -543,6 +707,11 @@ struct ListenerResult {
     participant: usize,
     counters: RunCounters,
     concealed_samples: u64,
+    concealment_events: u64,
+    silent_concealed_samples: u64,
+    late_packets_discarded: u64,
+    inserted_samples_for_deceleration: u64,
+    removed_samples_for_acceleration: u64,
     receiver_errors: usize,
     max_current_buffer_ms: u32,
     max_target_delay_ms: u32,
@@ -552,18 +721,29 @@ struct ListenerResult {
     receiver_retirements: u64,
     max_concurrent_receivers: usize,
     max_receiver_pool: usize,
+    neteq_timeline: Vec<NetEqTimelineSample>,
 }
 
 struct ReceiverSlot {
     receiver: VoiceReceiver,
     pending_talkspurt_start_us: Option<u64>,
     reported_concealed_samples: u64,
+    reported_concealment_events: u64,
+    reported_silent_concealed_samples: u64,
+    reported_late_packets_discarded: u64,
+    reported_inserted_samples_for_deceleration: u64,
+    reported_removed_samples_for_acceleration: u64,
     reported_error: bool,
 }
 
 #[derive(Debug, Default)]
 struct ReceiverTotals {
     concealed_samples: u64,
+    concealment_events: u64,
+    silent_concealed_samples: u64,
+    late_packets_discarded: u64,
+    inserted_samples_for_deceleration: u64,
+    removed_samples_for_acceleration: u64,
     receiver_errors: usize,
     max_current_buffer_ms: u32,
     max_target_delay_ms: u32,
@@ -593,6 +773,9 @@ impl RunCounters {
         self.outside_interest_datagrams += other.outside_interest_datagrams;
         self.malformed_datagrams += other.malformed_datagrams;
         self.received_bytes += other.received_bytes;
+        self.media_impairment_attempted_datagrams += other.media_impairment_attempted_datagrams;
+        self.media_impairment_delivered_datagrams += other.media_impairment_delivered_datagrams;
+        self.media_impairment_dropped_datagrams += other.media_impairment_dropped_datagrams;
         self.latencies_us.merge(other.latencies_us);
         self.queue_delays_us.merge(other.queue_delays_us);
         self.stress_queue_delays_us
@@ -697,6 +880,11 @@ fn print_help() {
          \x20 --receiver-policy NAME  retire or pool (default retire)\n\
          \x20 --interest-profile NAME rotating, crowd-burst, group-merge, or boundary-oscillation\n\
          \x20 --interest-listeners N  Interested listeners per game talker (default 7)\n\
+         \x20 --media-impairment NAME  none, uniform-loss, burst-loss, or outage\n\
+         \x20 --media-loss-percent P  Endpoint-boundary loss percentage (default 3)\n\
+         \x20 --media-burst-ms N      Mean burst duration for burst-loss (default 60)\n\
+         \x20 --media-outage-start-ms N  Outage start on media timeline (default 3000)\n\
+         \x20 --media-outage-duration-ms N  Outage length (default 300)\n\
          \x20 --seed N          Deterministic game schedule seed (default 1)\n\
          \x20 --runtime-workers N  Tokio worker threads (default available CPUs)\n\
          \x20 --output PATH     Also write pretty JSON metrics to PATH\n\
@@ -799,6 +987,11 @@ async fn run(config: Config) -> Result<Metrics> {
     }
     let mut counters = RunCounters::default();
     let mut concealed_samples = 0_u64;
+    let mut concealment_events = 0_u64;
+    let mut silent_concealed_samples = 0_u64;
+    let mut late_packets_discarded = 0_u64;
+    let mut inserted_samples_for_deceleration = 0_u64;
+    let mut removed_samples_for_acceleration = 0_u64;
     let mut receiver_errors = 0_usize;
     let mut max_current_buffer_ms = 0_u32;
     let mut max_target_delay_ms = 0_u32;
@@ -809,9 +1002,11 @@ async fn run(config: Config) -> Result<Metrics> {
     let mut max_concurrent_receivers = 0_usize;
     let mut max_receiver_pool = 0_usize;
     let mut participants_metrics = Vec::with_capacity(config.participants);
+    let mut neteq_timeline = Vec::new();
     for task in listener_tasks {
         let mut listener = task.await.context("listener task panicked")??;
         participants_metrics.push(participant_metrics(&mut listener));
+        neteq_timeline.append(&mut listener.neteq_timeline);
         active_receiver_count += listener.active_receiver_count;
         receiver_creations += listener.receiver_creations;
         receiver_reuses += listener.receiver_reuses;
@@ -820,10 +1015,24 @@ async fn run(config: Config) -> Result<Metrics> {
         max_receiver_pool = max_receiver_pool.max(listener.max_receiver_pool);
         counters.merge(listener.counters);
         concealed_samples = concealed_samples.saturating_add(listener.concealed_samples);
+        concealment_events = concealment_events.saturating_add(listener.concealment_events);
+        silent_concealed_samples =
+            silent_concealed_samples.saturating_add(listener.silent_concealed_samples);
+        late_packets_discarded =
+            late_packets_discarded.saturating_add(listener.late_packets_discarded);
+        inserted_samples_for_deceleration = inserted_samples_for_deceleration
+            .saturating_add(listener.inserted_samples_for_deceleration);
+        removed_samples_for_acceleration = removed_samples_for_acceleration
+            .saturating_add(listener.removed_samples_for_acceleration);
         receiver_errors += listener.receiver_errors;
         max_current_buffer_ms = max_current_buffer_ms.max(listener.max_current_buffer_ms);
         max_target_delay_ms = max_target_delay_ms.max(listener.max_target_delay_ms);
     }
+    neteq_timeline.sort_by(|left, right| {
+        left.participant
+            .cmp(&right.participant)
+            .then_with(|| left.elapsed_seconds.total_cmp(&right.elapsed_seconds))
+    });
 
     let cpu_seconds = after_media.cpu_seconds - after_setup.cpu_seconds;
     let media_seconds = media_wall.as_secs_f64();
@@ -831,7 +1040,7 @@ async fn run(config: Config) -> Result<Metrics> {
         .sent_datagrams
         .saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 5,
+        schema_version: 6,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         topology: "direct-full-mesh",
         scenario: config.scenario.as_str(),
@@ -844,6 +1053,11 @@ async fn run(config: Config) -> Result<Metrics> {
             Scenario::Baseline => "none",
             Scenario::GameInterest => config.interest_profile.as_str(),
         },
+        media_impairment: config.media_impairment.as_str(),
+        media_loss_percent: config.media_loss_percent,
+        media_burst_ms: config.media_burst_ms,
+        media_outage_start_ms: config.media_outage_start_ms,
+        media_outage_duration_ms: config.media_outage_duration_ms,
         seed: config.seed,
         runtime_worker_threads: config.runtime_workers,
         opus_version: voice_core::opus_version(),
@@ -874,6 +1088,7 @@ async fn run(config: Config) -> Result<Metrics> {
         current_rss_kib_after_setup,
         current_rss_kib_after_media,
         rss_samples,
+        neteq_timeline,
         sender_ticks: send_counters.sender_ticks,
         sender_callbacks: send_counters.sender_callbacks,
         sender_skipped_ticks: send_counters.sender_skipped_ticks,
@@ -893,6 +1108,9 @@ async fn run(config: Config) -> Result<Metrics> {
         received_datagrams: counters.received_datagrams,
         accepted_datagrams: counters.accepted_datagrams,
         outside_interest_datagrams: counters.outside_interest_datagrams,
+        media_impairment_attempted_datagrams: counters.media_impairment_attempted_datagrams,
+        media_impairment_delivered_datagrams: counters.media_impairment_delivered_datagrams,
+        media_impairment_dropped_datagrams: counters.media_impairment_dropped_datagrams,
         malformed_datagrams: counters.malformed_datagrams,
         missing_datagrams,
         sent_bytes: send_counters.sent_bytes,
@@ -962,6 +1180,11 @@ async fn run(config: Config) -> Result<Metrics> {
                 0.0
             }
         },
+        neteq_concealment_events: concealment_events,
+        neteq_silent_concealed_samples: silent_concealed_samples,
+        neteq_late_packets_discarded: late_packets_discarded,
+        neteq_inserted_samples_for_deceleration: inserted_samples_for_deceleration,
+        neteq_removed_samples_for_acceleration: removed_samples_for_acceleration,
         neteq_receiver_errors: receiver_errors,
         neteq_max_current_buffer_ms: max_current_buffer_ms,
         neteq_max_target_delay_ms: max_target_delay_ms,
@@ -1077,6 +1300,11 @@ fn new_receiver_slot() -> Result<ReceiverSlot> {
         receiver: VoiceReceiver::new(SAMPLE_RATE)?,
         pending_talkspurt_start_us: None,
         reported_concealed_samples: 0,
+        reported_concealment_events: 0,
+        reported_silent_concealed_samples: 0,
+        reported_late_packets_discarded: 0,
+        reported_inserted_samples_for_deceleration: 0,
+        reported_removed_samples_for_acceleration: 0,
         reported_error: false,
     })
 }
@@ -1089,6 +1317,38 @@ fn collect_receiver_totals(slot: &mut ReceiverSlot, totals: &mut ReceiverTotals)
             .saturating_sub(slot.reported_concealed_samples),
     );
     slot.reported_concealed_samples = stats.concealed_samples;
+    totals.concealment_events = totals.concealment_events.saturating_add(
+        stats
+            .concealment_events
+            .saturating_sub(slot.reported_concealment_events),
+    );
+    slot.reported_concealment_events = stats.concealment_events;
+    totals.silent_concealed_samples = totals.silent_concealed_samples.saturating_add(
+        stats
+            .silent_concealed_samples
+            .saturating_sub(slot.reported_silent_concealed_samples),
+    );
+    slot.reported_silent_concealed_samples = stats.silent_concealed_samples;
+    totals.late_packets_discarded = totals.late_packets_discarded.saturating_add(
+        stats
+            .late_packets_discarded
+            .saturating_sub(slot.reported_late_packets_discarded),
+    );
+    slot.reported_late_packets_discarded = stats.late_packets_discarded;
+    totals.inserted_samples_for_deceleration =
+        totals.inserted_samples_for_deceleration.saturating_add(
+            stats
+                .inserted_samples_for_deceleration
+                .saturating_sub(slot.reported_inserted_samples_for_deceleration),
+        );
+    slot.reported_inserted_samples_for_deceleration = stats.inserted_samples_for_deceleration;
+    totals.removed_samples_for_acceleration =
+        totals.removed_samples_for_acceleration.saturating_add(
+            stats
+                .removed_samples_for_acceleration
+                .saturating_sub(slot.reported_removed_samples_for_acceleration),
+        );
+    slot.reported_removed_samples_for_acceleration = stats.removed_samples_for_acceleration;
     if stats.sticky_error.is_some() && !slot.reported_error {
         totals.receiver_errors += 1;
         slot.reported_error = true;
@@ -1130,9 +1390,14 @@ async fn run_listener(
     let mut receiver_retirements = 0_u64;
     let mut receiver_reuses = 0_u64;
     let mut receiver_pool = Vec::new();
+    let mut impairment_routes = (0..receivers.len())
+        .map(|speaker| ImpairmentRouteState::new(config.seed, speaker, listener))
+        .collect::<Vec<_>>();
     let mut receiver_totals = ReceiverTotals::default();
     let mut max_concurrent_receivers = receivers.iter().flatten().count();
     let mut max_receiver_pool = 0_usize;
+    let mut neteq_timeline = Vec::new();
+    let mut next_neteq_sample = Duration::ZERO;
 
     while Instant::now() < media_end {
         let scheduled = ticker.tick().await;
@@ -1188,6 +1453,7 @@ async fn run_listener(
             &mut receiver_creations,
             &mut receiver_reuses,
             &mut receiver_pool,
+            &mut impairment_routes,
         )?;
         let drain_work_us = drain_work_start.elapsed().as_micros() as u64;
         counters.receive_drain_work_us.push(drain_work_us);
@@ -1217,6 +1483,19 @@ async fn run_listener(
         }
         max_concurrent_receivers = max_concurrent_receivers.max(receivers.iter().flatten().count());
         max_receiver_pool = max_receiver_pool.max(receiver_pool.len());
+        let media_elapsed = media_start.elapsed();
+        if media_elapsed >= next_neteq_sample
+            && neteq_timeline.len() < NETEQ_TIMELINE_CAPACITY_PER_PARTICIPANT
+        {
+            neteq_timeline.push(neteq_timeline_sample(
+                listener,
+                media_elapsed,
+                &receivers,
+                &receiver_pool,
+                &receiver_totals,
+            ));
+            next_neteq_sample += Duration::from_secs(1);
+        }
     }
 
     drain_received(
@@ -1231,6 +1510,7 @@ async fn run_listener(
         &mut receiver_creations,
         &mut receiver_reuses,
         &mut receiver_pool,
+        &mut impairment_routes,
     )?;
     let mut result = ListenerResult {
         participant: listener,
@@ -1241,6 +1521,7 @@ async fn run_listener(
         receiver_retirements,
         max_concurrent_receivers,
         max_receiver_pool,
+        neteq_timeline,
         ..Default::default()
     };
     let delivery_deadline = Instant::now() + DELIVERY_GRACE;
@@ -1258,6 +1539,7 @@ async fn run_listener(
             &mut result.receiver_creations,
             &mut result.receiver_reuses,
             &mut receiver_pool,
+            &mut impairment_routes,
         )?;
     }
     result.active_receiver_count = receivers.iter().flatten().count();
@@ -1273,6 +1555,11 @@ async fn run_listener(
         collect_receiver_totals(slot, &mut receiver_totals);
     }
     result.concealed_samples = receiver_totals.concealed_samples;
+    result.concealment_events = receiver_totals.concealment_events;
+    result.silent_concealed_samples = receiver_totals.silent_concealed_samples;
+    result.late_packets_discarded = receiver_totals.late_packets_discarded;
+    result.inserted_samples_for_deceleration = receiver_totals.inserted_samples_for_deceleration;
+    result.removed_samples_for_acceleration = receiver_totals.removed_samples_for_acceleration;
     result.receiver_errors = receiver_totals.receiver_errors;
     result.max_current_buffer_ms = receiver_totals.max_current_buffer_ms;
     result.max_target_delay_ms = receiver_totals.max_target_delay_ms;
@@ -1418,6 +1705,7 @@ fn drain_received(
     receiver_creations: &mut u64,
     receiver_reuses: &mut u64,
     receiver_pool: &mut Vec<ReceiverSlot>,
+    impairment_routes: &mut [ImpairmentRouteState],
 ) -> Result<()> {
     while let Ok(datagram) = receive_rx.try_recv() {
         counters.received_datagrams += 1;
@@ -1440,6 +1728,15 @@ fn drain_received(
                 .try_into()
                 .expect("checked envelope length"),
         );
+        counters.media_impairment_attempted_datagrams += 1;
+        let impairment = impairment_routes
+            .get_mut(datagram.speaker)
+            .context("received speaker outside impairment route table")?;
+        if impairment.should_drop(config, frame_index) {
+            counters.media_impairment_dropped_datagrams += 1;
+            continue;
+        }
+        counters.media_impairment_delivered_datagrams += 1;
         if stress_active(config, frame_index) {
             counters.stress_queue_delays_us.push(queue_delay_us);
         }
@@ -1528,6 +1825,36 @@ fn pull_receivers(
                 .talkspurt_start_to_audio_us
                 .push((clock_start.elapsed().as_micros() as u64).saturating_sub(started_us));
         }
+    }
+}
+
+fn neteq_timeline_sample(
+    participant: usize,
+    elapsed: Duration,
+    receivers: &[Option<ReceiverSlot>],
+    receiver_pool: &[ReceiverSlot],
+    totals: &ReceiverTotals,
+) -> NetEqTimelineSample {
+    let mut current_buffer_ms_max = 0;
+    let mut target_delay_ms_max = 0;
+    let mut concealed_samples = totals.concealed_samples;
+    for slot in receivers.iter().flatten().chain(receiver_pool) {
+        let stats = slot.receiver.stats();
+        current_buffer_ms_max = current_buffer_ms_max.max(stats.current_buffer_size_ms);
+        target_delay_ms_max = target_delay_ms_max.max(stats.target_delay_ms);
+        concealed_samples = concealed_samples.saturating_add(
+            stats
+                .concealed_samples
+                .saturating_sub(slot.reported_concealed_samples),
+        );
+    }
+    NetEqTimelineSample {
+        participant,
+        elapsed_seconds: elapsed.as_secs_f64(),
+        active_receivers: receivers.iter().flatten().count(),
+        current_buffer_ms_max,
+        target_delay_ms_max,
+        concealed_samples,
     }
 }
 
@@ -1711,6 +2038,13 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
         received_datagrams: listener.counters.received_datagrams,
         accepted_datagrams: listener.counters.accepted_datagrams,
         outside_interest_datagrams: listener.counters.outside_interest_datagrams,
+        media_impairment_attempted_datagrams: listener
+            .counters
+            .media_impairment_attempted_datagrams,
+        media_impairment_delivered_datagrams: listener
+            .counters
+            .media_impairment_delivered_datagrams,
+        media_impairment_dropped_datagrams: listener.counters.media_impairment_dropped_datagrams,
         active_receiver_count: listener.active_receiver_count,
         receiver_creations: listener.receiver_creations,
         receiver_reuses: listener.receiver_reuses,
@@ -1742,6 +2076,9 @@ fn participant_metrics(listener: &mut ListenerResult) -> ParticipantMetrics {
             .percentile(95),
         talkspurt_audio_events: listener.counters.talkspurt_start_to_audio_us.count() as usize,
         neteq_concealed_samples: listener.concealed_samples,
+        neteq_concealment_events: listener.concealment_events,
+        neteq_silent_concealed_samples: listener.silent_concealed_samples,
+        neteq_late_packets_discarded: listener.late_packets_discarded,
         neteq_receiver_errors: listener.receiver_errors,
     }
 }
@@ -1896,6 +2233,64 @@ mod tests {
         assert_eq!(left.count(), 20_000);
         assert_eq!(left.max(), 19_999);
         assert!((9_000..=11_000).contains(&left.percentile(50)));
+    }
+
+    #[test]
+    fn uniform_media_loss_is_deterministic_and_near_target() {
+        let config = Config {
+            media_impairment: MediaImpairment::UniformLoss,
+            media_loss_percent: 3.0,
+            ..Config::default()
+        };
+        let count_drops = || {
+            let mut route = ImpairmentRouteState::new(9, 2, 5);
+            (0..100_000)
+                .filter(|frame| route.should_drop(&config, *frame))
+                .count()
+        };
+
+        let drops = count_drops();
+        assert_eq!(drops, count_drops());
+        assert!((2_800..=3_200).contains(&drops));
+    }
+
+    #[test]
+    fn burst_media_loss_clusters_drops_near_target() {
+        let config = Config {
+            media_impairment: MediaImpairment::BurstLoss,
+            media_loss_percent: 5.0,
+            media_burst_ms: 60,
+            ..Config::default()
+        };
+        let mut route = ImpairmentRouteState::new(11, 3, 7);
+        let drops = (0..100_000)
+            .map(|frame| route.should_drop(&config, frame))
+            .collect::<Vec<_>>();
+        let drop_count = drops.iter().filter(|drop| **drop).count();
+        let burst_count = drops
+            .iter()
+            .enumerate()
+            .filter(|(index, drop)| **drop && (*index == 0 || !drops[*index - 1]))
+            .count();
+
+        assert!((4_500..=5_500).contains(&drop_count));
+        assert!((2.5..=3.5).contains(&(drop_count as f64 / burst_count as f64)));
+    }
+
+    #[test]
+    fn media_outage_uses_sender_timeline() {
+        let config = Config {
+            media_impairment: MediaImpairment::Outage,
+            media_outage_start_ms: 100,
+            media_outage_duration_ms: 60,
+            ..Config::default()
+        };
+        let mut route = ImpairmentRouteState::new(1, 0, 1);
+
+        let dropped = (0..10)
+            .filter(|frame| route.should_drop(&config, *frame))
+            .collect::<Vec<_>>();
+        assert_eq!(dropped, vec![5, 6, 7]);
     }
 
     #[test]

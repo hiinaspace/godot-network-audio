@@ -70,6 +70,28 @@ from mergeable deterministic samples capped at 4,096 observations per metric.
 This prevents the benchmark's diagnostics from growing with run duration; the
 JSON records the cap as `metric_sample_capacity`.
 
+Run deterministic loss/burst/outage treatments after Iroh receipt and before
+NetEq insertion with:
+
+```sh
+scripts/run_voice_media_impairment.sh target/voice-mesh/media-impairment 10 3
+```
+
+These schema-v6 results are the **media-boundary lane**: injected drops are
+reported separately and `missing_datagrams` should remain zero. They measure
+receiver/playout behavior, not Iroh robustness. Schema v6 also records a 1 Hz,
+per-participant NetEq buffer/target/concealment timeline (capped at one hour).
+
+Run the distinct Iroh transport lane on `gna-sim` with:
+
+```sh
+scripts/run_voice_transport_netem.sh target/voice-mesh/transport-netem 10
+```
+
+The runner refuses to replace an unexpected loopback qdisc, checks that shaped
+profiles count packets, verifies application-observed delay, and restores
+loopback to `noqueue` even on failure.
+
 Each virtual listener owns its own packet queue, NetEq instances, and staggered
 10 ms playback clock. This preserves the distributed cost shape of a party
 while still running all simulated clients inside one process and one pod.

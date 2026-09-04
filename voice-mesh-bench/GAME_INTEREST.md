@@ -228,6 +228,30 @@ MiB over the final two minutes, consistent with bounded receiver-pool warm-up.
 All 734,692 datagrams arrived with no send or NetEq errors, and CPU remained at
 247% of one core, essentially unchanged from the schema-v4 180-second run.
 
+## Initial impairment lanes
+
+Schema v6 separates deterministic loss after Iroh receipt from transport-path
+`tc netem`. In three-seed, 8-participant media-boundary runs, median clean
+concealment was 4.49% because rotating interest itself repeatedly warms new
+receivers. Uniform 3% loss raised it to 6.84%; 3% loss in 60 ms mean bursts
+raised it to 7.79%. A 100 ms outage was nearly absorbed at 4.95%, while 300 ms
+and 1000 ms outages reached 8.10% and 10.19%. Every transport datagram arrived,
+and all cases had zero NetEq errors.
+
+The first transport-path sweep independently validated loopback netem. A 40±10
+ms rule moved median one-way latency from 0.4 ms to 40.6 ms. Static 1% and 3%
+loss produced 68 and 185 missing application datagrams; the burst profile
+produced 191. Kernel qdisc counters recorded 106, 312, and 319 drops because
+they also include QUIC/control packets. The runner restored `lo` to `noqueue`.
+
+The new 1 Hz timeline exposed a likely NetEq-fork issue: in a matched 5% uniform
+loss seed, target delay rose from 20 ms to 220 ms and stayed there, while the
+reported current buffer peaked at 1430 ms despite a configured 250 ms maximum.
+The clean control settled to 20 ms and the 300 ms outage recovered. Packet loss
+appears to leave repeated expansion transitions accumulating buffered packets;
+this needs a focused NetEq reproduction before interpreting higher-loss quality
+or adding more impairment dimensions.
+
 Raw results are on `gna-sim` under:
 
 ```text
@@ -242,4 +266,7 @@ Raw results are on `gna-sim` under:
 /work/projects/godot-network-audio/target/voice-mesh/interest-stress-8p-all-interest/
 /work/projects/godot-network-audio/target/voice-mesh/heaptrack/
 /work/projects/godot-network-audio/target/voice-mesh/bounded-samples/
+/work/projects/godot-network-audio/target/voice-mesh/media-impairment-v2/
+/work/projects/godot-network-audio/target/voice-mesh/transport-netem-v1/
+/work/projects/godot-network-audio/target/voice-mesh/media-timeline-v1/
 ```
