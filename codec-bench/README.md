@@ -12,7 +12,9 @@ The optional argument is the number of 20 ms frames per encode measurement.
 Each bitrate is measured with DRED disabled and enabled. Both cases use 10%
 expected packet loss; the enabled case retains up to one second of DRED. The
 recovery smoke drops five consecutive packets (100 ms), parses redundancy from
-the next packet, and reports the count and RMS of generated recovery frames.
+the next packet, and reports available DRED samples, fully covered frames, and
+the count and RMS of decoder outputs. Outputs outside DRED coverage can include
+neural PLC, so decoded frames must not be equated with redundant coverage.
 
 This is a functional, CPU, and wire-size benchmark. Its deterministic
 speech-like synthetic signal is not suitable for perceptual quality claims.

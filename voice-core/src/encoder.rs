@@ -93,6 +93,8 @@ impl VoiceEncoder {
             .encoder
             .encode_float(&frame, &mut payload)
             .map_err(|e| Error::Opus(format!("encode: {e}")))?;
+        let timestamp = self.timestamp;
+        self.timestamp = self.timestamp.wrapping_add(FRAME_SAMPLES_48K_MONO as u32);
 
         // With DTX enabled, Opus may return tiny no-send packets during silence.
         if self.enable_dtx && packet_len <= 2 {
@@ -100,7 +102,7 @@ impl VoiceEncoder {
                 self.speaking = false;
                 return Ok(Some(VoicePacket {
                     seq: self.next_seq(),
-                    timestamp: self.next_timestamp(),
+                    timestamp,
                     flags: PacketFlags::from_bits(PacketFlags::END_OF_TALKSPURT),
                     payload: Vec::new(),
                 }));
@@ -117,7 +119,7 @@ impl VoiceEncoder {
 
         Ok(Some(VoicePacket {
             seq: self.next_seq(),
-            timestamp: self.next_timestamp(),
+            timestamp,
             flags,
             payload,
         }))
@@ -129,16 +131,20 @@ impl VoiceEncoder {
         let _ = self.encoder.reset_state();
     }
 
+    /// Advance the media clock for capture frames dropped before encoding.
+    ///
+    /// RTP timestamps track captured sample time, not transmitted packet count.
+    /// Sequence numbers therefore remain unchanged.
+    pub fn advance_dropped_frames(&mut self, frames: u64) {
+        self.timestamp = self
+            .timestamp
+            .wrapping_add((frames as u32).wrapping_mul(FRAME_SAMPLES_48K_MONO as u32));
+    }
+
     fn next_seq(&mut self) -> u16 {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
         seq
-    }
-
-    fn next_timestamp(&mut self) -> u32 {
-        let ts = self.timestamp;
-        self.timestamp = self.timestamp.wrapping_add(FRAME_SAMPLES_48K_MONO as u32);
-        ts
     }
 }
 
@@ -154,5 +160,49 @@ mod tests {
         let pkt = enc.poll_packet().unwrap().unwrap();
         assert!(!pkt.payload.is_empty());
         assert!(pkt.flags.contains(PacketFlags::START_OF_TALKSPURT));
+    }
+
+    #[test]
+    fn dtx_silence_advances_timestamp_without_consuming_sequences() {
+        let mut enc = VoiceEncoder::new(VoiceEncoderConfig::default()).unwrap();
+        enc.push_pcm(&[0.1; FRAME_SAMPLES_48K_MONO]);
+        let first = enc.poll_packet().unwrap().unwrap();
+
+        let silent_frames = 100_u32;
+        let mut last_silence_sequence = first.seq;
+        for _ in 0..silent_frames {
+            enc.push_pcm(&[0.0; FRAME_SAMPLES_48K_MONO]);
+            if let Some(packet) = enc.poll_packet().unwrap() {
+                last_silence_sequence = packet.seq;
+            }
+        }
+
+        enc.push_pcm(&[0.1; FRAME_SAMPLES_48K_MONO]);
+        let resumed = enc.poll_packet().unwrap().unwrap();
+        assert_eq!(
+            resumed.timestamp.wrapping_sub(first.timestamp),
+            (silent_frames + 1) * FRAME_SAMPLES_48K_MONO as u32
+        );
+        assert_eq!(resumed.seq, last_silence_sequence.wrapping_add(1));
+    }
+
+    #[test]
+    fn dropped_capture_frames_advance_only_timestamp() {
+        let mut enc = VoiceEncoder::new(VoiceEncoderConfig {
+            enable_dtx: false,
+            ..VoiceEncoderConfig::default()
+        })
+        .unwrap();
+        enc.push_pcm(&[0.1; FRAME_SAMPLES_48K_MONO]);
+        let first = enc.poll_packet().unwrap().unwrap();
+        enc.advance_dropped_frames(3);
+        enc.push_pcm(&[0.1; FRAME_SAMPLES_48K_MONO]);
+        let second = enc.poll_packet().unwrap().unwrap();
+
+        assert_eq!(second.seq, first.seq.wrapping_add(1));
+        assert_eq!(
+            second.timestamp.wrapping_sub(first.timestamp),
+            4 * FRAME_SAMPLES_48K_MONO as u32
+        );
     }
 }

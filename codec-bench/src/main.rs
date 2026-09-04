@@ -112,9 +112,10 @@ fn new_encoder(bitrate: u32, dred_duration: Option<u32>) -> Result<Encoder> {
 #[derive(serde::Serialize)]
 struct RecoveryMeasurement {
     lost_frames: usize,
-    parsed_offset_samples: i32,
-    recovered_frames: usize,
-    recovered_rms: Vec<f64>,
+    available_dred_samples: i32,
+    fully_dred_covered_frames: usize,
+    decoded_gap_frames: usize,
+    decoded_gap_rms: Vec<f64>,
     disabled_offset_samples: i32,
 }
 
@@ -149,12 +150,12 @@ fn dred_recovery_smoke(signal: &[Vec<f32>], bitrate: u32) -> Result<RecoveryMeas
         (LOST_FRAMES * FRAME_SAMPLES) as i32,
         SAMPLE_RATE as i32,
     )?;
-    let mut recovered_rms = Vec::new();
+    let mut decoded_gap_rms = Vec::new();
     if parsed_offset > 0 {
         for frame in 0..LOST_FRAMES {
             let offset = ((LOST_FRAMES - frame) * FRAME_SAMPLES) as i32;
             let recovered = decoder.dred_decode_f32(&dred, offset)?;
-            recovered_rms.push(rms(&recovered));
+            decoded_gap_rms.push(rms(&recovered));
         }
     }
 
@@ -168,9 +169,10 @@ fn dred_recovery_smoke(signal: &[Vec<f32>], bitrate: u32) -> Result<RecoveryMeas
 
     Ok(RecoveryMeasurement {
         lost_frames: LOST_FRAMES,
-        parsed_offset_samples: parsed_offset,
-        recovered_frames: recovered_rms.len(),
-        recovered_rms,
+        available_dred_samples: parsed_offset,
+        fully_dred_covered_frames: (parsed_offset.max(0) as usize / FRAME_SAMPLES).min(LOST_FRAMES),
+        decoded_gap_frames: decoded_gap_rms.len(),
+        decoded_gap_rms,
         disabled_offset_samples: disabled_offset,
     })
 }

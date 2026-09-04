@@ -18,8 +18,9 @@ Raw JSONL and whole-party JSON results are retained at
 - A DRED-capable 1.6.1 build with DRED disabled passed the representative
   32-participant game-interest smoke without transport or NetEq errors. Its
   end-to-end CPU and latency ranges overlapped 1.5.2 and are too noisy to rank.
-- DRED did not fit at the project's current 16 kb/s target. At 24 kb/s and
-  above, it recovered a scripted 100 ms loss burst in the functional smoke,
+- DRED did not fit at the project's current 16 kb/s target. At 24 kb/s it
+  carried 55 ms of history; at 32 kb/s and above it carried 95 ms. The DRED
+  decoder plus neural PLC generated output across a scripted 100 ms loss burst,
   with substantial encoder CPU cost and bitrate-dependent wire cost.
 - DRED should be treated as an adaptive policy experiment, not as a free codec
   upgrade. It requires a nonzero expected-loss setting and dedicated receive
@@ -47,17 +48,19 @@ ratios, but it is not a fair receiver-memory comparison with Debian's build.
 ## DRED smoke
 
 Each cell is the median of five 10,000-frame runs using libopus 1.6.1, 10%
-expected packet loss, VBR, and a one-second maximum DRED duration. “Recovered”
-counts generated frames for a five-packet/100 ms scripted gap; it is not a
-quality score.
+expected packet loss, VBR, and a one-second maximum DRED duration. “Coverage”
+is the history reported by `opus_dred_parse`; fully covered frames conservatively
+floor that value to 20 ms units. The decoder generated five output frames in
+each enabled case, but uncovered portions use neural PLC and are not counted as
+DRED recovery.
 
-| Target | DRED off wire | DRED on wire | Wire ratio | CPU ratio | Recovered |
+| Target | DRED off wire | DRED on wire | Wire ratio | CPU ratio | Coverage |
 |---:|---:|---:|---:|---:|---:|
-| 16 kb/s | 16.46 kb/s | 16.46 kb/s | 1.000 | 1.252 | 0 / 5 |
-| 24 kb/s | 24.42 kb/s | 28.00 kb/s | 1.147 | 1.215 | 5 / 5 |
-| 32 kb/s | 32.40 kb/s | 33.95 kb/s | 1.048 | 2.804 | 5 / 5 |
-| 48 kb/s | 48.40 kb/s | 50.25 kb/s | 1.038 | 1.480 | 5 / 5 |
-| 64 kb/s | 64.40 kb/s | 65.21 kb/s | 1.012 | 1.454 | 5 / 5 |
+| 16 kb/s | 16.46 kb/s | 16.46 kb/s | 1.000 | 1.252 | 0 ms / 0 frames |
+| 24 kb/s | 24.42 kb/s | 28.00 kb/s | 1.147 | 1.215 | 55 ms / 2 frames |
+| 32 kb/s | 32.40 kb/s | 33.95 kb/s | 1.048 | 2.804 | 95 ms / 4 frames |
+| 48 kb/s | 48.40 kb/s | 50.25 kb/s | 1.038 | 1.480 | 95 ms / 4 frames |
+| 64 kb/s | 64.40 kb/s | 65.21 kb/s | 1.012 | 1.454 | 95 ms / 4 frames |
 
 The 32 kb/s CPU discontinuity is plausible codec-mode switching and should be
 retested with recorded speech before being generalized. At 16 kb/s, libopus
@@ -91,3 +94,11 @@ numbers must not be used as a version comparison.
   rates, aligned decoded WAVs, and listening or a full-reference metric. That
   work is only warranted if DRED remains attractive after the broader harness
   review.
+
+## Upstream references
+
+- [libopus 1.6.1 release](https://opus-codec.org/release/stable/2026/01/14/libopus-1_6_1.html)
+- [libopus 1.6 feature demo](https://opus-codec.org/demo/opus-1.6/)
+- [libopus 1.6 API documentation](https://opus-codec.org/docs/opus_api-1.6.pdf)
+- [Upstream 1.6 encoder CPU report](https://github.com/xiph/opus/issues/469)
+- [Upstream 1.6 silence/DTX report](https://github.com/xiph/opus/issues/477)

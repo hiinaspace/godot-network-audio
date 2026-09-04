@@ -9,6 +9,8 @@ const PAYLOAD_TYPE_OPUS: u8 = 96;
 const SSRC_FIXED: u32 = 0x474e_6175;
 const OUTPUT_FRAME_MS: u32 = 10;
 const TALKSPURT_RESUME_PREBUFFER_PACKETS: u32 = 2;
+const OPUS_PACKET_SAMPLES: u32 = 960;
+const DTX_DISCONTINUITY_MIN_MISSING_FRAMES: u32 = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReceiverStats {
@@ -46,6 +48,8 @@ pub struct VoiceReceiver {
     end_of_talkspurt_seq: Option<u16>,
     resuming_talkspurt: bool,
     resumed_packet_count: u32,
+    last_media_seq: Option<u16>,
+    last_media_timestamp: Option<u32>,
 }
 
 impl VoiceReceiver {
@@ -82,6 +86,8 @@ impl VoiceReceiver {
             end_of_talkspurt_seq: None,
             resuming_talkspurt: false,
             resumed_packet_count: 0,
+            last_media_seq: None,
+            last_media_timestamp: None,
         })
     }
 
@@ -107,11 +113,21 @@ impl VoiceReceiver {
         let explicit_start = pkt
             .flags
             .contains(crate::packet::PacketFlags::START_OF_TALKSPURT);
+        let packet_is_newer = self
+            .last_media_seq
+            .is_none_or(|last_seq| sequence_is_newer(pkt.seq, last_seq));
+        let start_after_lost_end =
+            explicit_start && self.last_media_seq.is_some() && packet_is_newer;
+        let timestamp_discontinuity =
+            !pkt.payload.is_empty() && packet_is_newer && self.media_timestamp_has_dtx_gap(&pkt);
         let implicit_start = !pkt.payload.is_empty()
             && self
                 .end_of_talkspurt_seq
                 .is_some_and(|end_seq| sequence_is_newer(pkt.seq, end_seq));
-        if (explicit_start || implicit_start) && (self.pending_silence || self.intentional_silence)
+        if ((explicit_start || implicit_start)
+            && (self.pending_silence || self.intentional_silence))
+            || start_after_lost_end
+            || timestamp_discontinuity
         {
             self.inner.flush();
             self.pending_silence = false;
@@ -121,9 +137,10 @@ impl VoiceReceiver {
             self.resumed_packet_count = 0;
         }
 
-        if pkt
-            .flags
-            .contains(crate::packet::PacketFlags::END_OF_TALKSPURT)
+        if packet_is_newer
+            && pkt
+                .flags
+                .contains(crate::packet::PacketFlags::END_OF_TALKSPURT)
         {
             self.pending_silence = true;
             self.end_of_talkspurt_seq = Some(pkt.seq);
@@ -142,6 +159,10 @@ impl VoiceReceiver {
             self.record_failure(format!("insert_packet: {err}"));
             Error::from(err)
         })?;
+        if packet_is_newer {
+            self.last_media_seq = Some(pkt.seq);
+            self.last_media_timestamp = Some(pkt.timestamp);
+        }
         if self.resuming_talkspurt {
             self.resumed_packet_count = self.resumed_packet_count.saturating_add(1);
         }
@@ -226,6 +247,8 @@ impl VoiceReceiver {
         self.end_of_talkspurt_seq = None;
         self.resuming_talkspurt = false;
         self.resumed_packet_count = 0;
+        self.last_media_seq = None;
+        self.last_media_timestamp = None;
         self.consecutive_failures = 0;
         Ok(())
     }
@@ -247,6 +270,22 @@ impl VoiceReceiver {
             ))
             .unwrap_or(now)
         }
+    }
+
+    fn media_timestamp_has_dtx_gap(&self, pkt: &VoicePacket) -> bool {
+        let (Some(last_seq), Some(last_timestamp)) =
+            (self.last_media_seq, self.last_media_timestamp)
+        else {
+            return false;
+        };
+        let sequence_frames = u32::from(pkt.seq.wrapping_sub(last_seq));
+        if sequence_frames == 0 || sequence_frames >= (1 << 15) {
+            return false;
+        }
+        let expected_samples = sequence_frames.wrapping_mul(OPUS_PACKET_SAMPLES);
+        let actual_samples = pkt.timestamp.wrapping_sub(last_timestamp);
+        actual_samples.saturating_sub(expected_samples)
+            >= DTX_DISCONTINUITY_MIN_MISSING_FRAMES * OPUS_PACKET_SAMPLES
     }
 
     fn record_failure(&mut self, message: String) {
@@ -454,6 +493,91 @@ mod tests {
     }
 
     #[test]
+    fn explicit_start_recovers_when_end_marker_was_lost() -> AnyResult<()> {
+        let (start, _lost_end, resumed) = dtx_packet_sequence()?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+        receiver.push_packet(
+            start,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+
+        receiver.push_packet(
+            resumed[0].clone(),
+            PacketArrival {
+                received_at_mono_us: 2_000_000,
+            },
+        )?;
+        assert!(receiver.resuming_talkspurt);
+        assert_eq!(receiver.resumed_packet_count, 1);
+        receiver.push_packet(
+            resumed[1].clone(),
+            PacketArrival {
+                received_at_mono_us: 2_020_000,
+            },
+        )?;
+        assert_eq!(receiver.resumed_packet_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn timestamp_gap_recovers_when_both_markers_were_lost() -> AnyResult<()> {
+        let (start, _lost_end, resumed) = dtx_packet_sequence()?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+        receiver.push_packet(
+            start,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+
+        // Drop EOT and the flagged first resume packet. The second packet has a
+        // large media-timestamp gap but only a small transmitted-sequence gap.
+        let mut unflagged_resume = resumed[1].clone();
+        unflagged_resume.flags = crate::packet::PacketFlags::default();
+        receiver.push_packet(
+            unflagged_resume,
+            PacketArrival {
+                received_at_mono_us: 2_020_000,
+            },
+        )?;
+        assert!(receiver.resuming_talkspurt);
+        assert_eq!(receiver.resumed_packet_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_stale_end_does_not_stop_new_talkspurt() -> AnyResult<()> {
+        let (start, stale_end, resumed) = dtx_packet_sequence()?;
+        let mut receiver = VoiceReceiver::new(SAMPLE_RATE)?;
+        receiver.push_packet(
+            start,
+            PacketArrival {
+                received_at_mono_us: 0,
+            },
+        )?;
+        for (index, packet) in resumed.into_iter().enumerate() {
+            receiver.push_packet(
+                packet,
+                PacketArrival {
+                    received_at_mono_us: 2_000_000 + index as u64 * 20_000,
+                },
+            )?;
+        }
+        receiver.push_packet(
+            stale_end,
+            PacketArrival {
+                received_at_mono_us: 2_040_000,
+            },
+        )?;
+
+        assert!(!receiver.pending_silence);
+        assert!(!receiver.intentional_silence);
+        Ok(())
+    }
+
+    #[test]
     fn sequence_newer_handles_wrap_and_rejects_old_packets() {
         assert!(sequence_is_newer(0, u16::MAX));
         assert!(sequence_is_newer(11, 10));
@@ -490,6 +614,51 @@ mod tests {
         receiver.pull_frame(&mut frame);
         assert!(receiver.stats().sticky_error.is_none());
         Ok(())
+    }
+
+    fn dtx_packet_sequence() -> AnyResult<(VoicePacket, VoicePacket, [VoicePacket; 2])> {
+        let mut encoder = VoiceEncoder::new(VoiceEncoderConfig::default())?;
+        encoder.push_pcm(&[0.1; ENCODE_FRAME_SAMPLES]);
+        let start = encoder.poll_packet()?.expect("initial voice packet");
+
+        let mut end = None;
+        for _ in 0..200 {
+            encoder.push_pcm(&[0.0; ENCODE_FRAME_SAMPLES]);
+            if let Some(packet) = encoder.poll_packet()? {
+                if packet
+                    .flags
+                    .contains(crate::packet::PacketFlags::END_OF_TALKSPURT)
+                {
+                    end = Some(packet);
+                    break;
+                }
+            }
+        }
+        let end = end.expect("Opus DTX should end the talkspurt");
+
+        // Keep the media clock moving through a long no-send period.
+        for _ in 0..50 {
+            encoder.push_pcm(&[0.0; ENCODE_FRAME_SAMPLES]);
+            let _ = encoder.poll_packet()?;
+        }
+
+        let mut resumed = Vec::new();
+        for _ in 0..20 {
+            encoder.push_pcm(&[0.1; ENCODE_FRAME_SAMPLES]);
+            if let Some(packet) = encoder.poll_packet()? {
+                resumed.push(packet);
+                if resumed.len() == 2 {
+                    break;
+                }
+            }
+        }
+        let resumed: [VoicePacket; 2] = resumed
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected two resumed voice packets"))?;
+        assert!(resumed[0]
+            .flags
+            .contains(crate::packet::PacketFlags::START_OF_TALKSPURT));
+        Ok((start, end, resumed))
     }
 
     fn sine_wave_seconds(seconds: f32, hz: f32, sample_rate: u32, amplitude: f32) -> Vec<f32> {

@@ -56,6 +56,11 @@ cargo build --release -p voice-mesh-bench
 run_benchmark() {
   local run_name="$1"
   local seed="$2"
+  local ready_file="${3:-}"
+  local ready_args=()
+  if [[ -n "$ready_file" ]]; then
+    ready_args=(--media-ready-file "$ready_file")
+  fi
   "$BINARY" \
     --scenario game-interest \
     --participants "$PARTICIPANTS" \
@@ -68,6 +73,7 @@ run_benchmark() {
     --dtx on \
     --seed "$seed" \
     --runtime-workers "$RUNTIME_WORKERS" \
+    "${ready_args[@]}" \
     --output "$OUTPUT_DIR/$run_name.json" \
     >"$OUTPUT_DIR/$run_name.stdout"
 }
@@ -111,10 +117,23 @@ run_recovery() {
   local seed="$2"
   shift 2
   local run_name="${PARTICIPANTS}p-${TALKERS}t-${name}-seed${seed}"
+  local ready_file="$OUTPUT_DIR/$run_name.ready"
   remove_netem
+  rm -f "$ready_file"
   echo "running $run_name (${RUN_SECONDS}s; clean→impaired→clean)"
-  run_benchmark "$run_name" "$seed" &
+  run_benchmark "$run_name" "$seed" "$ready_file" &
   RUN_PID=$!
+  for _ in $(seq 1 3000); do
+    if [[ -s "$ready_file" ]]; then
+      break
+    fi
+    kill -0 "$RUN_PID"
+    sleep 0.01
+  done
+  if [[ ! -s "$ready_file" ]]; then
+    echo "benchmark did not report media start: $ready_file" >&2
+    return 1
+  fi
   sleep "$IMPAIRMENT_START_SECONDS"
   kill -0 "$RUN_PID"
   printf 'impairment_added_at=%s\n' "$(date --iso-8601=ns)" \

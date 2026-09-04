@@ -96,7 +96,6 @@ FIELDS = [
     "playout_lateness_us_max",
     "neteq_concealed_percent",
     "neteq_concealment_events",
-    "neteq_silent_concealed_samples",
     "neteq_late_packets_discarded",
     "neteq_inserted_samples_for_deceleration",
     "neteq_removed_samples_for_acceleration",

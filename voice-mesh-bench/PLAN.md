@@ -109,9 +109,11 @@ For every sender/listener direction, add:
 - burst/gap loss density and duration;
 - one-way transport delay and end-to-playout delay percentiles;
 - NetEq actual, target, and minimum jitter-buffer delay over time;
-- concealed and silent-concealed samples, concealment event count, discarded
-  packets, acceleration/deceleration samples, delayed-outage events, and
-  interruption count/duration;
+- concealed samples and concealment event count, discarded packets,
+  acceleration/deceleration samples, delayed-outage events, and interruption
+  count/duration. Do not use the current Rust port's silent-concealment split:
+  it labels every Expand sample as silent, unlike Chromium NetEq's actual
+  voice/noise classification;
 - time to recover target delay and concealment rate after impairment ends.
 
 ## Quality lane
@@ -143,9 +145,9 @@ output.
 **1.6.1/DRED spike complete:** the focused five-run comparison found roughly
 6% higher voiced encode cost, 17% higher mixed voice/silence cost, and 73%
 higher continuous-silence cost in 1.6.1, with unchanged packet behavior. DRED
-did not fit at 16 kb/s; at 24 kb/s and above it functionally recovered a 100 ms
-scripted gap, while adding 21-180% encoder CPU and 1-15% wire bytes depending on
-bitrate. See `OPUS_1_6_DRED_RESULTS.md`. Keep production on 1.5.2 pending the
+did not fit at 16 kb/s; it carried 55 ms of history at 24 kb/s and 95 ms at
+32 kb/s and above, while adding 21-180% encoder CPU and 1-15% wire bytes
+depending on bitrate. See `OPUS_1_6_DRED_RESULTS.md`. Keep production on 1.5.2 pending the
 broader review; recorded-speech quality work is optional follow-up rather than
 a prerequisite for the Godot scale gate.
 
@@ -205,6 +207,33 @@ a prerequisite for the Godot scale gate.
    relay, socket-buffer, and host-scheduling behavior hidden by loopback.
 8. Only then add the Godot audio-thread, source-count, spatial-mixing, and
    render-contention layer, preserving the same timelines and metrics.
+
+## Adversarial review corrections
+
+The September 2026 cross-model review found four harness issues that affect how
+older results should be read:
+
+- DTX used to advance RTP timestamps only for emitted packets. Silence and
+  scheduler-skipped capture frames now advance the media clock, while sequence
+  numbers still count transmitted packets. Older game-interest/DTX timing and
+  concealment measurements must not be used as final evidence.
+- Talkspurt recovery now handles a lost end marker, loss of both the end and
+  next start markers, and a reordered stale end marker. These are regression
+  tested in `voice-core`.
+- Multiprocess workers now share an absolute monotonic start barrier, and CPU is
+  measured over the requested media window rather than including delivery
+  grace. Older single-versus-multiprocess CPU ratios are not comparable.
+- Transport recovery impairment now starts relative to an application-written
+  media-ready marker rather than process launch. The raw silent-concealment
+  counter remains serialized for history but is explicitly marked invalid and
+  omitted from summaries; total concealed samples and their serialized pull
+  denominator remain usable.
+
+The review also narrows the evidence: loopback and one root `netem` qdisc do not
+exercise relay/NAT behavior, independent paths, or queue-capacity pressure;
+aggregate delivery does not prove per-route ordering; and star-forwarder
+failure remains untested. Those are explicit follow-ups, not claims supported
+by the current runs.
 
 ## References
 

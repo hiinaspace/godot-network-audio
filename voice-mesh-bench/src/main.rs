@@ -215,6 +215,7 @@ struct Config {
     seed: u64,
     runtime_workers: usize,
     output: Option<PathBuf>,
+    media_ready_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -245,6 +246,7 @@ impl Default for Config {
                 .map(usize::from)
                 .unwrap_or(1),
             output: None,
+            media_ready_file: None,
         }
     }
 }
@@ -389,6 +391,11 @@ impl Config {
                         args.next().context("--output requires a path")?,
                     ));
                 }
+                "--media-ready-file" => {
+                    config.media_ready_file = Some(PathBuf::from(
+                        args.next().context("--media-ready-file requires a path")?,
+                    ));
+                }
                 _ => bail!("unknown argument {arg}; use --help"),
             }
         }
@@ -469,6 +476,9 @@ impl Config {
             && config.scenario != Scenario::GameInterest
         {
             bail!("multiprocess comparison currently requires --scenario game-interest");
+        }
+        if config.process_layout == ProcessLayout::Multi && config.media_ready_file.is_some() {
+            bail!("--media-ready-file currently requires --process-layout single");
         }
         Ok(Some(config))
     }
@@ -765,9 +775,11 @@ struct Metrics {
     stress_playout_pull_work_us_p95: u64,
     playout_lateness_us_max: u64,
     neteq_concealed_samples: u64,
+    neteq_receiver_pull_samples: u64,
     neteq_concealed_percent: f64,
     neteq_concealment_events: u64,
     neteq_silent_concealed_samples: u64,
+    neteq_silent_concealed_samples_valid: bool,
     neteq_late_packets_discarded: u64,
     neteq_inserted_samples_for_deceleration: u64,
     neteq_removed_samples_for_acceleration: u64,
@@ -1125,7 +1137,7 @@ enum WorkerCommand {
     Configure(Config),
     Connect { peer: usize, addr: EndpointAddr },
     Accept { peer: usize },
-    Start { delay_ms: u64 },
+    Start { start_at_mono_us: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1196,6 +1208,7 @@ struct MultiprocessMetrics {
     latency_us_p99: u64,
     latency_us_max: u64,
     playout_deadline_miss_percent: f64,
+    neteq_receiver_pull_samples: u64,
     neteq_concealed_percent: f64,
     neteq_receiver_errors: usize,
     workers: Vec<ProcessWorkerResult>,
@@ -1373,8 +1386,9 @@ fn run_multiprocess(config: Config) -> Result<MultiprocessMetrics> {
         }
     }
     let setup_wall_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
+    let start_at_mono_us = monotonic_time_us().saturating_add(500_000);
     for (worker, _) in &mut workers {
-        worker.send(&WorkerCommand::Start { delay_ms: 500 })?;
+        worker.send(&WorkerCommand::Start { start_at_mono_us })?;
     }
 
     let mut results = Vec::with_capacity(worker_count);
@@ -1427,7 +1441,7 @@ fn aggregate_multiprocess_metrics(
     setup_wall_ms: f64,
     results: Vec<ProcessWorkerResult>,
 ) -> MultiprocessMetrics {
-    let media_seconds = config.duration.as_secs_f64() + DELIVERY_GRACE.as_secs_f64();
+    let media_seconds = config.duration.as_secs_f64();
     let cpu_seconds = results.iter().map(|result| result.cpu_seconds).sum::<f64>();
     let sent_datagrams = results.iter().map(|result| result.sent_datagrams).sum();
     let sent_bytes = results.iter().map(|result| result.sent_bytes).sum();
@@ -1469,7 +1483,7 @@ fn aggregate_multiprocess_metrics(
     let concealed_samples = results.iter().map(|result| result.concealed_samples).sum();
     let receiver_errors = results.iter().map(|result| result.receiver_errors).sum();
     MultiprocessMetrics {
-        schema_version: 11,
+        schema_version: 13,
         process_layout: "multi",
         topology: config.topology.as_str(),
         scenario: config.scenario.as_str(),
@@ -1508,6 +1522,7 @@ fn aggregate_multiprocess_metrics(
         latency_us_p99: slice_percentile(&latencies, 99),
         latency_us_max: latencies.last().copied().unwrap_or(0),
         playout_deadline_miss_percent: percent(deadline_misses, playout_ticks),
+        neteq_receiver_pull_samples: receiver_pull_samples,
         neteq_concealed_percent: percent(concealed_samples, receiver_pull_samples),
         neteq_receiver_errors: receiver_errors,
         workers: results,
@@ -1579,14 +1594,21 @@ async fn worker_process(control_addr: SocketAddr, id: usize, role: WorkerRole) -
                 connections[peer] = Some(connection);
                 send_worker_response(&mut write_half, &WorkerResponse::Ack).await?;
             }
-            WorkerCommand::Start { delay_ms } => {
+            WorkerCommand::Start { start_at_mono_us } => {
                 let result = match role {
                     WorkerRole::Client => {
-                        run_client_worker(id, endpoint.clone(), connections, config, delay_ms)
-                            .await?
+                        run_client_worker(
+                            id,
+                            endpoint.clone(),
+                            connections,
+                            config,
+                            start_at_mono_us,
+                        )
+                        .await?
                     }
                     WorkerRole::Sfu => {
-                        run_sfu_worker(id, endpoint.clone(), connections, config, delay_ms).await?
+                        run_sfu_worker(id, endpoint.clone(), connections, config, start_at_mono_us)
+                            .await?
                     }
                 };
                 send_worker_response(&mut write_half, &WorkerResponse::Result(result)).await?;
@@ -1625,7 +1647,7 @@ async fn run_client_worker(
     _endpoint: Endpoint,
     connections: Vec<Option<Connection>>,
     config: Config,
-    delay_ms: u64,
+    start_at_mono_us: u64,
 ) -> Result<ProcessWorkerResult> {
     let clock_start = Instant::now();
     let (receive_tx, receive_rx) = mpsc::unbounded_channel();
@@ -1664,7 +1686,7 @@ async fn run_client_worker(
         ..Default::default()
     })?;
     let receivers = build_listener_receivers(id, &config, config.participants)?;
-    let media_start = Instant::now() + Duration::from_millis(delay_ms);
+    let media_start = instant_for_monotonic_deadline(start_at_mono_us);
     let before = process_usage()?;
     let sender = tokio::spawn(send_media(
         id,
@@ -1687,8 +1709,9 @@ async fn run_client_worker(
         config,
     ));
     let send = sender.await.context("worker sender task panicked")??;
+    let after_media = process_usage()?;
     let listener = listener.await.context("worker listener task panicked")??;
-    let after = process_usage()?;
+    let after_delivery = process_usage()?;
     for reader in readers.lock().expect("reader lock poisoned").drain(..) {
         reader.abort();
     }
@@ -1704,8 +1727,8 @@ async fn run_client_worker(
     Ok(ProcessWorkerResult {
         id,
         role: Some(WorkerRole::Client),
-        cpu_seconds: after.cpu_seconds - before.cpu_seconds,
-        max_rss_kib: after.max_rss_kib,
+        cpu_seconds: after_media.cpu_seconds - before.cpu_seconds,
+        max_rss_kib: after_delivery.max_rss_kib,
         current_rss_kib: current_rss_kib()?,
         sent_datagrams: send.sent_datagrams,
         sent_bytes: send.sent_bytes,
@@ -1727,7 +1750,7 @@ async fn run_sfu_worker(
     _endpoint: Endpoint,
     connections: Vec<Option<Connection>>,
     config: Config,
-    delay_ms: u64,
+    start_at_mono_us: u64,
 ) -> Result<ProcessWorkerResult> {
     let clients = Arc::new(
         connections[..config.participants]
@@ -1752,13 +1775,15 @@ async fn run_sfu_worker(
             &readers,
         );
     }
-    let media_start = Instant::now() + Duration::from_millis(delay_ms);
+    let media_start = instant_for_monotonic_deadline(start_at_mono_us);
     let before = process_usage()?;
     tokio::time::sleep_until(tokio::time::Instant::from_std(
-        media_start + config.duration + DELIVERY_GRACE,
+        media_start + config.duration,
     ))
     .await;
-    let after = process_usage()?;
+    let after_media = process_usage()?;
+    tokio::time::sleep(DELIVERY_GRACE).await;
+    let after_delivery = process_usage()?;
     let sfu = counters.snapshot();
     for reader in readers.lock().expect("reader lock poisoned").drain(..) {
         reader.abort();
@@ -1766,8 +1791,8 @@ async fn run_sfu_worker(
     Ok(ProcessWorkerResult {
         id,
         role: Some(WorkerRole::Sfu),
-        cpu_seconds: after.cpu_seconds - before.cpu_seconds,
-        max_rss_kib: after.max_rss_kib,
+        cpu_seconds: after_media.cpu_seconds - before.cpu_seconds,
+        max_rss_kib: after_delivery.max_rss_kib,
         current_rss_kib: current_rss_kib()?,
         sfu_received_datagrams: sfu.received_datagrams,
         sfu_received_bytes: sfu.received_bytes,
@@ -1807,6 +1832,7 @@ fn print_help() {
          \x20 --seed N          Deterministic game schedule seed (default 1)\n\
          \x20 --runtime-workers N  Tokio worker threads (default available CPUs)\n\
          \x20 --output PATH     Also write pretty JSON metrics to PATH\n\
+         \x20 --media-ready-file PATH  Write a marker at the actual media start\n\
          \x20 -h, --help        Show this help"
     );
 }
@@ -1897,6 +1923,12 @@ async fn run(config: Config) -> Result<Metrics> {
     let mut next_rss_sample = media_start;
     while next_rss_sample < media_end {
         tokio::time::sleep_until(tokio::time::Instant::from_std(next_rss_sample)).await;
+        if next_rss_sample == media_start {
+            if let Some(path) = &config.media_ready_file {
+                fs::write(path, format!("{}\n", monotonic_time_us()))
+                    .with_context(|| format!("write media-ready marker {}", path.display()))?;
+            }
+        }
         rss_samples.push(rss_sample(media_start)?);
         next_rss_sample += Duration::from_secs(10);
     }
@@ -1980,7 +2012,7 @@ async fn run(config: Config) -> Result<Metrics> {
     };
     let missing_datagrams = expected_received_datagrams.saturating_sub(counters.received_datagrams);
     let metrics = Metrics {
-        schema_version: 10,
+        schema_version: 12,
         metric_sample_capacity: METRIC_SAMPLE_CAPACITY,
         process_layout: "single",
         topology: config.topology.as_str(),
@@ -2143,6 +2175,7 @@ async fn run(config: Config) -> Result<Metrics> {
         stress_playout_pull_work_us_p95: counters.stress_playout_pull_work_us.percentile(95),
         playout_lateness_us_max: counters.playout_lateness_us_max,
         neteq_concealed_samples: concealed_samples,
+        neteq_receiver_pull_samples: counters.receiver_pull_samples,
         neteq_concealed_percent: {
             let possible_samples = counters.receiver_pull_samples;
             if possible_samples > 0 {
@@ -2153,6 +2186,10 @@ async fn run(config: Config) -> Result<Metrics> {
         },
         neteq_concealment_events: concealment_events,
         neteq_silent_concealed_samples: silent_concealed_samples,
+        // The current Rust NetEq port labels every Expand sample as silent, unlike
+        // Chromium NetEq's voice/noise split. Preserve the raw counter for schema
+        // continuity, but make its non-comparability explicit to consumers.
+        neteq_silent_concealed_samples_valid: false,
         neteq_late_packets_discarded: late_packets_discarded,
         neteq_inserted_samples_for_deceleration: inserted_samples_for_deceleration,
         neteq_removed_samples_for_acceleration: removed_samples_for_acceleration,
@@ -2997,6 +3034,7 @@ async fn send_media(
             counters.stress_sender_ticks += skipped_ticks + 1;
             counters.stress_sender_skipped_ticks += skipped_ticks;
         }
+        encoder.advance_dropped_frames(skipped_ticks);
         let callback_work_start = Instant::now();
         encode_and_send(
             speaker,
@@ -3361,6 +3399,12 @@ fn media_frame_at(media_start: Instant, now: Instant) -> u64 {
     now.saturating_duration_since(media_start)
         .as_micros()
         .saturating_div(SEND_TICK.as_micros()) as u64
+}
+
+fn instant_for_monotonic_deadline(deadline_us: u64) -> Instant {
+    let now = Instant::now();
+    let remaining_us = deadline_us.saturating_sub(monotonic_time_us());
+    now + Duration::from_micros(remaining_us)
 }
 
 fn monotonic_deadline_us(deadline: Instant) -> u64 {
