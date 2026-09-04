@@ -165,6 +165,15 @@ time_text = (output_dir / "receiver_time.txt").read_text()
 user = re.search(r"User time \(seconds\): ([0-9.]+)", time_text)
 system = re.search(r"System time \(seconds\): ([0-9.]+)", time_text)
 rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", time_text)
+elapsed = re.search(r"Elapsed \(wall clock\) time.*: ([0-9]+:[0-9:.]+)", time_text)
+
+
+def duration_seconds(value):
+    parts = [float(part) for part in value.split(":")]
+    return sum(part * 60**index for index, part in enumerate(reversed(parts)))
+
+
+observed_seconds = duration_seconds(elapsed.group(1)) if elapsed else run_seconds
 log_text = (output_dir / "receiver.log").read_text(errors="replace")
 deltas_ms = [row.get("delta_sec", 0.0) * 1000.0 for row in rows]
 last = rows[-1] if rows else {}
@@ -172,7 +181,8 @@ last = rows[-1] if rows else {}
 summary = {
     "peer_slots_requested": peer_count,
     "active_speakers_requested": active_speakers,
-    "run_seconds": run_seconds,
+    "expected_run_seconds": run_seconds,
+    "observed_run_seconds": observed_seconds,
     "join_events": sum(event["event"] == "joined" for event in load_events),
     "scheduled_leave_events": len(scheduled_leaves),
     "receiver_connect_events": sum(event["event"] == "peer_connected" for event in receiver_events),
@@ -199,7 +209,7 @@ summary = {
     "frame_delta_ms_p95": percentile(deltas_ms, 95),
     "frame_delta_ms_p99": percentile(deltas_ms, 99),
     "frame_delta_ms_max": max(deltas_ms, default=0.0),
-    "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / run_seconds * 100.0,
+    "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / observed_seconds * 100.0,
     "receiver_max_rss_kib": int(rss.group(1)) if rss else 0,
     "receiver_error_lines": sum("ERROR:" in line or "SCRIPT ERROR:" in line for line in log_text.splitlines()),
     "transport": last.get("transport", {}),

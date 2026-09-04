@@ -9,7 +9,8 @@ OUTPUT_DIR="$(realpath -m "${1:-$ROOT_DIR/target/godot-voice-churn}")"
 PEERS="${2:-31}"
 ACTIVE="${3:-7}"
 PHASE_SECONDS="${4:-3}"
-RECEIVER_SECONDS="$(python3 -c "print(float('$PHASE_SECONDS') * 5.0 + 4.0)")"
+EXPECTED_SECONDS="$(python3 -c "print(float('$PHASE_SECONDS') * 5.0 + 4.0)")"
+RECEIVER_SAFETY_SECONDS=120
 GODOT_BIN="${GODOT_BIN:-$(command -v godot || command -v godot4 || true)}"
 
 mkdir -p "$OUTPUT_DIR"
@@ -36,16 +37,18 @@ trap cleanup EXIT
 
 module_id="$(pactl load-module module-null-sink sink_name="$sink" rate=48000)"
 ffmpeg -hide_banner -loglevel error -nostdin -y -f pulse -i "$sink.monitor" \
-  -t "$RECEIVER_SECONDS" -ac 2 -ar 48000 "$OUTPUT_DIR/mixed_output.wav" \
+  -t "$RECEIVER_SAFETY_SECONDS" -ac 2 -ar 48000 "$OUTPUT_DIR/mixed_output.wav" \
   >"$OUTPUT_DIR/output_capture.log" 2>&1 &
 capture_pid=$!
 
 endpoint="$OUTPUT_DIR/receiver_endpoint.json"
 trace="$OUTPUT_DIR/receiver_trace.jsonl"
 receiver_events="$OUTPUT_DIR/receiver_events.jsonl"
+quit_file="$OUTPUT_DIR/receiver_done_${tag}"
 env PULSE_SINK="$sink" GNA_IROH_ROLE=receiver GNA_IROH_BIND_ADDR=127.0.0.1:0 \
   GNA_IROH_ENDPOINT_INFO_PATH="$endpoint" GNA_DEMO_OUTPUT_DEVICE="$sink" \
-  GNA_DEMO_SPATIALIZE=1 GNA_DEMO_QUIT_SECONDS="$RECEIVER_SECONDS" \
+  GNA_DEMO_SPATIALIZE=1 GNA_DEMO_QUIT_SECONDS="$RECEIVER_SAFETY_SECONDS" \
+  GNA_DEMO_QUIT_FILE="$quit_file" \
   GNA_DEMO_TRACE_JSONL="$trace" GNA_DEMO_EVENT_JSONL="$receiver_events" \
   /usr/bin/time -v -o "$OUTPUT_DIR/receiver_time.txt" \
   "$GODOT_BIN" --display-driver headless --audio-driver PulseAudio \
@@ -66,13 +69,18 @@ done
 loadgen_pid=$!
 wait "$loadgen_pid"
 loadgen_pid=""
+# Let the receiver drain the final connection-close events before asking its
+# parent node to exit on the next process frame.
+sleep 1
+touch "$quit_file"
 wait "$receiver_pid"
 receiver_pid=""
+kill -INT "$capture_pid" 2>/dev/null || true
 wait "$capture_pid" || true
 capture_pid=""
 
 python3 "$ROOT_DIR/scripts/summarize_godot_voice_churn.py" \
-  "$OUTPUT_DIR" "$PEERS" "$ACTIVE" "$RECEIVER_SECONDS" >"$OUTPUT_DIR/summary.json"
+  "$OUTPUT_DIR" "$PEERS" "$ACTIVE" "$EXPECTED_SECONDS" >"$OUTPUT_DIR/summary.json"
 cat "$OUTPUT_DIR/summary.json"
 cat "$OUTPUT_DIR/loadgen.json"
 

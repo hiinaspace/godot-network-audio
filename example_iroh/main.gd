@@ -17,6 +17,7 @@ var endpoint_info_path := ""
 var remote_endpoint_info_path := ""
 var trace_jsonl_path := ""
 var event_jsonl_path := ""
+var quit_file_path := ""
 var allow_synthetic_fallback := true
 var force_synthetic := false
 var send_audio := true
@@ -121,6 +122,10 @@ func _ready() -> void:
 		_connect_remote_from_file()
 
 func _process(delta: float) -> void:
+	if quit_file_path != "" and FileAccess.file_exists(quit_file_path):
+		quit_file_path = ""
+		_shutdown_demo()
+		return
 	if role == ROLE_RECEIVER:
 		_maybe_start_playback()
 		_track_first_output()
@@ -387,6 +392,9 @@ func _load_env_config() -> void:
 	value = OS.get_environment("GNA_DEMO_EVENT_JSONL")
 	if value != "":
 		event_jsonl_path = value
+	value = OS.get_environment("GNA_DEMO_QUIT_FILE")
+	if value != "":
+		quit_file_path = value
 	value = OS.get_environment("GNA_DEMO_INPUT_DEVICE")
 	if value != "":
 		selected_input_device = value
