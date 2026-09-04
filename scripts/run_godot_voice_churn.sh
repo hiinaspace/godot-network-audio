@@ -9,7 +9,7 @@ OUTPUT_DIR="$(realpath -m "${1:-$ROOT_DIR/target/godot-voice-churn}")"
 PEERS="${2:-31}"
 ACTIVE="${3:-7}"
 PHASE_SECONDS="${4:-3}"
-EXPECTED_SECONDS="$(python3 -c "print(float('$PHASE_SECONDS') * 5.0 + 4.0)")"
+EXPECTED_SECONDS="$(python3 -c "print(float('$PHASE_SECONDS') * 5.0 + 2.0)")"
 RECEIVER_SAFETY_SECONDS=120
 GODOT_BIN="${GODOT_BIN:-$(command -v godot || command -v godot4 || true)}"
 

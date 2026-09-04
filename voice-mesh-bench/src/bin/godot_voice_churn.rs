@@ -165,7 +165,7 @@ fn main() -> Result<()> {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
     events.flush()?;
-    drop(peers);
+    shutdown_peers(peers.into_iter().flatten().collect());
 
     println!(
         "{{\"peers\":{peer_count},\"active_speakers\":{active_speakers},\"phase_seconds\":{phase_seconds},\"setup_ms\":{setup_ms:.3},\"ticks\":{total_frames},\"sent_datagrams\":{sent_datagrams},\"send_errors\":{send_errors}}}"
@@ -236,13 +236,28 @@ fn leave_group(
     event: &str,
     events: &mut BufWriter<File>,
 ) -> Result<()> {
+    let mut departing = Vec::with_capacity(active_speakers);
     for slot in group_slots(group, active_speakers) {
         if let Some(peer) = peers[slot].as_ref() {
             log_event(events, event, peer)?;
         }
-        drop(peers[slot].take());
+        if let Some(peer) = peers[slot].take() {
+            departing.push(peer);
+        }
     }
+    shutdown_peers(departing);
     Ok(())
+}
+
+fn shutdown_peers(peers: Vec<Peer>) {
+    // Each sidecar owns a runtime whose graceful endpoint close may take a few
+    // hundred milliseconds. Closing a population serially makes the scenario
+    // duration depend on N and can outlive the receiver gate.
+    thread::scope(|scope| {
+        for peer in peers {
+            scope.spawn(move || drop(peer));
+        }
+    });
 }
 
 fn group_slots(group: usize, active_speakers: usize) -> std::ops::Range<usize> {
