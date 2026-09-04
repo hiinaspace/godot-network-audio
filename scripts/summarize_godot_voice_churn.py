@@ -198,6 +198,36 @@ log_text = (output_dir / "receiver.log").read_text(errors="replace")
 deltas_ms = [row.get("delta_sec", 0.0) * 1000.0 for row in rows]
 last = rows[-1] if rows else {}
 
+# Godot clamps reported frame deltas after a long stall, so wall-clock trace
+# gaps are more trustworthy. Separately track periods where the main loop kept
+# tracing but none of the active AudioStreamNetwork playbacks advanced: that is
+# an audio-thread-wide mixer pause, not packet or per-source latency.
+main_trace_gaps_ms = [
+    (later["unix_usec"] - earlier["unix_usec"]) / 1000.0
+    for earlier, later in zip(rows, rows[1:])
+]
+last_audio_progress_usec = None
+previous_mixed = {}
+audio_callback_gaps_ms = []
+for row in rows:
+    receivers = row.get("receivers", {})
+    playing = any(bool(value.get("is_playing")) for value in receivers.values())
+    progressed = any(
+        int(value.get("mixed_output_frames", 0))
+        > int(previous_mixed.get(peer, -1))
+        for peer, value in receivers.items()
+    )
+    if progressed:
+        if playing and last_audio_progress_usec is not None:
+            audio_callback_gaps_ms.append(
+                (row["unix_usec"] - last_audio_progress_usec) / 1000.0
+            )
+        last_audio_progress_usec = row["unix_usec"]
+    previous_mixed = {
+        peer: int(value.get("mixed_output_frames", 0))
+        for peer, value in receivers.items()
+    }
+
 summary = {
     "peer_slots_requested": peer_count,
     "active_speakers_requested": active_speakers,
@@ -246,6 +276,8 @@ summary = {
     "frame_delta_ms_p95": percentile(deltas_ms, 95),
     "frame_delta_ms_p99": percentile(deltas_ms, 99),
     "frame_delta_ms_max": max(deltas_ms, default=0.0),
+    "main_trace_gap_ms_max": max(main_trace_gaps_ms, default=0.0),
+    "audio_callback_gap_ms_max": max(audio_callback_gaps_ms, default=0.0),
     "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / observed_seconds * 100.0,
     "scenario_cpu_percent_of_one_core": scenario_cpu_percent,
     "scenario_wall_seconds": scenario_wall_seconds,

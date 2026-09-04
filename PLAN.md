@@ -10,9 +10,11 @@
 > The first Godot scale gate is now complete on Godot 4.7.2. It introduced a
 > peer-routed receive API and validated 31 connected peers / seven simultaneous
 > `AudioStreamPlayer3D` sources against real PulseAudio output. See
-> `voice-mesh-bench/GODOT_SCALE_RESULTS.md`. The next useful gate is source
-> churn under render/main-thread contention, not compatibility work for the old
-> spike API.
+> `voice-mesh-bench/GODOT_SCALE_RESULTS.md`. The source-churn gate is also
+> implemented, but it exposed intermittent whole-mixer pauses in both 2D and
+> 3D on the headless PulseAudio pod. See
+> `voice-mesh-bench/GODOT_CHURN_RESULTS.md`. The next gate is receiver/fleet
+> isolation, before render contention or silent-peer profiling.
 
 This file tracks current status and the next implementation milestones.
 Durable architecture notes live in `DESIGN.md`.

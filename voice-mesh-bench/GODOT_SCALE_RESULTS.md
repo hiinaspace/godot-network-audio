@@ -75,11 +75,9 @@ one receive/NetEq lane per audible remote talker, and Godot-native per-source
 mixing. There is no evidence here that a custom native mixer or a return to a
 single mixed extension stream is needed.
 
-The experiment is deliberately headless. It exercises Godot's audio thread,
-real PulseAudio output, and `AudioStreamPlayer3D`, but not a renderer, scene
-complexity, animation, physics, or game-script load. Next, reuse the established
-game-interest timeline to rotate talkers and create/retire sources while adding
-controlled render/main-thread contention. Track first audible frame, stale
-audio after interest exit, collateral gaps, frame time, audio-thread
-concealment, CPU, and RSS. A graphical run or representative render workload
-is needed before making desktop-client capacity claims.
+The first source-churn gate is now implemented; see
+`GODOT_CHURN_RESULTS.md`. It found repeatable whole-mixer pauses in both 2D and
+3D headless PulseAudio controls, including cases where the Godot main loop and
+iroh delivery remain healthy. Isolate the receiver from the synthetic fleet
+before adding render contention or treating Godot CPU/latency figures as a
+capacity result.
