@@ -6,7 +6,7 @@ const FRAME_SECONDS := float(FRAME_SAMPLES) / float(SAMPLE_RATE)
 const ROLE_SENDER := "sender"
 const ROLE_RECEIVER := "receiver"
 const DEFAULT_QUIT_SECONDS := 6.0
-const STARTUP_PREBUFFER_PACKETS := 4
+const STARTUP_PREBUFFER_PACKETS := 1
 
 var role := ROLE_RECEIVER
 var quit_after_seconds := DEFAULT_QUIT_SECONDS
