@@ -8,9 +8,11 @@ license.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 iroh.workspace = true
+iroh-base.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tinyvec.workspace = true
 tokio.workspace = true
 voice-core = { path = "../voice-core" }
+godot_network_audio_iroh = { path = "../iroh-sidecar" }
