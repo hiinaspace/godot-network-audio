@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -17,17 +19,115 @@ use voice_core::VoicePacket;
 use crate::sender::NetworkAudioSender;
 use crate::stream::{AudioStreamNetwork, LoopbackTarget};
 
+const PENDING_PACKETS_PER_PEER: usize = 64;
+
+#[derive(Default)]
+struct SendRouter {
+    connections: HashMap<EndpointId, Connection>,
+    selected_peers: Option<HashSet<EndpointId>>,
+}
+
+impl SendRouter {
+    fn targets(&self) -> Vec<Connection> {
+        self.connections
+            .iter()
+            .filter(|(peer, _)| {
+                self.selected_peers
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(*peer))
+            })
+            .map(|(_, connection)| connection.clone())
+            .collect()
+    }
+}
+
+struct PendingPacket {
+    packet: VoicePacket,
+    received_at_mono_us: u64,
+}
+
+#[derive(Default)]
+struct PeerIngress {
+    sink: Option<LoopbackTarget>,
+    pending: VecDeque<PendingPacket>,
+}
+
+#[derive(Default)]
+struct ReceiveRouter {
+    peers: RwLock<HashMap<EndpointId, PeerIngress>>,
+    default_sink: RwLock<Option<LoopbackTarget>>,
+    pending_drops: AtomicU64,
+}
+
+impl ReceiveRouter {
+    fn route(&self, peer: EndpointId, packet: VoicePacket, received_at_mono_us: u64) {
+        let default_sink = self
+            .default_sink
+            .read()
+            .expect("default receive sink poisoned")
+            .clone();
+        let sink = {
+            let mut peers = self.peers.write().expect("receive router poisoned");
+            let ingress = peers.entry(peer).or_default();
+            if let Some(sink) = default_sink.clone().or_else(|| ingress.sink.clone()) {
+                Some(sink)
+            } else {
+                if ingress.pending.len() == PENDING_PACKETS_PER_PEER {
+                    ingress.pending.pop_front();
+                    self.pending_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                ingress.pending.push_back(PendingPacket {
+                    packet: packet.clone(),
+                    received_at_mono_us,
+                });
+                None
+            }
+        };
+        if let Some(sink) = sink {
+            sink.enqueue_with_timestamp(packet, received_at_mono_us);
+        }
+    }
+
+    fn register(&self, peer: EndpointId, sink: LoopbackTarget) {
+        let pending = {
+            let mut peers = self.peers.write().expect("receive router poisoned");
+            let ingress = peers.entry(peer).or_default();
+            ingress.sink = Some(sink.clone());
+            std::mem::take(&mut ingress.pending)
+        };
+        for queued in pending {
+            sink.enqueue_with_timestamp(queued.packet, queued.received_at_mono_us);
+        }
+    }
+
+    fn unregister(&self, peer: EndpointId) {
+        self.peers
+            .write()
+            .expect("receive router poisoned")
+            .remove(&peer);
+    }
+
+    fn pending_packet_count(&self) -> usize {
+        self.peers
+            .read()
+            .expect("receive router poisoned")
+            .values()
+            .map(|ingress| ingress.pending.len())
+            .sum()
+    }
+}
+
 #[derive(GodotClass)]
 #[class(base=Node)]
 pub struct IrohVoiceTransport {
     base: Base<Node>,
     service: Option<VoiceIrohService>,
     receiver: Option<broadcast::Receiver<VoiceEvent>>,
-    receive_sink: Option<LoopbackTarget>,
-    /// Shared with the direct send handler so it can be updated on peer connect
-    /// without reinstalling the closure. Written on connect/disconnect, read on
-    /// every encoded packet — both happen on non-main threads.
-    active_send_conn: Arc<RwLock<Option<Connection>>>,
+    receive_streams: HashMap<EndpointId, Gd<AudioStreamNetwork>>,
+    receive_router: Arc<ReceiveRouter>,
+    send_router: Arc<RwLock<SendRouter>>,
+    direct_packets_sent: Arc<AtomicU64>,
+    direct_send_errors: Arc<AtomicU64>,
     process_mode_enabled: bool,
     last_error: GString,
     packets_sent: i64,
@@ -42,8 +142,11 @@ impl INode for IrohVoiceTransport {
             base,
             service: None,
             receiver: None,
-            receive_sink: None,
-            active_send_conn: Arc::new(RwLock::new(None)),
+            receive_streams: HashMap::new(),
+            receive_router: Arc::new(ReceiveRouter::default()),
+            send_router: Arc::new(RwLock::new(SendRouter::default())),
+            direct_packets_sent: Arc::new(AtomicU64::new(0)),
+            direct_send_errors: Arc::new(AtomicU64::new(0)),
             process_mode_enabled: false,
             last_error: GString::new(),
             packets_sent: 0,
@@ -58,7 +161,7 @@ impl INode for IrohVoiceTransport {
 
     fn exit_tree(&mut self) {
         self.receiver = None;
-        self.receive_sink = None;
+        self.receive_streams.clear();
         self.service = None;
     }
 }
@@ -107,7 +210,7 @@ impl IrohVoiceTransport {
             Ok(service) => {
                 self.receiver = Some(service.subscribe());
                 self.service = Some(service);
-                self.maybe_install_packet_handler();
+                self.install_packet_router();
                 self.enable_processing();
                 true
             }
@@ -143,15 +246,15 @@ impl IrohVoiceTransport {
         };
         match service.connect(addr) {
             Ok(peer) => {
-                // Populate the shared connection slot immediately so the direct
-                // send handler can start forwarding packets without waiting for
-                // the next _process() frame to drain the broadcast event.
                 if let Some(conn) = service.get_connection(peer) {
-                    *self
-                        .active_send_conn
+                    self.send_router
                         .write()
-                        .expect("active_send_conn poisoned") = Some(conn);
+                        .expect("send router poisoned")
+                        .connections
+                        .entry(peer.id)
+                        .or_insert(conn);
                 }
+                self.ensure_receive_stream_for(peer.id);
                 true
             }
             Err(err) => {
@@ -161,38 +264,107 @@ impl IrohVoiceTransport {
         }
     }
 
-    /// Wire `sender`'s encoded output directly to this transport's active peer,
-    /// bypassing Godot's `_process()` cadence entirely. Call this after
-    /// `start_endpoint()`; the connection slot is updated automatically when
-    /// `connect_to_peer()` succeeds. The GDScript `packet_ready` signal will
-    /// NOT be emitted while a direct handler is installed.
+    /// Wire encoded output directly to all connected peers, or the subset set
+    /// with `set_send_peers`. This never depends on Godot's `_process()` cadence.
     #[func]
     fn attach_sender(&mut self, mut sender: Gd<NetworkAudioSender>) {
-        let conn_slot = self.active_send_conn.clone();
+        let router = self.send_router.clone();
+        let sent = self.direct_packets_sent.clone();
+        let errors = self.direct_send_errors.clone();
         let handler = Arc::new(move |bytes: Vec<u8>| {
-            let conn = conn_slot.read().expect("active_send_conn poisoned").clone();
-            if let Some(conn) = conn {
-                let _ = conn.send_datagram(Bytes::from(bytes));
+            let targets = router.read().expect("send router poisoned").targets();
+            let bytes = Bytes::from(bytes);
+            for connection in targets {
+                match connection.send_datagram(bytes.clone()) {
+                    Ok(()) => {
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         });
         sender.bind_mut().install_direct_send_handler(handler);
     }
 
-    /// Attach an AudioStreamNetwork as the receive target. Packets are pushed
-    /// directly into its internal queue from the iroh receive thread, bypassing
-    /// Godot's _process() cadence entirely.
+    /// Restrict direct sender output to `peer_ids`. An empty array intentionally
+    /// sends to no peers. Call `send_to_all_peers` to remove the filter.
+    #[func]
+    fn set_send_peers(&mut self, peer_ids: Array<GString>) -> bool {
+        let mut selected = HashSet::new();
+        for peer_id in peer_ids.iter_shared() {
+            let Ok(peer) = EndpointId::from_str(peer_id.to_string().as_str()) else {
+                self.record_error(format!("invalid send peer id: {peer_id}"));
+                return false;
+            };
+            selected.insert(peer);
+        }
+        self.send_router
+            .write()
+            .expect("send router poisoned")
+            .selected_peers = Some(selected);
+        true
+    }
+
+    #[func]
+    fn send_to_all_peers(&mut self) {
+        self.send_router
+            .write()
+            .expect("send router poisoned")
+            .selected_peers = None;
+    }
+
+    /// Legacy single-stream route. Multi-peer games should call
+    /// `get_or_create_receive_stream(peer_id)` and assign one stream to each
+    /// AudioStreamPlayer/AudioStreamPlayer3D.
     #[func]
     fn set_receive_stream(&mut self, stream: Gd<AudioStreamNetwork>) {
-        self.receive_sink = Some(stream.bind().loopback_target());
-        self.maybe_install_packet_handler();
+        *self
+            .receive_router
+            .default_sink
+            .write()
+            .expect("default receive sink poisoned") = Some(stream.bind().loopback_target());
         self.enable_processing();
     }
 
     #[func]
     fn clear_receive_stream(&mut self) {
-        self.receive_sink = None;
-        // Handler stays installed in the service until a new one is set or the
-        // service shuts down — harmless, it will just decode and drop packets.
+        *self
+            .receive_router
+            .default_sink
+            .write()
+            .expect("default receive sink poisoned") = None;
+    }
+
+    /// Return the stable stream resource for `peer_id`, creating it when first
+    /// requested. Incoming Iroh packets are routed directly into this stream's
+    /// bounded queue from the network thread; each playback owns its own NetEq.
+    #[func]
+    fn get_or_create_receive_stream(&mut self, peer_id: GString) -> Option<Gd<AudioStreamNetwork>> {
+        let peer = match EndpointId::from_str(peer_id.to_string().as_str()) {
+            Ok(peer) => peer,
+            Err(err) => {
+                self.record_error(format!("invalid receive peer id: {err}"));
+                return None;
+            }
+        };
+        Some(self.ensure_receive_stream_for(peer))
+    }
+
+    #[func]
+    fn remove_receive_stream(&mut self, peer_id: GString) -> bool {
+        let Ok(peer) = EndpointId::from_str(peer_id.to_string().as_str()) else {
+            self.record_error(format!("invalid receive peer id: {peer_id}"));
+            return false;
+        };
+        self.receive_router.unregister(peer);
+        self.receive_streams.remove(&peer).is_some()
+    }
+
+    #[func]
+    fn receive_stream_count(&self) -> i64 {
+        self.receive_streams.len() as i64
     }
 
     #[func]
@@ -224,9 +396,25 @@ impl IrohVoiceTransport {
     #[func]
     fn get_stats(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
-        dict.set("packets_sent", self.packets_sent);
+        dict.set(
+            "packets_sent",
+            self.packets_sent + self.direct_packets_sent.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "send_errors",
+            self.direct_send_errors.load(Ordering::Relaxed) as i64,
+        );
         dict.set("packets_received", self.packets_received);
         dict.set("peers_connected", self.peers_connected);
+        dict.set("receive_streams", self.receive_streams.len() as i64);
+        dict.set(
+            "pending_receive_packets",
+            self.receive_router.pending_packet_count() as i64,
+        );
+        dict.set(
+            "pending_receive_drops",
+            self.receive_router.pending_drops.load(Ordering::Relaxed) as i64,
+        );
         dict.set("last_error", &self.last_error);
         dict
     }
@@ -238,17 +426,29 @@ impl IrohVoiceTransport {
         }
     }
 
-    fn maybe_install_packet_handler(&mut self) {
-        let (Some(service), Some(sink)) = (self.service.as_ref(), self.receive_sink.as_ref())
-        else {
+    fn install_packet_router(&mut self) {
+        let Some(service) = self.service.as_ref() else {
             return;
         };
-        let sink = sink.clone();
-        service.set_packet_handler(Arc::new(move |bytes: Bytes, received_at_mono_us: u64| {
-            if let Ok(packet) = VoicePacket::decode_from_bytes(&bytes) {
-                sink.enqueue_with_timestamp(packet, received_at_mono_us);
-            }
-        }));
+        let router = self.receive_router.clone();
+        service.set_packet_handler(Arc::new(
+            move |peer, bytes: Bytes, received_at_mono_us: u64| {
+                if let Ok(packet) = VoicePacket::decode_from_bytes(&bytes) {
+                    router.route(peer.id, packet, received_at_mono_us);
+                }
+            },
+        ));
+    }
+
+    fn ensure_receive_stream_for(&mut self, peer: EndpointId) -> Gd<AudioStreamNetwork> {
+        if let Some(stream) = self.receive_streams.get(&peer) {
+            return stream.clone();
+        }
+        let stream = AudioStreamNetwork::new_gd();
+        self.receive_router
+            .register(peer, stream.bind().loopback_target());
+        self.receive_streams.insert(peer, stream.clone());
+        stream
     }
 
     fn drain_events(&mut self) {
@@ -273,38 +473,40 @@ impl IrohVoiceTransport {
         match event {
             VoiceEvent::PeerConnected { peer } => {
                 self.peers_connected += 1;
-                // Also update the send connection slot for the accepted-connection
-                // path (e.g. receiver role with attach_sender).
                 if let Some(service) = self.service.as_ref() {
                     if let Some(conn) = service.get_connection(peer) {
-                        *self
-                            .active_send_conn
+                        self.send_router
                             .write()
-                            .expect("active_send_conn poisoned") = Some(conn);
+                            .expect("send router poisoned")
+                            .connections
+                            .insert(peer.id, conn);
                     }
                 }
+                self.ensure_receive_stream_for(peer.id);
                 self.base_mut()
                     .emit_signal("peer_connected", &[peer.id.to_string().to_variant()]);
             }
             VoiceEvent::PeerReplaced { peer } => {
                 if let Some(service) = self.service.as_ref() {
                     if let Some(conn) = service.get_connection(peer) {
-                        *self
-                            .active_send_conn
+                        self.send_router
                             .write()
-                            .expect("active_send_conn poisoned") = Some(conn);
+                            .expect("send router poisoned")
+                            .connections
+                            .insert(peer.id, conn);
                     }
                 }
+                self.ensure_receive_stream_for(peer.id);
                 self.base_mut()
                     .emit_signal("peer_replaced", &[peer.id.to_string().to_variant()]);
             }
             VoiceEvent::PeerDisconnected { peer } => {
                 self.peers_connected = self.peers_connected.saturating_sub(1);
-                // Clear the send slot so the handler stops trying to send.
-                *self
-                    .active_send_conn
+                self.send_router
                     .write()
-                    .expect("active_send_conn poisoned") = None;
+                    .expect("send router poisoned")
+                    .connections
+                    .remove(&peer.id);
                 self.base_mut()
                     .emit_signal("peer_disconnected", &[peer.id.to_string().to_variant()]);
             }

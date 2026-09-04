@@ -19,7 +19,7 @@ anyhow = "1.0.100"
 audiopus = "0.3.0-rc.0"
 bytes = "1.11"
 crossbeam-queue = "0.3.12"
-godot = { version = "0.5.0", features = ["api-4-6", "experimental-threads"] }
+godot = { version = "0.5.5", features = ["api-4-7", "experimental-threads"] }
 hound = "3.5.1"
 iroh = "1.1.0"
 iroh-base = "1.1.0"

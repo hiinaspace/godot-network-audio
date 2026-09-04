@@ -64,7 +64,7 @@ impl Default for VoiceIrohConfig {
     }
 }
 
-type PacketHandler = Arc<dyn Fn(Bytes, u64) + Send + Sync>;
+type PacketHandler = Arc<dyn Fn(RemotePeer, Bytes, u64) + Send + Sync>;
 
 struct SharedState {
     start: Instant,
@@ -323,7 +323,7 @@ fn spawn_datagram_task(connection: Connection, shared: Arc<SharedState>) {
                 .expect("packet_handler lock poisoned")
                 .clone();
             if let Some(ref h) = handler {
-                h(bytes.clone(), received_at_mono_us);
+                h(RemotePeer { id: peer }, bytes.clone(), received_at_mono_us);
             }
             // Always broadcast so the GDScript packet_received signal and stats
             // counter still work regardless of whether a handler is installed.
