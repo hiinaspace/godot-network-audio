@@ -65,6 +65,13 @@ struct SharedStreamState {
     playout_paused: AtomicBool,
     active: AtomicBool,
     playing: AtomicBool,
+    first_enqueue_us: AtomicU64,
+    first_output_us: AtomicU64,
+    callback_entries: AtomicU64,
+    callback_exits: AtomicU64,
+    callback_last_exit_us: AtomicU64,
+    callback_gap_us_max: AtomicU64,
+    callback_duration_us_max: AtomicU64,
 }
 
 impl SharedStreamState {
@@ -98,6 +105,13 @@ impl SharedStreamState {
             playout_paused: AtomicBool::new(false),
             active: AtomicBool::new(true),
             playing: AtomicBool::new(false),
+            first_enqueue_us: AtomicU64::new(0),
+            first_output_us: AtomicU64::new(0),
+            callback_entries: AtomicU64::new(0),
+            callback_exits: AtomicU64::new(0),
+            callback_last_exit_us: AtomicU64::new(0),
+            callback_gap_us_max: AtomicU64::new(0),
+            callback_duration_us_max: AtomicU64::new(0),
         }
     }
 
@@ -175,6 +189,12 @@ impl SharedStreamState {
             return false;
         }
         let now_us = self.now_mono_us();
+        let _ = self.first_enqueue_us.compare_exchange(
+            0,
+            now_us.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         let last_enqueue_us = self.last_enqueue_us.swap(now_us, Ordering::Relaxed);
         if last_enqueue_us != 0 {
             let interval_us = now_us.saturating_sub(last_enqueue_us);
@@ -444,6 +464,30 @@ impl AudioStreamNetwork {
             self.shared.playout_paused.load(Ordering::Relaxed),
         );
         dict.set("active", self.shared.active.load(Ordering::Relaxed));
+        dict.set(
+            "first_enqueue_us",
+            self.shared.first_enqueue_us.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "first_output_us",
+            self.shared.first_output_us.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "callback_entries",
+            self.shared.callback_entries.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "callback_exits",
+            self.shared.callback_exits.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "callback_gap_us_max",
+            self.shared.callback_gap_us_max.load(Ordering::Relaxed) as i64,
+        );
+        dict.set(
+            "callback_duration_us_max",
+            self.shared.callback_duration_us_max.load(Ordering::Relaxed) as i64,
+        );
         dict.set("queued_packets", self.shared.queue.len() as i64);
         dict.set(
             "dropped_packets",
@@ -508,6 +552,7 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
     }
 
     unsafe fn mix_resampled_rawptr(&mut self, buffer: RawPtr<*mut AudioFrame>, frames: i32) -> i32 {
+        let _timing = CallbackTiming::new(Arc::clone(&self.shared));
         let buffer = buffer.ptr();
         if buffer.is_null() || frames <= 0 {
             return 0;
@@ -566,6 +611,14 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
         self.shared
             .non_silent_output_frames
             .fetch_add(non_silent_frames, Ordering::Relaxed);
+        if non_silent_frames > 0 {
+            let _ = self.shared.first_output_us.compare_exchange(
+                0,
+                self.shared.now_mono_us().max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
 
         if let Some(receiver) = self.receiver.as_ref() {
             let stats = receiver.stats();
@@ -656,5 +709,37 @@ fn zero_frames(frames: &mut [AudioFrame]) {
     for frame in frames {
         frame.left = 0.0;
         frame.right = 0.0;
+    }
+}
+
+struct CallbackTiming {
+    shared: Arc<SharedStreamState>,
+    start_us: u64,
+}
+
+impl CallbackTiming {
+    fn new(shared: Arc<SharedStreamState>) -> Self {
+        let start_us = shared.now_mono_us();
+        let previous = shared.callback_last_exit_us.load(Ordering::Relaxed);
+        if previous != 0 {
+            shared
+                .callback_gap_us_max
+                .fetch_max(start_us.saturating_sub(previous), Ordering::Relaxed);
+        }
+        shared.callback_entries.fetch_add(1, Ordering::Relaxed);
+        Self { shared, start_us }
+    }
+}
+
+impl Drop for CallbackTiming {
+    fn drop(&mut self) {
+        let end = self.shared.now_mono_us();
+        self.shared
+            .callback_duration_us_max
+            .fetch_max(end.saturating_sub(self.start_us), Ordering::Relaxed);
+        self.shared
+            .callback_last_exit_us
+            .store(end, Ordering::Relaxed);
+        self.shared.callback_exits.fetch_add(1, Ordering::Relaxed);
     }
 }

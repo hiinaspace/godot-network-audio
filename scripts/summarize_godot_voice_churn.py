@@ -288,4 +288,14 @@ summary = {
     "receiver_error_lines": sum("ERROR:" in line or "SCRIPT ERROR:" in line for line in log_text.splitlines()),
     "transport": last.get("transport", {}),
 }
+observations = [value for row in rows for value in row.get("receivers", {}).values()]
+observations.extend(event.get("details", {}) for event in receiver_events)
+for field in ("callback_gap_us_max", "callback_duration_us_max"):
+    summary[field] = max((value.get(field, 0) for value in observations), default=0)
+local_start_latencies = [
+    (event["details"]["first_output_us"] - event["details"]["first_enqueue_us"]) / 1000
+    for event in receiver_events
+    if event["event"] == "first_non_silent_output" and event["details"].get("first_output_us", 0) > 0
+]
+summary["receiver_local_first_packet_to_output_ms_max"] = max(local_start_latencies, default=0)
 print(json.dumps(summary, indent=2, sort_keys=True))

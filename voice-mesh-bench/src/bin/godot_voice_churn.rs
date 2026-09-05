@@ -47,6 +47,7 @@ struct EventRecord {
     generation: u32,
     peer_id: String,
     active: bool,
+    paths: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -61,9 +62,10 @@ fn main() -> Result<()> {
     let peer_count = args[3].parse::<usize>().context("parse PEERS")?;
     let active_speakers = args[4].parse::<usize>().context("parse ACTIVE_SPEAKERS")?;
     let phase_seconds = args[5].parse::<f64>().context("parse PHASE_SECONDS")?;
+    let fixed = std::env::var("GNA_CHURN_FIXED").is_ok_and(|v| v == "1");
     if peer_count == 0
         || active_speakers == 0
-        || peer_count < active_speakers * 3
+        || peer_count < active_speakers * if fixed { 1 } else { 3 }
         || phase_seconds < 1.0
     {
         bail!("require PEERS >= 3 * ACTIVE_SPEAKERS > 0 and PHASE_SECONDS >= 1");
@@ -81,8 +83,8 @@ fn main() -> Result<()> {
     // seven Tokio/Iroh runtimes mid-talkspurt is artificial co-host contention;
     // the scenario should measure connection churn, not runtime construction.
     let mut prepared_replacements = Vec::with_capacity(active_speakers);
-    for slot in group_slots(0, active_speakers) {
-        prepared_replacements.push((slot, bind_service()?));
+    for slot in group_slots(0, if fixed { 0 } else { active_speakers }) {
+        prepared_replacements.push((slot, bind_service(peer_count + slot)?));
     }
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
 
@@ -92,6 +94,7 @@ fn main() -> Result<()> {
     let mut next_deadline = Instant::now();
     let mut sent_datagrams = 0_u64;
     let mut send_errors = 0_u64;
+    let mut deadline_lateness_us = Vec::with_capacity(total_frames as usize);
     let mut retired_peers = Vec::new();
     let (replacement_tx, replacement_rx) = mpsc::channel::<Result<Peer>>();
     let (retired_tx, retired_rx) = mpsc::channel::<Peer>();
@@ -110,6 +113,10 @@ fn main() -> Result<()> {
         }
         if tick == 0 {
             set_group_active(&mut peers, 0, active_speakers, true, &mut events)?;
+        } else if fixed && tick == phase_frames * 5 {
+            set_group_active(&mut peers, 0, active_speakers, false, &mut events)?;
+        } else if fixed {
+            // Hold the initial sources continuously active through the media window.
         } else if tick == phase_frames {
             set_group_active(&mut peers, 0, active_speakers, false, &mut events)?;
             set_group_active(&mut peers, 1, active_speakers, true, &mut events)?;
@@ -153,6 +160,7 @@ fn main() -> Result<()> {
         }
 
         let now = Instant::now();
+        let scheduled_deadline = next_deadline;
         if let Some(remaining) = next_deadline.checked_duration_since(now) {
             thread::sleep(remaining);
         } else if now.saturating_duration_since(next_deadline) > FRAME_DURATION {
@@ -161,6 +169,11 @@ fn main() -> Result<()> {
             next_deadline = now;
         }
 
+        deadline_lateness_us.push(
+            Instant::now()
+                .saturating_duration_since(scheduled_deadline)
+                .as_micros() as u64,
+        );
         for peer in peers.iter_mut().flatten() {
             if !peer.active && !peer.closing_talkspurt {
                 peer.encoder.advance_dropped_frames(1);
@@ -199,6 +212,10 @@ fn main() -> Result<()> {
         log_event(&mut events, "shutdown_requested", peer)?;
     }
     write_events(event_path, &events)?;
+    std::fs::write(
+        format!("{event_path}.cadence.json"),
+        serde_json::to_vec(&deadline_lateness_us)?,
+    )?;
     drop(retired_tx);
     retired_peers.extend(retired_rx);
     let mut shutdown_tasks = Vec::new();
@@ -215,12 +232,27 @@ fn main() -> Result<()> {
 }
 
 fn connect_peer(endpoint: &EndpointAddr, slot: usize, generation: u32) -> Result<Peer> {
-    connect_prepared_peer(endpoint, bind_service()?, slot, generation)
+    connect_prepared_peer(endpoint, bind_service(slot)?, slot, generation)
 }
 
-fn bind_service() -> Result<VoiceIrohService> {
+fn bind_service(index: usize) -> Result<VoiceIrohService> {
+    let bind_addr = match std::env::var("GNA_CHURN_BIND_IP") {
+        Ok(ip) => {
+            let base = std::env::var("GNA_CHURN_BASE_PORT")
+                .unwrap_or_else(|_| "42001".into())
+                .parse::<u16>()?;
+            let port = base
+                .checked_add(u16::try_from(index)?)
+                .context("port overflow")?;
+            if port > 42127 {
+                bail!("loadgen port outside permitted range");
+            }
+            SocketAddr::new(ip.parse()?, port)
+        }
+        Err(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    };
     VoiceIrohService::bind(VoiceIrohConfig {
-        bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        bind_addr: Some(bind_addr),
         relay: false,
         ..Default::default()
     })
@@ -352,6 +384,24 @@ fn log_event(events: &mut Vec<EventRecord>, event: &str, peer: &Peer) -> Result<
         generation: peer.generation,
         peer_id: peer.service.endpoint_id().to_string(),
         active: peer.active,
+        paths: peer
+            .service
+            .get_connection(peer.remote)
+            .map(|connection| {
+                connection
+                    .paths()
+                    .iter()
+                    .map(|path| {
+                        format!(
+                            "{:?};selected={};relay={}",
+                            path.remote_addr(),
+                            path.is_selected(),
+                            path.is_relay()
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
     Ok(())
 }
