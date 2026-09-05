@@ -1,5 +1,77 @@
 # Godot source/talker churn gate
 
+## Isolated-host follow-up (2026-09-05)
+
+The dedicated `gna-loadgen` worker is operational. Receiver/audio/capture run
+on `gna-sim`, the synthetic fleet runs on another physical host in `gna-loadgen`,
+and cc-0 only orchestrates. The controller is `scripts/run_godot_isolated.py`:
+
+```sh
+python3 scripts/run_godot_isolated.py --fixed --spatial 3 --repeats 1
+python3 scripts/run_godot_isolated.py --fixed --spatial 2 --repeats 1
+python3 scripts/run_godot_isolated.py --spatial 3 --repeats 1
+```
+
+Build the debug Iroh-enabled extension on the receiver and the release
+`godot_voice_churn` binary on the loadgen first. Both use the normal project
+paths; loadgen's `target` points to `/build/target`. The worker pins the existing
+Godot 4.7.2 executable (SHA256
+`8d106cbe6144c2dc7e881d61d2429c1a8a76e6b22ef48bd5e48dcf934953f71e`),
+because the default `godot` now resolves to 4.6.1. UDP uses receiver port 42000
+and distinct loadgen ports starting at 42001, including replacements. The final
+run explicitly recorded selected direct IP paths with no relay.
+
+Six isolated runs reproduced the problem: three fixed-seven 3D startups, one
+fixed-seven 2D startup, and two 31/7 churn runs. The first was a preliminary
+control; the remaining five used callback entry/exit instrumentation. Every run
+delivered all expected packets (5,327 fixed / 5,481 churn). All six recorded
+zero CPU throttling on both pods. The five instrumented runs had sender deadline
+lateness below 0.4 ms with no missed 20 ms deadlines.
+
+| Instrumented case | Callback invocation gap max | Callback execution max | Receiver-local first enqueue → output max |
+|---|---:|---:|---:|
+| Fixed seven, 3D, repeat 1 | 1,364 ms | 5.3 ms | 1,449 ms |
+| Fixed seven, 3D, repeat 2 | 1,285 ms | 5.3 ms | 1,366 ms |
+| Fixed seven, 2D | 1,412 ms | 7.3 ms | 1,482 ms |
+| 31/7 churn, repeat 1 | 1,097 ms | 6.6 ms | 1,186 ms |
+| 31/7 churn, final | 1,087 ms | 6.8 ms | 1,168 ms |
+
+Main-loop trace gaps stayed below 46 ms in these instrumented controls. The
+callback timer measures elapsed monotonic time from one callback's exit to the
+next entry; the duration timer covers the callback itself. This distinguishes a
+delay outside our mixing/NetEq callback from a slow callback. It does **not**
+identify the exact Godot/PulseAudio lock, buffering behavior, or scheduler cause.
+The older same-pod explanations about reclamation, shared CPU quota, or trace
+I/O being the root cause of all pauses were hypotheses, not established causes.
+
+Cross-host raw wall-clock latency fields are explicitly labeled unadjusted.
+Persistent SSH clock probes before/after the final run bounded sender-minus-
+receiver offset to 6.338–7.814 ms; its corrected first-output maximum was
+1,170.170–1,171.646 ms. The receiver-local enqueue/output measurement above
+requires no host-clock synchronization. Earlier isolated runs used wider SSH
+startup bounds, so use their local instrumentation for timing conclusions.
+Lifetime packet/concealment counters and zero final stream counts do not prove
+audible continuity: final churn had zero concealed samples despite the pause.
+Retired streams remain retained until shutdown under the current demo policy;
+zero registered streams is not proof of bounded long-session reclamation.
+
+The 20–30 repeat matrix was stopped after reliable reproduction. The next
+bounded diagnostic is tracing the receiver's Godot/PulseAudio waiting behavior.
+`strace true` currently fails on `gna-sim` with
+`PTRACE_TRACEME: Operation not permitted`. No pod privilege was changed. `time`
+and `strace` were installed through the already-authorized package mechanism and
+added to `/work/.bootstrap/apt-extra.txt`. See the updated org fleet handoff for
+the capability check needed before resuming.
+
+Raw artifacts remain on `gna-sim` under `target/godot-gate/isolated/`; the final
+fully versioned run is `churn-3d-1788574914747959375-0` at source `637111d`.
+Its manifest includes engine/extension hashes, clean source state, PulseAudio
+information, both cgroups' CPU/pressure snapshots, and clock bounds. Source and
+test binaries have been synchronized across both workers. No network/audio
+load ran on cc-0.
+
+## Original same-pod experiment
+
 Date: 2026-09-04
 
 Runner: `gna-sim`, 12 visible CPUs with an eight-core cgroup quota, Godot

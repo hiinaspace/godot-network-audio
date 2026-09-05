@@ -12,9 +12,10 @@
 > `AudioStreamPlayer3D` sources against real PulseAudio output. See
 > `voice-mesh-bench/GODOT_SCALE_RESULTS.md`. The source-churn gate is also
 > implemented, but it exposed intermittent whole-mixer pauses in both 2D and
-> 3D on the headless PulseAudio pod. See
-> `voice-mesh-bench/GODOT_CHURN_RESULTS.md`. The next gate is receiver/fleet
-> isolation, before render contention or silent-peer profiling.
+> 3D on the headless PulseAudio pod. Isolated gna-sim/gna-loadgen controls now
+> reproduce 1.1–1.4 second gaps outside the extension callback with healthy
+> sender cadence and no CPU throttling. See `voice-mesh-bench/GODOT_CHURN_RESULTS.md`.
+> Next: Godot/PulseAudio wait tracing; the current pod denies PTRACE_TRACEME.
 
 This file tracks current status and the next implementation milestones.
 Durable architecture notes live in `DESIGN.md`.
