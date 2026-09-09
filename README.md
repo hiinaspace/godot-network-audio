@@ -25,8 +25,8 @@ func _on_peer_connected(peer_id: String) -> void:
 	voice_player.play()
 
 func _on_peer_disconnected(peer_id: String) -> void:
-	# Deactivate the corresponding stream first.
-	# See example_iroh for deferred player cleanup during churn.
+	# Deactivate the stream, then stop/detach and queue_free its player.
+	# See example_iroh for complete disconnect cleanup.
 	transport.remove_receive_stream(peer_id)
 ```
 

@@ -103,10 +103,11 @@ Each remote peer gets one stable `AudioStreamNetwork` and therefore one NetEq
 instance. A game assigns that resource to its peer-specific 2D or 3D player.
 The iroh network thread may enqueue directly, but stream creation/removal and
 Godot node ownership stay on the main thread. Packets that beat peer
-registration are held in a small bounded per-peer queue. Disconnect must deactivate playback and remove routing so Godot does not keep
-pulling packet-loss concealment for a departed source. The current example
-retains deactivated players until shutdown to avoid live audio-graph churn;
-bounded reclamation is still required for long sessions.
+registration are held in a small bounded per-peer queue. Disconnect deactivates
+playback, stops/detaches the player, removes routing, and queues node deletion.
+Godot releases playback through its audio lifecycle. The example does not
+retain retired players. Weak-reference harness checks verify release across
+repeated turnover; see `voice-mesh-bench/GODOT_CHURN_RESULTS.md`.
 
 ### Silence and talkspurts
 
@@ -336,9 +337,10 @@ This is the correct place to validate the full iroh transport path.
 
 The optional Iroh integration and corrected synthetic transport experiments
 are implemented. Keep one local encoder, peer-routed receive queues, and
-Godot-native per-source mixing. The pod startup pause was traced to null-sink latency and controlled with
-`norewinds=1`; see `voice-mesh-bench/GODOT_PULSE_WAIT_RESULTS.md`. Bounded
-retired-player reclamation remains the next integration issue; see `PLAN.md`.
+Godot-native per-source mixing. The pod startup pause was traced to null-sink
+latency and controlled with `norewinds=1`; see
+`voice-mesh-bench/GODOT_PULSE_WAIT_RESULTS.md`. Normal stop/detach/queue-free
+cleanup now releases departed resources across repeated churn; see `PLAN.md`.
 
 The practical library target is about 16 participants; 32 is a scaling probe.
 Initial manual validation is 2–3 people. Pod results do not establish hardware,

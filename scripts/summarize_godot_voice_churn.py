@@ -182,7 +182,7 @@ observed_seconds = duration_seconds(elapsed.group(1)) if elapsed else run_second
 scenario_start = min(
     event["unix_usec"] for event in load_events if event["event"] == "talker_on"
 )
-scenario_end = min(
+scenario_end = max(
     event["unix_usec"] for event in load_events if event["event"] == "shutdown_requested"
 )
 scenario_resources = [
@@ -278,6 +278,7 @@ summary = {
     "frame_delta_ms_max": max(deltas_ms, default=0.0),
     "main_trace_gap_ms_max": max(main_trace_gaps_ms, default=0.0),
     "audio_callback_gap_ms_max": max(audio_callback_gaps_ms, default=0.0),
+    "audio_callback_gap_note": "Legacy main-loop progress heuristic includes startup/lifecycle gaps; use callback_gap_us_max for callback invocation timing.",
     "receiver_cpu_percent_of_one_core": ((float(user.group(1)) if user else 0.0) + (float(system.group(1)) if system else 0.0)) / observed_seconds * 100.0,
     "scenario_cpu_percent_of_one_core": scenario_cpu_percent,
     "scenario_wall_seconds": scenario_wall_seconds,
@@ -298,4 +299,18 @@ local_start_latencies = [
     if event["event"] == "first_non_silent_output" and event["details"].get("first_output_us", 0) > 0
 ]
 summary["receiver_local_first_packet_to_output_ms_max"] = max(local_start_latencies, default=0)
+reclamation_checks = [event for event in receiver_events if event["event"] == "receive_reclamation_checked"]
+summary["receive_reclamation_checks"] = len(reclamation_checks)
+summary["receive_reclamation_failures"] = sum(
+    any(event["details"].get(field, False) for field in ("player_alive", "stream_alive", "playback_alive"))
+    for event in reclamation_checks
+)
+summary["receive_reclamation_missing"] = len(
+    {event["peer_id"] for event in receiver_events if event["event"] == "peer_disconnected"}
+    - {event["peer_id"] for event in reclamation_checks}
+)
+summary["receive_reclamation_elapsed_ms_max"] = max(
+    (event["details"]["elapsed_usec"] / 1000 for event in reclamation_checks), default=0
+)
+summary["final_pending_reclamation_checks"] = int(last.get("pending_reclamation_checks", 0))
 print(json.dumps(summary, indent=2, sort_keys=True))

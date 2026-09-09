@@ -61,6 +61,9 @@ def main():
                 raise RuntimeError(version)
             manifest.update(executable=str(binary), version=version,
                             sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+            demo_source = (ROOT / 'example_iroh/main.gd').read_bytes()
+            manifest['demo_sha256'] = hashlib.sha256(demo_source).hexdigest()
+            (out / 'demo_source.gd').write_bytes(demo_source)
             extension = ROOT / 'example_iroh/addons/godot_network_audio/bin/godot_network_audio.so'
             manifest['extension_sha256'] = hashlib.sha256(extension.read_bytes()).hexdigest()
             sink = 'gna_isolated_' + str(os.getpid())

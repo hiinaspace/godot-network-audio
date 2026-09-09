@@ -32,7 +32,7 @@ var stream
 var player
 var receive_streams := {}
 var receive_players := {}
-var retired_receive_players := []
+var pending_reclamation_checks := 0
 var audio_listener: AudioListener3D
 var camera: Camera3D
 var transport
@@ -218,12 +218,20 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 	var peer_player = receive_players.get(disconnected_peer_id)
 	var peer_stream = receive_streams[disconnected_peer_id]
 	_record_event("peer_disconnected", disconnected_peer_id, peer_stream.get_stats())
+	# Silence immediately, then release the Godot audio graph through its normal
+	# main-thread lifecycle. The old second-long pause was null-sink latency,
+	# not evidence that these objects must be retained until shutdown.
+	peer_stream.deactivate()
+	var stream_ref: WeakRef = weakref(peer_stream)
+	var player_ref: WeakRef = null
+	var playback_ref: WeakRef = null
 	if peer_player != null:
-		# Mutating a live AudioStreamPlayer can make Godot synchronize with the
-		# audio server at the end of this frame. Deactivate the stream atomically
-		# and retain its player until a non-interactive reclamation point.
-		peer_stream.deactivate()
-		retired_receive_players.append(peer_player)
+		player_ref = weakref(peer_player)
+		if peer_player.has_stream_playback():
+			playback_ref = weakref(peer_player.get_stream_playback())
+		peer_player.stop()
+		peer_player.stream = null
+		peer_player.queue_free()
 	receive_players.erase(disconnected_peer_id)
 	receive_streams.erase(disconnected_peer_id)
 	peers_with_output.erase(disconnected_peer_id)
@@ -235,6 +243,33 @@ func _on_peer_disconnected(disconnected_peer_id: String) -> void:
 		stream = receive_streams[remaining_peer]
 		player = receive_players[remaining_peer]
 	print("iroh demo: receive stream removed peer=", disconnected_peer_id, " count=", receive_streams.size())
+	if event_file != null:
+		_check_reclamation(disconnected_peer_id, player_ref, stream_ref, playback_ref)
+
+func _check_reclamation(disconnected_peer_id: String, player_ref: WeakRef, stream_ref: WeakRef, playback_ref: WeakRef) -> void:
+	# Weak references do not extend resource lifetime. Godot may retain stopped
+	# playback briefly while its audio thread drains the removal/fade. Observe
+	# release for at most one second; do not confuse two render frames with an
+	# audio-thread reclamation barrier. Only enabled for harness event logging.
+	pending_reclamation_checks += 1
+	var started_usec := Time.get_ticks_usec()
+	var details := {}
+	while true:
+		await get_tree().process_frame
+		details = {
+			"player_alive": player_ref != null and player_ref.get_ref() != null,
+			"stream_alive": stream_ref.get_ref() != null,
+			"playback_alive": playback_ref != null and playback_ref.get_ref() != null,
+			"elapsed_usec": Time.get_ticks_usec() - started_usec,
+		}
+		if not (details.player_alive or details.stream_alive or details.playback_alive):
+			break
+		if details.elapsed_usec >= 1_000_000:
+			break
+	pending_reclamation_checks -= 1
+	_record_event("receive_reclamation_checked", disconnected_peer_id, details)
+	if details.player_alive or details.stream_alive or details.playback_alive:
+		push_error("iroh demo: receive resources retained after disconnect: " + disconnected_peer_id)
 
 func _push_synthetic_frame() -> void:
 	var samples := PackedFloat32Array()
@@ -255,6 +290,7 @@ func _print_stats() -> void:
 		"sender": sender.get_stats() if sender != null else {},
 		"peer_id": peer_id,
 		"receive_stream_count": receive_streams.size(),
+		"pending_reclamation_checks": pending_reclamation_checks,
 		"receivers": _receiver_stats(),
 	}
 	print("iroh demo: stats ", JSON.stringify(row))
@@ -267,10 +303,6 @@ func _shutdown_demo() -> void:
 	for connected_peer in receive_players:
 		receive_players[connected_peer].stop()
 		receive_players[connected_peer].stream = null
-	for retired_player in retired_receive_players:
-		retired_player.stream = null
-		retired_player.queue_free()
-	retired_receive_players.clear()
 	receive_players.clear()
 	receive_streams.clear()
 	stream = null
@@ -329,6 +361,7 @@ func _write_trace_row(delta: float) -> void:
 		"role": role,
 		"peer_id": peer_id,
 		"receive_stream_count": receive_streams.size(),
+		"pending_reclamation_checks": pending_reclamation_checks,
 		"receivers": _receiver_stats(),
 		"transport": transport.get_stats(),
 		"receiver": stream.get_stats() if stream != null else {},

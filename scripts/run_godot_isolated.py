@@ -39,7 +39,7 @@ def clock_bounds(host):
             'samples': samples}
 
 
-def run(index, fixed, spatial, trace=False, norewinds=False):
+def run(index, fixed, spatial, trace=False, norewinds=False, cycles=1):
     label = f'{"fixed" if fixed else "churn"}-{spatial}d-{time.time_ns()}-{index}'
     directory = '/tmp/gna-isolated-' + label
     durable = ROOT + '/target/godot-gate/isolated/' + label
@@ -63,9 +63,26 @@ def run(index, fixed, spatial, trace=False, norewinds=False):
             time.sleep(.1)
         if not endpoint:
             raise RuntimeError('receiver endpoint unavailable')
-        command = shlex.join(['python3', ROOT + '/scripts/godot_isolated_worker.py', 'loadgen',
-                              directory, str(peers), '7', str(int(fixed)), str(int(spatial == 3))])
-        remote('gna-loadgen', command, input=endpoint, timeout=110)
+        # Keep the receiver alive while fresh fleets repeatedly join and leave.
+        # This distinguishes bounded cleanup from process-exit reclamation.
+        artifacts = {'loadgen_events.jsonl': '', 'loadgen_events.jsonl.cadence.json': [],
+                     'loadgen.json': '', 'manifest.json': []}
+        for cycle in range(cycles):
+            fleet_directory = directory + f'-fleet-{cycle}'
+            command = shlex.join(['python3', ROOT + '/scripts/godot_isolated_worker.py', 'loadgen',
+                                  fleet_directory, str(peers), '7', str(int(fixed)), str(int(spatial == 3))])
+            remote('gna-loadgen', command, input=endpoint, timeout=110)
+            for name in artifacts:
+                content = remote('gna-loadgen', f'cat {fleet_directory}/{name}')
+                if name.endswith('.cadence.json'):
+                    artifacts[name].extend(json.loads(content))
+                elif name == 'manifest.json':
+                    artifacts[name].append(json.loads(content))
+                else:
+                    artifacts[name] += content
+            # Preserve each worker's complete artifacts until the run is durable.
+        # Give final disconnect callbacks and deferred deletion checks time to run.
+        remote('gna-sim', 'sleep 0.1')
         remote('gna-sim', f'touch {directory}/done')
         stdout, stderr = receiver.communicate(timeout=110)
         if receiver.returncode:
@@ -74,16 +91,18 @@ def run(index, fixed, spatial, trace=False, norewinds=False):
             after = dict(zip(('receiver', 'loadgen'), pool.map(clock_bounds, ('gna-sim', 'gna-loadgen'))))
         # Transfer the small sender artifacts through the controller; audio and
         # full receiver traces never pass through cc-0.
-        for name in ('loadgen_events.jsonl', 'loadgen_events.jsonl.cadence.json', 'loadgen.json', 'manifest.json'):
-            content = remote('gna-loadgen', f'cat {directory}/{name}')
+        for name, content in artifacts.items():
             target = 'loadgen_manifest.json' if name == 'manifest.json' else name
+            if not isinstance(content, str):
+                content = json.dumps(content)
             remote('gna-sim', f'tee {directory}/{target} >/dev/null', input=content)
         remote('gna-sim', f'tee {directory}/clock_bounds.json >/dev/null',
                input=json.dumps({'before': before, 'after': after}, indent=2))
         # Cross-host wall subtraction has a measured bound; publish it alongside
         # sender cadence and receiver-local trace gaps, not as exact latency.
-        summary = remote('gna-sim', f'python3 {ROOT}/scripts/summarize_godot_voice_churn.py {directory} {peers} 7 17')
+        summary = remote('gna-sim', f'python3 {ROOT}/scripts/summarize_godot_voice_churn.py {directory} {peers} 7 {17 * cycles}')
         data = json.loads(summary)
+        data['fleet_cycles'] = cycles
         lo = min(v['loadgen']['low'] - v['receiver']['high'] for v in (before, after))
         hi = max(v['loadgen']['high'] - v['receiver']['low'] for v in (before, after))
         data['sender_minus_receiver_clock_offset_us_bounds'] = [lo, hi]
@@ -93,12 +112,23 @@ def run(index, fixed, spatial, trace=False, norewinds=False):
         cadence = json.loads(remote('gna-sim', f'cat {directory}/loadgen_events.jsonl.cadence.json'))
         data['sender_deadline_lateness_us_max'] = max(cadence)
         data['sender_deadlines_over_20ms'] = sum(x > 20000 for x in cadence)
+        checked_fields = ('receive_reclamation_failures', 'receive_reclamation_missing',
+                          'final_pending_reclamation_checks', 'receiver_error_lines',
+                          'queue_dropped_packets', 'missing_first_output', 'missing_scheduled_disconnect')
+        data['validation_failures'] = [field for field in checked_fields if data.get(field, 0)]
+        if data.get('receive_reclamation_checks') != data['receiver_disconnect_events']:
+            data['validation_failures'].append('reclamation_count_mismatch')
         remote('gna-sim', f'tee {directory}/summary.json >/dev/null', input=json.dumps(data, indent=2))
         remote('gna-sim', f'mkdir -p {durable} && cp -a {directory}/. {durable}/')
         print(json.dumps({'run': label, 'result': data}), flush=True)
-        for host in ('gna-sim', 'gna-loadgen'):
+        cleanup = [('gna-sim', directory)] + [
+            ('gna-loadgen', directory + f'-fleet-{cycle}') for cycle in range(cycles)
+        ]
+        for host, scratch in cleanup:
             # Exact, generated run directory; durable receiver copy already exists.
-            remote(host, shlex.join(['python3', '-c', 'import shutil,sys; shutil.rmtree(sys.argv[1])', directory]))
+            remote(host, shlex.join(['python3', '-c', 'import shutil,sys; shutil.rmtree(sys.argv[1])', scratch]))
+        if data['validation_failures']:
+            raise RuntimeError(f"Isolated gate failed: {data['validation_failures']}; artifacts: {durable}")
     finally:
         # Worker timeouts also bound remote lifetime if control connectivity fails.
         subprocess.run(SSH + ['claude@gna-sim', f'test ! -d {directory} || touch {directory}/done'], capture_output=True)
@@ -116,6 +146,8 @@ if __name__ == '__main__':
     parser.add_argument('--spatial', type=int, choices=(2, 3), default=3)
     parser.add_argument('--trace', action='store_true', help='Trace receiver waits with strace')
     parser.add_argument('--norewinds', action='store_true', help='Use a PulseAudio null sink with 50 ms maximum latency and no rewinds')
+    parser.add_argument('--cycles', type=int, choices=range(1, 4), default=1,
+                        help='Fresh fleet cycles within one receiver lifetime (bounded by its 90 s timeout)')
     args = parser.parse_args()
     for index in range(args.repeats):
-        run(index, args.fixed, args.spatial, args.trace, args.norewinds)
+        run(index, args.fixed, args.spatial, args.trace, args.norewinds, args.cycles)

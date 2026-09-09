@@ -1,9 +1,69 @@
-> Latest result (2026-09-09): the isolated startup pause is a PulseAudio
-> null-sink latency artifact. `--norewinds` reduces callback gaps to 17–28 ms
-> in fixed/churn controls. See `GODOT_PULSE_WAIT_RESULTS.md` and `../PLAN.md`.
-> Below are historical results; isolation and tracing provisioning are complete.
-
 # Godot source/talker churn gate
+
+## Receive-resource cleanup (2026-09-09)
+
+The null-sink startup artifact is resolved for pod controls using `--norewinds`;
+see `GODOT_PULSE_WAIT_RESULTS.md`. The example now deactivates a departed
+stream, stops/detaches its player, removes routing, and queues the node for
+end-of-frame deletion. There is no retired-player array or shutdown-only
+retention policy. Godot owns synchronization with the audio thread.
+
+Harness-only weak-reference checks observe player, stream, and playback release
+without keeping those resources alive. They stop after release or a one-second
+diagnostic deadline. An initial two-render-frame check was too early for active
+playback objects: nodes and streams were gone, but the engine had not yet
+released playback. Measuring actual release resolves that instrumentation error;
+no application delay or receiver pool is required.
+
+`--cycles 3` runs three fresh fleets against one persistent Godot receiver.
+The existing 31-peer/seven-active workload is reused as a reclamation stress
+control, not as a new product target. Each cycle includes identity replacement,
+graceful departure, abrupt departure, and talker turnover.
+
+| Three-cycle control | 3D | 2D |
+|---|---:|---:|
+| Delivered / expected datagrams | 16,443 / 16,443 | 16,443 / 16,443 |
+| Connects / disconnects | 114 / 114 | 114 / 114 |
+| Talker activations | 84 | 84 |
+| Fully released player/stream/playback sets | 114 | 114 |
+| Missing / failed release checks | 0 / 0 | 0 / 0 |
+| Maximum observed release time | 19.257 ms | 19.009 ms |
+| Maximum callback invocation gap | 23.097 ms | 30.687 ms |
+| Maximum callback execution | 11.926 ms | 19.850 ms |
+| Maximum receiver-local first packet → output | 126.140 ms | 107.607 ms |
+| Collateral concealed samples at departures | 0 | 0 |
+| Total concealed samples | 5,280 | 7,680 |
+| Maximum receiver RSS | 149.9 MiB | 148.3 MiB |
+
+Both runs ended with zero registered streams and zero pending checks, no queue
+drops or receiver errors, and no sender deadline over 20 ms. Release measurements
+are main-loop observations, so they bound rather than pinpoint destruction time.
+The roughly 52-second controls establish release across repeated turnover, not
+an hours-long memory plateau or hardware/VR readiness. Nonzero total concealment
+is retained as a diagnostic; it is not a perceptual-quality measurement.
+
+The controller now fails on reclamation failures/missing checks, unmatched
+release/disconnect counts, receiver errors, queue drops, or missing expected
+first-output/disconnect events. Manifests preserve the actual demo source/hash.
+Multi-cycle CPU windows span the full workload, including between-cycle setup;
+they no longer accidentally stop at the first fleet's shutdown marker.
+
+```sh
+python3 scripts/run_godot_isolated.py --spatial 3 --norewinds --cycles 3
+python3 scripts/run_godot_isolated.py --spatial 2 --norewinds --cycles 3
+```
+
+Artifacts on gna-sim under `target/godot-gate/isolated/`:
+- `churn-3d-1788986592956419571-0`: initial two-frame probe (too early for playback).
+- `churn-3d-1788986646177819787-0`: three-cycle 3D release check. Summary was
+  regenerated for the corrected full-cycle CPU window; the previous summary
+  is retained as `summary_before_multicycle_window_fix.json`.
+- `churn-2d-1788986732065438483-0`: three-cycle 2D release check and final harness
+  validation, including an empty `validation_failures` list.
+
+The following September 4–5 sections are historical evidence. Their pending
+isolation, tracing, and reclamation instructions are superseded by this section
+and `../PLAN.md`.
 
 ## Isolated-host follow-up (2026-09-05)
 

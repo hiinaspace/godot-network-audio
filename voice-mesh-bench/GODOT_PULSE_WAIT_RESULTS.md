@@ -91,9 +91,9 @@ The bounded startup diagnostic is complete, and the small churn control no
 longer has the second-long mixer pause. Use `--norewinds` for subsequent pod
 controls and preserve the default-sink case as a diagnostic reproduction.
 Do not extrapolate these short runs to long sessions, real hardware, or VR.
-Next implementation work: bound retired receive-player lifetime and measure
-safe reclamation with this corrected harness, then real desktop 2–3-person
-integration. Target ~16 participants when investigating remaining scale
+Follow-up receive-player cleanup is now implemented and validated across
+three-cycle 2D/3D controls; see `GODOT_CHURN_RESULTS.md`. Real desktop
+2–3-person integration remains the next practical validation environment. Target ~16 participants when investigating remaining scale
 constraints; 32 remains a characterization point.
 
 ## Artifacts
