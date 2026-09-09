@@ -1,3 +1,6 @@
+> Historical brainstorming; not the current architecture or task list.
+> See `DESIGN.md` and `PLAN.md`.
+
 make voice chat work reasonably in godot.
 
 https://github.com/goatchurchprime/two-voip-godot-4 is an attempt at it, but it feels like it's missing some pieces.

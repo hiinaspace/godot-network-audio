@@ -21,7 +21,11 @@ def snapshot():
 
 
 def main():
-    role, directory, peers, active, fixed, spatial = sys.argv[1:]
+    role, directory, peers, active, fixed, spatial = sys.argv[1:7]
+    trace = '--trace' in sys.argv[7:]
+    norewinds = '--norewinds' in sys.argv[7:]
+    if set(sys.argv[7:]) - {'--trace', '--norewinds'}:
+        raise ValueError('unknown worker options')
     out = pathlib.Path(directory)
     out.mkdir(parents=True, exist_ok=False)
     children = []
@@ -30,7 +34,11 @@ def main():
     env = os.environ.copy()
     before = snapshot()
     manifest = {'role': role, 'host': socket.gethostname(), 'before': before,
-                'peers': int(peers), 'active': int(active), 'fixed': fixed, 'spatial': spatial}
+                'trace': trace, 'null_sink_norewinds': norewinds, 'peers': int(peers),
+                'active': int(active), 'fixed': fixed, 'spatial': spatial}
+    worker_source = pathlib.Path(__file__).read_bytes()
+    manifest['worker_sha256'] = hashlib.sha256(worker_source).hexdigest()
+    (out / 'worker_source.py').write_bytes(worker_source)
 
     def launch(command, log, extra=None):
         handle = (out / log).open('w')
@@ -57,7 +65,8 @@ def main():
             manifest['extension_sha256'] = hashlib.sha256(extension.read_bytes()).hexdigest()
             sink = 'gna_isolated_' + str(os.getpid())
             module = subprocess.check_output(['pactl', 'load-module', 'module-null-sink',
-                                             'sink_name=' + sink, 'rate=48000'], text=True).strip()
+                                             'sink_name=' + sink, 'rate=48000',
+                                             'norewinds=' + str(int(norewinds))], text=True).strip()
             manifest['pulse_info'] = subprocess.check_output(['pactl', 'info'], text=True)
             launch(['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
                     '-f', 'pulse', '-i', sink + '.monitor', '-t', '90', '-ac', '2', '-ar', '48000',
@@ -70,7 +79,11 @@ def main():
                        GNA_DEMO_QUIT_FILE=str(out / 'done'),
                        GNA_DEMO_TRACE_JSONL=str(out / 'receiver_trace.jsonl'),
                        GNA_DEMO_EVENT_JSONL=str(out / 'receiver_events.jsonl'))
-            process = launch(['/usr/bin/time', '-v', '-o', str(out / 'receiver_time.txt'), str(binary),
+            trace_command = (['strace', '-ff', '-ttt', '-T', '-o', str(out / 'godot_waits'),
+                              '-e', 'trace=futex,poll,ppoll,select,pselect6,epoll_wait,epoll_pwait,clock_nanosleep,nanosleep,write,read,prctl']
+                             if trace else [])
+            process = launch(['/usr/bin/time', '-v', '-o', str(out / 'receiver_time.txt'),
+                              *trace_command, str(binary),
                               '--display-driver', 'headless', '--audio-driver', 'PulseAudio',
                               '--path', str(ROOT / 'example_iroh'), '--scene', 'res://main.tscn'],
                              'receiver.log')
@@ -78,7 +91,13 @@ def main():
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 ids = pathlib.Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
+                if trace and ids:
+                    ids = pathlib.Path(f'/proc/{ids[0]}/task/{ids[0]}/children').read_text().split()
+                # strace can briefly spawn a capability probe before Godot.
+                ids = [pid for pid in ids
+                       if pathlib.Path(f'/proc/{pid}/exe').resolve() == binary]
                 if ids:
+                    manifest['godot_pid'] = int(ids[0])
                     launch(['python3', str(ROOT / 'scripts/sample_process_resources.py'), ids[0],
                             str(out / 'receiver_resources.jsonl')], 'sampler.log')
                     break

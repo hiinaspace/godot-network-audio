@@ -103,9 +103,10 @@ Each remote peer gets one stable `AudioStreamNetwork` and therefore one NetEq
 instance. A game assigns that resource to its peer-specific 2D or 3D player.
 The iroh network thread may enqueue directly, but stream creation/removal and
 Godot node ownership stay on the main thread. Packets that beat peer
-registration are held in a small bounded per-peer queue. Disconnect must stop
-the corresponding player and remove the stream so Godot does not keep pulling
-packet-loss concealment for a source that no longer exists.
+registration are held in a small bounded per-peer queue. Disconnect must deactivate playback and remove routing so Godot does not keep
+pulling packet-loss concealment for a departed source. The current example
+retains deactivated players until shutdown to avoid live audio-graph churn;
+bounded reclamation is still required for long sessions.
 
 ### Silence and talkspurts
 
@@ -237,7 +238,7 @@ Why this shape:
 
 ### Full-mesh send model
 
-For 2–8 peers, default to:
+For the roughly 16-participant library target, default to:
 - one local mic capture path
 - one paced sender pipeline
 - one encoded packet stream
@@ -333,9 +334,12 @@ This is the correct place to validate the full iroh transport path.
 
 ## Current architectural conclusions
 
-- The audio side is now good enough that transport integration is the right next frontier.
-- The demo loopback path is useful as a regression harness even if it is not a product feature.
-- The current direct loopback bypass is a testing path, not the model to expose as the real transport integration surface.
-- The first real transport integration should be iroh, not HLMP.
-- HLMP is still worth an example later, but should not drive the core design because of its polling-oriented runtime model.
-- `PLAN.md` should stay tactical; this file should hold the durable reasoning.
+The optional Iroh integration and corrected synthetic transport experiments
+are implemented. Keep one local encoder, peer-routed receive queues, and
+Godot-native per-source mixing. The pod startup pause was traced to null-sink latency and controlled with
+`norewinds=1`; see `voice-mesh-bench/GODOT_PULSE_WAIT_RESULTS.md`. Bounded
+retired-player reclamation remains the next integration issue; see `PLAN.md`.
+
+The practical library target is about 16 participants; 32 is a scaling probe.
+Initial manual validation is 2–3 people. Pod results do not establish hardware,
+public-Internet, perceptual-quality, or rendered VR performance.

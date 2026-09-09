@@ -6,9 +6,11 @@ Specifically, this extension does the stuff you need to do between Godot's
 audio system and data packets to transmit audio efficiently and robustly, but leaves
 the packet delivery part up to your choice of transport (up to some practical requirements).
 
-Status: works well in the current synthetic network and headless Godot
-harnesses, including 31 connected remote peers and seven simultaneous spatial
-sources. The API is still experimental and there are no packaged builds yet.
+Status: synthetic transport tests pass through 32 participants, and the Godot
+harness supports seven simultaneous spatial sources. Isolated headless
+Godot/PulseAudio startup pauses were traced to null-sink latency; corrected
+harness controls pass (see `voice-mesh-bench/GODOT_PULSE_WAIT_RESULTS.md`). The library target is roughly 16 participants, with 32 used to
+characterize scaling. The API is experimental; there are no packaged builds yet.
 
 Godot 4.7 is the current minimum. The optional iroh integration exposes one
 stable `AudioStreamNetwork` per remote peer, so normal game code can attach each
@@ -23,7 +25,8 @@ func _on_peer_connected(peer_id: String) -> void:
 	voice_player.play()
 
 func _on_peer_disconnected(peer_id: String) -> void:
-	# Stop/free the corresponding player first.
+	# Deactivate the corresponding stream first.
+	# See example_iroh for deferred player cleanup during churn.
 	transport.remove_receive_stream(peer_id)
 ```
 

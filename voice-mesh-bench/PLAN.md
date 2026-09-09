@@ -1,3 +1,7 @@
+> Historical workload design; implemented phases and current priorities are
+> summarized in `../PLAN.md`. 32 participants is a scaling probe; the practical
+> library target is about 16 (clarified 2026-09-09).
+
 # Game-voice scenario plan
 
 This plan extends the initial full-mesh smoke benchmark into a reusable tester

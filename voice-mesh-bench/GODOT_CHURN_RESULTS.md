@@ -1,3 +1,8 @@
+> Latest result (2026-09-09): the isolated startup pause is a PulseAudio
+> null-sink latency artifact. `--norewinds` reduces callback gaps to 17–28 ms
+> in fixed/churn controls. See `GODOT_PULSE_WAIT_RESULTS.md` and `../PLAN.md`.
+> Below are historical results; isolation and tracing provisioning are complete.
+
 # Godot source/talker churn gate
 
 ## Isolated-host follow-up (2026-09-05)
@@ -57,7 +62,7 @@ zero registered streams is not proof of bounded long-session reclamation.
 
 The 20–30 repeat matrix was stopped after reliable reproduction. The next
 bounded diagnostic is tracing the receiver's Godot/PulseAudio waiting behavior.
-`strace true` currently fails on `gna-sim` with
+At the time of this run, `strace true` failed on `gna-sim` with
 `PTRACE_TRACEME: Operation not permitted`. No pod privilege was changed. `time`
 and `strace` were installed through the already-authorized package mechanism and
 added to `/work/.bootstrap/apt-extra.txt`. See the updated org fleet handoff for

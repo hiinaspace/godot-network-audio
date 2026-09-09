@@ -78,6 +78,6 @@ single mixed extension stream is needed.
 The first source-churn gate is now implemented; see
 `GODOT_CHURN_RESULTS.md`. It found repeatable whole-mixer pauses in both 2D and
 3D headless PulseAudio controls, including cases where the Godot main loop and
-iroh delivery remain healthy. Isolate the receiver from the synthetic fleet
-before adding render contention or treating Godot CPU/latency figures as a
-capacity result.
+iroh delivery remain healthy. Split-host isolation reproduced the pause; September 9 tracing identified
+null-sink startup latency. Corrected controls are in `GODOT_PULSE_WAIT_RESULTS.md`. Do not treat these CPU/latency figures as a
+capacity result until that issue is understood.

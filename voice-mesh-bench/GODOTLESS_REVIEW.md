@@ -1,3 +1,6 @@
+> Historical completed gate. Current priorities and the ~16-participant product
+> target are in `../PLAN.md`; the ranked follow-up below records the review date.
+
 # Godotless experiment review
 
 Date: 2026-09-04
@@ -34,7 +37,7 @@ original topology matrix. Those grow much more slowly than connection count.
 There is therefore no observed greater-than-quadratic cliff through N=32. The
 early warning is the known O(N^2) connection/setup state itself, plus serialized
 setup; the experiment neither predicts nor needs to explore behavior above the
-product's current 32-participant bound.
+32-participant characterization bound.
 
 The static star confirms the expected trade: N connections and much lower
 client upload/setup/RSS, but similar aggregate CPU because encryption, forwarding,

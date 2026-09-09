@@ -39,13 +39,15 @@ def clock_bounds(host):
             'samples': samples}
 
 
-def run(index, fixed, spatial):
+def run(index, fixed, spatial, trace=False, norewinds=False):
     label = f'{"fixed" if fixed else "churn"}-{spatial}d-{time.time_ns()}-{index}'
     directory = '/tmp/gna-isolated-' + label
     durable = ROOT + '/target/godot-gate/isolated/' + label
     peers = 7 if fixed else 31
     command = shlex.join(['python3', ROOT + '/scripts/godot_isolated_worker.py', 'receiver',
-                          directory, str(peers), '7', str(int(fixed)), str(int(spatial == 3))])
+                          directory, str(peers), '7', str(int(fixed)), str(int(spatial == 3)),
+                          *(['--trace'] if trace else []),
+                          *(['--norewinds'] if norewinds else [])])
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         before = dict(zip(('receiver', 'loadgen'), pool.map(clock_bounds, ('gna-sim', 'gna-loadgen'))))
     receiver = subprocess.Popen(SSH + ['claude@gna-sim', command], stdout=subprocess.PIPE,
@@ -112,6 +114,8 @@ if __name__ == '__main__':
     parser.add_argument('--repeats', type=int, default=1)
     parser.add_argument('--fixed', action='store_true')
     parser.add_argument('--spatial', type=int, choices=(2, 3), default=3)
+    parser.add_argument('--trace', action='store_true', help='Trace receiver waits with strace')
+    parser.add_argument('--norewinds', action='store_true', help='Use a PulseAudio null sink with 50 ms maximum latency and no rewinds')
     args = parser.parse_args()
     for index in range(args.repeats):
-        run(index, args.fixed, args.spatial)
+        run(index, args.fixed, args.spatial, args.trace, args.norewinds)
