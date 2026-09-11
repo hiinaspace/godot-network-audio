@@ -3,7 +3,7 @@ use godot::classes::{AudioServer, INode, Node};
 use godot::obj::Singleton;
 use godot::prelude::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -64,6 +64,9 @@ struct PipelineState {
     cv: Condvar,
     stop: AtomicBool,
     speaking: AtomicBool,
+    input_gain: AtomicU32,
+    input_peak: AtomicU32,
+    captured_frames: AtomicI64,
     last_error: Mutex<Option<String>>,
     stats: WorkerStats,
     /// When set, encoded packets are handed off directly to this handler from
@@ -78,6 +81,9 @@ impl PipelineState {
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
             speaking: AtomicBool::new(false),
+            input_gain: AtomicU32::new(1.0_f32.to_bits()),
+            input_peak: AtomicU32::new(0.0_f32.to_bits()),
+            captured_frames: AtomicI64::new(0),
             last_error: Mutex::new(None),
             stats: WorkerStats::default(),
             direct_send_handler: RwLock::new(None),
@@ -105,6 +111,11 @@ pub struct NetworkAudioSender {
     denoise: bool,
     #[export]
     capture_audio_server_input: bool,
+    /// Own AudioServer capture from the paced worker, independent of rendering.
+    /// Only one sender may read the global capture buffer. Set before start_capture.
+    #[export]
+    capture_on_worker: bool,
+    input_gain_db: f32,
     #[export]
     microphone_frame_budget: i32,
     sender: Option<LocalSendPipeline>,
@@ -149,6 +160,8 @@ impl INode for NetworkAudioSender {
             enable_dtx: true,
             denoise: false,
             capture_audio_server_input: false,
+            capture_on_worker: false,
+            input_gain_db: 0.0,
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
             sender: None,
             loopback_target: None,
@@ -196,7 +209,7 @@ impl INode for NetworkAudioSender {
 
     fn process(&mut self, _delta: f64) {
         self.process_ticks += 1;
-        if self.capture_audio_server_input {
+        if self.capture_audio_server_input && !self.capture_on_worker {
             self.pump_audio_server_input();
         }
         self.drain_worker_packets();
@@ -255,9 +268,14 @@ impl NetworkAudioSender {
         if self.capture_audio_server_input {
             return;
         }
-        self.capture_audio_server_input = true;
         let mut audio_server = AudioServer::singleton();
-        let _ = audio_server.set_input_device_active(true);
+        if audio_server.set_input_device_active(true) != godot::global::Error::OK {
+            self.last_error = "Could not activate microphone".into();
+            let error = self.last_error.to_variant();
+            self.base_mut().emit_signal("encoder_error", &[error]);
+            return;
+        }
+        self.capture_audio_server_input = true;
         self.input_sample_rate_hz = audio_server.get_input_mix_rate() as i32;
         self.rebuild_encoder();
     }
@@ -269,8 +287,38 @@ impl NetworkAudioSender {
         }
         self.capture_audio_server_input = false;
         self.stop_sender();
+        self.last_speaking = false;
         let mut audio_server = AudioServer::singleton();
         let _ = audio_server.set_input_device_active(false);
+    }
+
+    #[func]
+    fn set_input_gain_db(&mut self, db: f32) {
+        if !db.is_finite() {
+            return;
+        }
+        self.input_gain_db = db.clamp(-30.0, 24.0);
+        if let Some(sender) = &self.sender {
+            sender.state.input_gain.store(
+                10.0_f32.powf(self.input_gain_db / 20.0).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[func]
+    fn get_input_peak_db(&self) -> f32 {
+        let peak = self
+            .sender
+            .as_ref()
+            .map(|s| f32::from_bits(s.state.input_peak.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        (20.0 * peak.max(0.001).log10()).max(-60.0)
+    }
+
+    #[func]
+    fn is_capturing(&self) -> bool {
+        self.capture_audio_server_input
     }
 
     #[func]
@@ -286,12 +334,17 @@ impl NetworkAudioSender {
     #[func]
     fn get_captured_input_frames(&self) -> i64 {
         self.captured_input_frames
+            + self
+                .sender
+                .as_ref()
+                .map(|s| s.state.captured_frames.load(Ordering::Relaxed))
+                .unwrap_or(0)
     }
 
     #[func]
     fn get_stats(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
-        dict.set("captured_input_frames", self.captured_input_frames);
+        dict.set("captured_input_frames", self.get_captured_input_frames());
         dict.set("input_sample_rate_hz", self.input_sample_rate_hz);
         dict.set("bitrate_bps", self.bitrate_bps);
         dict.set("process_ticks", self.process_ticks);
@@ -450,7 +503,12 @@ impl NetworkAudioSender {
             denoise: self.denoise,
         };
 
-        match LocalSendPipeline::new(config, self.loopback_target.clone()) {
+        match LocalSendPipeline::new(
+            config,
+            self.loopback_target.clone(),
+            self.capture_on_worker && self.capture_audio_server_input,
+            10.0_f32.powf(self.input_gain_db / 20.0),
+        ) {
             Ok(sender) => {
                 // Reinstall the direct send handler on the new pipeline if one was registered.
                 if let Some(handler) = self.direct_send_handler.clone() {
@@ -513,9 +571,22 @@ impl NetworkAudioSender {
             let stereo = stereo_frames.to_vec();
             let mut mono_samples = Vec::with_capacity(stereo.len());
             for frame in &stereo {
-                mono_samples.push(0.5 * (frame.x + frame.y));
+                mono_samples.push(microphone_sample(
+                    frame.x,
+                    frame.y,
+                    10.0_f32.powf(self.input_gain_db / 20.0),
+                ));
             }
 
+            if let Some(sender) = &self.sender {
+                sender.state.input_peak.store(
+                    mono_samples
+                        .iter()
+                        .fold(0.0_f32, |p, s| p.max(s.abs()))
+                        .to_bits(),
+                    Ordering::Relaxed,
+                );
+            }
             self.chunk_count += 1;
             self.last_chunk_frames = stereo.len() as i32;
             self.max_chunk_frames = self.max_chunk_frames.max(stereo.len() as i32);
@@ -572,9 +643,9 @@ impl NetworkAudioSender {
             .load(Ordering::Relaxed);
         let worker_packets_dropped = sender.state.stats.packets_dropped.load(Ordering::Relaxed);
 
+        self.last_speaking = speaking;
         for packet_bytes in packets {
             self.packets_sent += 1;
-            self.last_speaking = speaking;
             let packed: PackedByteArray = packet_bytes.into_iter().collect();
             self.base_mut()
                 .emit_signal("packet_ready", &[packed.to_variant()]);
@@ -602,13 +673,16 @@ impl LocalSendPipeline {
     fn new(
         config: VoiceEncoderConfig,
         loopback_target: Option<LoopbackTarget>,
+        capture: bool,
+        gain: f32,
     ) -> anyhow::Result<Self> {
         let state = Arc::new(PipelineState::new());
+        state.input_gain.store(gain.to_bits(), Ordering::Relaxed);
         let thread_state = Arc::clone(&state);
 
         let handle = thread::Builder::new()
             .name("gna-send-pacer".to_string())
-            .spawn(move || worker_loop(thread_state, config, loopback_target))?;
+            .spawn(move || worker_loop(thread_state, config, loopback_target, capture))?;
 
         Ok(Self {
             state,
@@ -719,7 +793,9 @@ fn worker_loop(
     state: Arc<PipelineState>,
     config: VoiceEncoderConfig,
     loopback_target: Option<LoopbackTarget>,
+    capture: bool,
 ) {
+    let frame_samples = (config.input_sample_rate as usize / 50).max(1);
     let mut encoder = match VoiceEncoder::new(config) {
         Ok(encoder) => encoder,
         Err(err) => {
@@ -758,9 +834,40 @@ fn worker_loop(
             .tick_lag_max_us
             .fetch_max(tick_lag_us, Ordering::Relaxed);
 
-        let frame = {
+        let frame = if capture {
+            // Activation/device changes and teardown happen on the main thread,
+            // with this worker joined before deactivation. These driver reads lock
+            // the AudioDriver; this is the only reader of its global input offset.
+            let server = AudioServer::singleton();
+            let mut available = server.get_input_frames_available().max(0) as usize;
+            if available > frame_samples * 5 {
+                let stale = available - frame_samples * 5;
+                let _ = server.get_input_frames(stale as i32);
+                state
+                    .stats
+                    .pcm_samples_dropped
+                    .fetch_add(stale as i64, Ordering::Relaxed);
+                available -= stale;
+            }
+            let stereo = server.get_input_frames(available.min(frame_samples) as i32);
+            let gain = f32::from_bits(state.input_gain.load(Ordering::Relaxed));
+            let frame: Vec<f32> = stereo
+                .as_slice()
+                .iter()
+                .map(|v| microphone_sample(v.x, v.y, gain))
+                .collect();
+            state
+                .captured_frames
+                .fetch_add(frame.len() as i64, Ordering::Relaxed);
+            let peak = frame.iter().fold(0.0_f32, |p, v| p.max(v.abs()));
+            let previous = f32::from_bits(state.input_peak.load(Ordering::Relaxed));
+            state
+                .input_peak
+                .store(peak.max(previous * 0.85).to_bits(), Ordering::Relaxed);
+            frame
+        } else {
             let mut guard = state.queues.lock().expect("worker queue mutex poisoned");
-            let take = guard.pcm_samples.len().min(960);
+            let take = guard.pcm_samples.len().min(frame_samples);
             let mut frame = Vec::with_capacity(take);
             for _ in 0..take {
                 if let Some(sample) = guard.pcm_samples.pop_front() {
@@ -780,7 +887,7 @@ fn worker_loop(
                 .stats
                 .worker_ticks_with_pcm
                 .fetch_add(1, Ordering::Relaxed);
-            if frame.len() < 960 {
+            if frame.len() < frame_samples {
                 state
                     .stats
                     .worker_partial_pcm_ticks
@@ -878,5 +985,26 @@ fn worker_loop(
         if next_tick + std::time::Duration::from_secs(10) < Instant::now() {
             next_tick = Instant::now();
         }
+    }
+}
+
+fn microphone_sample(left: f32, right: f32, gain: f32) -> f32 {
+    let sample = (left * 0.5 + right * 0.5) * gain;
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod microphone_tests {
+    use super::microphone_sample;
+    #[test]
+    fn gain_downmix_clips_and_rejects_nonfinite_input() {
+        assert_eq!(microphone_sample(0.2, 0.4, 2.0), 0.6);
+        assert_eq!(microphone_sample(0.8, 0.8, 4.0), 1.0);
+        assert_eq!(microphone_sample(-0.8, -0.8, 4.0), -1.0);
+        assert_eq!(microphone_sample(f32::NAN, 0.0, 1.0), 0.0);
     }
 }
