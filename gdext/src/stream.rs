@@ -31,7 +31,7 @@ struct QueuedPacket {
 }
 
 #[derive(Clone)]
-pub(crate) struct LoopbackTarget {
+pub struct LoopbackTarget {
     shared: Arc<SharedStreamState>,
 }
 
@@ -221,6 +221,22 @@ impl SharedStreamState {
 }
 
 impl LoopbackTarget {
+    /// Parse a wire packet and retain its original monotonic receive time.
+    /// Safe to call from a network worker; decoding/playout remains on the mixer.
+    pub fn enqueue_bytes_at(&self, bytes: &[u8], received_at: Instant) -> bool {
+        let Ok(packet) = VoicePacket::decode_from_bytes(bytes) else {
+            return false;
+        };
+        self.shared.enqueue_packet(
+            packet,
+            PacketArrival {
+                received_at_mono_us: received_at
+                    .saturating_duration_since(self.shared.mono_epoch)
+                    .as_micros() as u64,
+            },
+        )
+    }
+
     pub(crate) fn enqueue_now(&self, packet: VoicePacket) -> bool {
         self.shared.enqueue_packet(
             packet,
@@ -505,7 +521,7 @@ impl AudioStreamNetwork {
         self.shared.enqueue_packet(packet, arrival)
     }
 
-    pub(crate) fn loopback_target(&self) -> LoopbackTarget {
+    pub fn loopback_target(&self) -> LoopbackTarget {
         LoopbackTarget {
             shared: Arc::clone(&self.shared),
         }

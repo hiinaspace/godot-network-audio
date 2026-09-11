@@ -14,7 +14,7 @@ use crate::stream::{AudioStreamNetwork, LoopbackTarget};
 
 /// Called directly from the encode thread with encoded packet bytes.
 /// When installed, bypasses the `encoded_packets` queue and `_process()` drain entirely.
-pub(crate) type DirectSendHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+pub type DirectSendHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 const DEFAULT_MICROPHONE_FRAME_BUDGET: i32 = 960;
 /// Target inter-packet interval for paced emission, in microseconds.
@@ -472,8 +472,7 @@ impl NetworkAudioSender {
     /// Install a handler that receives encoded packet bytes directly from the
     /// encode thread, bypassing `_process()`. When set, the `packet_ready`
     /// signal is NOT emitted (the handler replaces it).
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) fn install_direct_send_handler(&mut self, handler: DirectSendHandler) {
+    pub fn install_direct_send_handler(&mut self, handler: DirectSendHandler) {
         self.direct_send_handler = Some(handler.clone());
         if let Some(sender) = self.sender.as_ref() {
             sender.set_direct_send_handler(handler);
