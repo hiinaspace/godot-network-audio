@@ -67,6 +67,7 @@ struct PipelineState {
     input_gain: AtomicU32,
     input_peak: AtomicU32,
     captured_frames: AtomicI64,
+    packet_clock: AtomicU64,
     last_error: Mutex<Option<String>>,
     stats: WorkerStats,
     /// When set, encoded packets are handed off directly to this handler from
@@ -84,6 +85,7 @@ impl PipelineState {
             input_gain: AtomicU32::new(1.0_f32.to_bits()),
             input_peak: AtomicU32::new(0.0_f32.to_bits()),
             captured_frames: AtomicI64::new(0),
+            packet_clock: AtomicU64::new(0),
             last_error: Mutex::new(None),
             stats: WorkerStats::default(),
             direct_send_handler: RwLock::new(None),
@@ -116,6 +118,7 @@ pub struct NetworkAudioSender {
     #[export]
     capture_on_worker: bool,
     input_gain_db: f32,
+    packet_clock: u64,
     #[export]
     microphone_frame_budget: i32,
     sender: Option<LocalSendPipeline>,
@@ -162,6 +165,7 @@ impl INode for NetworkAudioSender {
             capture_audio_server_input: false,
             capture_on_worker: false,
             input_gain_db: 0.0,
+            packet_clock: 0,
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
             sender: None,
             loopback_target: None,
@@ -508,6 +512,7 @@ impl NetworkAudioSender {
             self.loopback_target.clone(),
             self.capture_on_worker && self.capture_audio_server_input,
             10.0_f32.powf(self.input_gain_db / 20.0),
+            self.packet_clock,
         ) {
             Ok(sender) => {
                 // Reinstall the direct send handler on the new pipeline if one was registered.
@@ -665,6 +670,12 @@ impl NetworkAudioSender {
     fn stop_sender(&mut self) {
         if let Some(mut sender) = self.sender.take() {
             sender.stop();
+            self.packet_clock = sender.state.packet_clock.load(Ordering::Relaxed);
+            while let Some(bytes) = sender.pop_encoded_packet() {
+                let packed: PackedByteArray = bytes.into_iter().collect();
+                self.base_mut()
+                    .emit_signal("packet_ready", &[packed.to_variant()]);
+            }
         }
     }
 }
@@ -675,9 +686,11 @@ impl LocalSendPipeline {
         loopback_target: Option<LoopbackTarget>,
         capture: bool,
         gain: f32,
+        packet_clock: u64,
     ) -> anyhow::Result<Self> {
         let state = Arc::new(PipelineState::new());
         state.input_gain.store(gain.to_bits(), Ordering::Relaxed);
+        state.packet_clock.store(packet_clock, Ordering::Relaxed);
         let thread_state = Arc::clone(&state);
 
         let handle = thread::Builder::new()
@@ -804,6 +817,8 @@ fn worker_loop(
         }
     };
 
+    let clock = state.packet_clock.load(Ordering::Relaxed);
+    encoder.restore_packet_clock(clock as u16, (clock >> 16) as u32);
     let epoch = Instant::now();
     let mut next_tick = epoch;
     loop {
@@ -986,6 +1001,27 @@ fn worker_loop(
             next_tick = Instant::now();
         }
     }
+    // Stop is a speech boundary, not packet loss. Discard pending PCM and keep
+    // the next sequence/timestamp so a later capture does not replay old IDs.
+    if let Some(packet) = encoder.finish_talkspurt() {
+        if let Some(target) = loopback_target {
+            let _ = target.enqueue_now(packet.clone());
+        }
+        let bytes = encode_packet_bytes(&packet).to_vec();
+        let handler = state.direct_send_handler.read().unwrap().clone();
+        if let Some(handler) = handler {
+            handler(bytes);
+        } else {
+            let mut queues = state.queues.lock().unwrap();
+            queues.encoded_packets.clear();
+            queues.encoded_packets.push_back(bytes);
+        }
+    }
+    let (seq, timestamp) = encoder.packet_clock();
+    state.packet_clock.store(
+        u64::from(seq) | (u64::from(timestamp) << 16),
+        Ordering::Relaxed,
+    );
 }
 
 fn microphone_sample(left: f32, right: f32, gain: f32) -> f32 {

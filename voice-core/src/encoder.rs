@@ -125,6 +125,32 @@ impl VoiceEncoder {
         }))
     }
 
+    /// Preserve the transport clock when replacing an encoder after a device change.
+    pub fn packet_clock(&self) -> (u16, u32) {
+        (self.seq, self.timestamp)
+    }
+
+    /// Apply only to a fresh encoder before submitting PCM.
+    pub fn restore_packet_clock(&mut self, seq: u16, timestamp: u32) {
+        self.seq = seq;
+        self.timestamp = timestamp;
+    }
+
+    /// End transmission without encoding queued microphone samples.
+    pub fn finish_talkspurt(&mut self) -> Option<VoicePacket> {
+        self.pending_pcm.clear();
+        if !self.speaking {
+            return None;
+        }
+        self.speaking = false;
+        Some(VoicePacket {
+            seq: self.next_seq(),
+            timestamp: self.timestamp,
+            flags: PacketFlags::from_bits(PacketFlags::END_OF_TALKSPURT),
+            payload: Vec::new(),
+        })
+    }
+
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
         self.speaking = false;
@@ -204,5 +230,28 @@ mod tests {
             second.timestamp.wrapping_sub(first.timestamp),
             4 * FRAME_SAMPLES_48K_MONO as u32
         );
+    }
+    #[test]
+    fn encoder_replacement_preserves_clock_and_ends_speech() {
+        let config = VoiceEncoderConfig {
+            enable_dtx: false,
+            ..Default::default()
+        };
+        let mut first = VoiceEncoder::new(config.clone()).unwrap();
+        first.push_pcm(&[0.2; 960]);
+        let packet = first.poll_packet().unwrap().unwrap();
+        let end = first.finish_talkspurt().unwrap();
+        assert!(end.payload.is_empty());
+        assert!(end.flags.contains(PacketFlags::END_OF_TALKSPURT));
+        assert_eq!(end.seq, packet.seq.wrapping_add(1));
+        assert!(first.finish_talkspurt().is_none());
+        let (seq, timestamp) = first.packet_clock();
+        let mut second = VoiceEncoder::new(config).unwrap();
+        second.restore_packet_clock(seq, timestamp);
+        second.push_pcm(&[0.2; 960]);
+        let resumed = second.poll_packet().unwrap().unwrap();
+        assert_eq!(resumed.seq, end.seq.wrapping_add(1));
+        assert_eq!(resumed.timestamp, packet.timestamp + 960);
+        assert!(resumed.flags.contains(PacketFlags::START_OF_TALKSPURT));
     }
 }
