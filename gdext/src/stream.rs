@@ -1,3 +1,4 @@
+use crate::pcm_tap::PcmTap;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub struct LoopbackTarget {
 
 #[derive(Debug)]
 struct SharedStreamState {
+    pcm_tap: Arc<PcmTap>,
     queue: ArrayQueue<QueuedPacket>,
     mono_epoch: Instant,
     dropped_packets: AtomicU64,
@@ -77,6 +79,7 @@ struct SharedStreamState {
 impl SharedStreamState {
     fn new() -> Self {
         Self {
+            pcm_tap: Arc::new(PcmTap::default()),
             queue: ArrayQueue::new(DEFAULT_QUEUE_CAPACITY),
             mono_epoch: Instant::now(),
             dropped_packets: AtomicU64::new(0),
@@ -120,6 +123,7 @@ impl SharedStreamState {
     }
 
     fn reset_runtime_stats(&self) {
+        self.pcm_tap.reset();
         self.current_buffer_size_ms.store(0, Ordering::Relaxed);
         self.target_delay_ms.store(0, Ordering::Relaxed);
         self.preferred_buffer_size_ms.store(0, Ordering::Relaxed);
@@ -372,6 +376,7 @@ impl AudioStreamNetwork {
     /// audio callback return silence without advancing NetEq.
     #[func]
     fn deactivate(&mut self) {
+        self.shared.pcm_tap.reset();
         self.shared.active.store(false, Ordering::Relaxed);
         self.shared.playout_paused.store(true, Ordering::Relaxed);
         while self.shared.queue.pop().is_some() {}
@@ -519,6 +524,11 @@ impl AudioStreamNetwork {
 impl AudioStreamNetwork {
     fn enqueue_packet(&mut self, packet: VoicePacket, arrival: PacketArrival) -> bool {
         self.shared.enqueue_packet(packet, arrival)
+    }
+
+    pub fn pcm_tap(&self) -> Arc<PcmTap> {
+        self.shared.pcm_tap.enable();
+        self.shared.pcm_tap.clone()
     }
 
     pub fn loopback_target(&self) -> LoopbackTarget {
@@ -698,6 +708,10 @@ impl AudioStreamNetworkPlayback {
             }
 
             let copy_count = available.min(out.len() - written);
+            self.shared.pcm_tap.push(
+                &self.pending_mono[self.pending_cursor..self.pending_cursor + copy_count],
+                RECEIVER_SAMPLE_RATE_HZ,
+            );
             for frame in &mut out[written..written + copy_count] {
                 let sample = self.pending_mono[self.pending_cursor];
                 frame.left = sample;

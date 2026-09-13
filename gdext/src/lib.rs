@@ -2,6 +2,8 @@
 use godot::prelude::*;
 
 mod packet_bytes;
+mod pcm_tap;
+pub use pcm_tap::{PcmBlock, PcmTap};
 mod sender;
 mod stream;
 

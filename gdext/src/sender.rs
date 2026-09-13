@@ -1,3 +1,4 @@
+use crate::pcm_tap::PcmTap;
 use godot::builtin::{PackedByteArray, PackedFloat32Array, VarDictionary};
 use godot::classes::{AudioServer, INode, Node};
 use godot::obj::Singleton;
@@ -103,6 +104,7 @@ impl PipelineState {
 pub struct NetworkAudioSender {
     base: Base<Node>,
     clock_origin: Instant,
+    pcm_tap: Arc<PcmTap>,
     #[export]
     bitrate_bps: i32,
     #[export]
@@ -158,6 +160,7 @@ impl INode for NetworkAudioSender {
         Self {
             base,
             clock_origin: Instant::now(),
+            pcm_tap: Arc::new(PcmTap::default()),
             bitrate_bps: 16_000,
             input_sample_rate_hz: 48_000,
             enable_dtx: true,
@@ -261,6 +264,7 @@ impl NetworkAudioSender {
 
     #[func]
     fn flush(&mut self) {
+        self.pcm_tap.reset();
         if let Some(sender) = self.sender.as_ref() {
             sender.flush();
         }
@@ -513,6 +517,7 @@ impl NetworkAudioSender {
             self.capture_on_worker && self.capture_audio_server_input,
             10.0_f32.powf(self.input_gain_db / 20.0),
             self.packet_clock,
+            self.pcm_tap.clone(),
         ) {
             Ok(sender) => {
                 // Reinstall the direct send handler on the new pipeline if one was registered.
@@ -540,6 +545,12 @@ impl NetworkAudioSender {
         if let Some(sender) = self.sender.as_ref() {
             sender.set_direct_send_handler(handler);
         }
+    }
+
+    /// Native analysis handle; PCM remains owned by the existing capture worker.
+    pub fn pcm_tap(&self) -> Arc<PcmTap> {
+        self.pcm_tap.enable();
+        self.pcm_tap.clone()
     }
 
     fn pump_audio_server_input(&mut self) {
@@ -677,6 +688,7 @@ impl NetworkAudioSender {
                     .emit_signal("packet_ready", &[packed.to_variant()]);
             }
         }
+        self.pcm_tap.reset();
     }
 }
 
@@ -687,6 +699,7 @@ impl LocalSendPipeline {
         capture: bool,
         gain: f32,
         packet_clock: u64,
+        pcm_tap: Arc<PcmTap>,
     ) -> anyhow::Result<Self> {
         let state = Arc::new(PipelineState::new());
         state.input_gain.store(gain.to_bits(), Ordering::Relaxed);
@@ -695,7 +708,7 @@ impl LocalSendPipeline {
 
         let handle = thread::Builder::new()
             .name("gna-send-pacer".to_string())
-            .spawn(move || worker_loop(thread_state, config, loopback_target, capture))?;
+            .spawn(move || worker_loop(thread_state, config, loopback_target, capture, pcm_tap))?;
 
         Ok(Self {
             state,
@@ -807,7 +820,9 @@ fn worker_loop(
     config: VoiceEncoderConfig,
     loopback_target: Option<LoopbackTarget>,
     capture: bool,
+    pcm_tap: Arc<PcmTap>,
 ) {
+    let input_sample_rate = config.input_sample_rate;
     let frame_samples = (config.input_sample_rate as usize / 50).max(1);
     let mut encoder = match VoiceEncoder::new(config) {
         Ok(encoder) => encoder,
@@ -908,6 +923,7 @@ fn worker_loop(
                     .worker_partial_pcm_ticks
                     .fetch_add(1, Ordering::Relaxed);
             }
+            pcm_tap.push(&frame, input_sample_rate);
             encoder.push_pcm(&frame);
             loop {
                 match encoder.poll_packet() {
