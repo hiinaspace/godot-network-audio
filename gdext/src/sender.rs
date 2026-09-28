@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use voice_core::vad::MicrophoneGate;
 use voice_core::{PacketFlags, VoiceEncoder, VoiceEncoderConfig};
 
 use crate::packet_bytes::encode_packet_bytes;
@@ -67,6 +68,10 @@ struct PipelineState {
     speaking: AtomicBool,
     input_gain: AtomicU32,
     input_peak: AtomicU32,
+    input_rms: AtomicU32,
+    gated_rms: AtomicU32,
+    gate_threshold_db: AtomicU32,
+    transmit_enabled: AtomicBool,
     captured_frames: AtomicI64,
     packet_clock: AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -85,6 +90,10 @@ impl PipelineState {
             speaking: AtomicBool::new(false),
             input_gain: AtomicU32::new(1.0_f32.to_bits()),
             input_peak: AtomicU32::new(0.0_f32.to_bits()),
+            input_rms: AtomicU32::new(0.0_f32.to_bits()),
+            gated_rms: AtomicU32::new(0.0_f32.to_bits()),
+            gate_threshold_db: AtomicU32::new((-38.0_f32).to_bits()),
+            transmit_enabled: AtomicBool::new(true),
             captured_frames: AtomicI64::new(0),
             packet_clock: AtomicU64::new(0),
             last_error: Mutex::new(None),
@@ -120,6 +129,8 @@ pub struct NetworkAudioSender {
     #[export]
     capture_on_worker: bool,
     input_gain_db: f32,
+    gate_threshold_db: f32,
+    transmit_enabled: bool,
     packet_clock: u64,
     #[export]
     microphone_frame_budget: i32,
@@ -168,6 +179,8 @@ impl INode for NetworkAudioSender {
             capture_audio_server_input: false,
             capture_on_worker: false,
             input_gain_db: 0.0,
+            gate_threshold_db: -38.0,
+            transmit_enabled: true,
             packet_clock: 0,
             microphone_frame_budget: DEFAULT_MICROPHONE_FRAME_BUDGET,
             sender: None,
@@ -312,6 +325,56 @@ impl NetworkAudioSender {
                 Ordering::Relaxed,
             );
         }
+    }
+
+    #[func]
+    fn set_gate_threshold_db(&mut self, db: f32) {
+        if !db.is_finite() {
+            return;
+        }
+        self.gate_threshold_db = db.clamp(-60.0, -20.0);
+        if let Some(sender) = &self.sender {
+            sender
+                .state
+                .gate_threshold_db
+                .store(self.gate_threshold_db.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[func]
+    fn get_gate_threshold_db(&self) -> f32 {
+        self.gate_threshold_db
+    }
+
+    #[func]
+    fn set_transmit_enabled(&mut self, enabled: bool) {
+        self.transmit_enabled = enabled;
+        if let Some(sender) = &self.sender {
+            sender
+                .state
+                .transmit_enabled
+                .store(enabled, Ordering::Relaxed);
+        }
+    }
+
+    #[func]
+    fn get_input_rms_db(&self) -> f32 {
+        let rms = self
+            .sender
+            .as_ref()
+            .map(|s| f32::from_bits(s.state.input_rms.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        (20.0 * rms.max(0.0001).log10()).max(-80.0)
+    }
+
+    #[func]
+    fn get_gated_rms_db(&self) -> f32 {
+        let rms = self
+            .sender
+            .as_ref()
+            .map(|s| f32::from_bits(s.state.gated_rms.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        (20.0 * rms.max(0.0001).log10()).max(-80.0)
     }
 
     #[func]
@@ -520,6 +583,14 @@ impl NetworkAudioSender {
             self.pcm_tap.clone(),
         ) {
             Ok(sender) => {
+                sender
+                    .state
+                    .gate_threshold_db
+                    .store(self.gate_threshold_db.to_bits(), Ordering::Relaxed);
+                sender
+                    .state
+                    .transmit_enabled
+                    .store(self.transmit_enabled, Ordering::Relaxed);
                 // Reinstall the direct send handler on the new pipeline if one was registered.
                 if let Some(handler) = self.direct_send_handler.clone() {
                     sender.set_direct_send_handler(handler);
@@ -831,6 +902,7 @@ fn worker_loop(
             return;
         }
     };
+    let mut microphone_gate = MicrophoneGate::default();
 
     let clock = state.packet_clock.load(Ordering::Relaxed);
     encoder.restore_packet_clock(clock as u16, (clock >> 16) as u32);
@@ -864,7 +936,7 @@ fn worker_loop(
             .tick_lag_max_us
             .fetch_max(tick_lag_us, Ordering::Relaxed);
 
-        let frame = if capture {
+        let mut frame = if capture {
             // Activation/device changes and teardown happen on the main thread,
             // with this worker joined before deactivation. These driver reads lock
             // the AudioDriver; this is the only reader of its global input offset.
@@ -890,6 +962,11 @@ fn worker_loop(
                 .captured_frames
                 .fetch_add(frame.len() as i64, Ordering::Relaxed);
             let peak = frame.iter().fold(0.0_f32, |p, v| p.max(v.abs()));
+            let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len().max(1) as f32).sqrt();
+            let previous_rms = f32::from_bits(state.input_rms.load(Ordering::Relaxed));
+            state
+                .input_rms
+                .store(rms.max(previous_rms * 0.80).to_bits(), Ordering::Relaxed);
             let previous = f32::from_bits(state.input_peak.load(Ordering::Relaxed));
             state
                 .input_peak
@@ -913,6 +990,19 @@ fn worker_loop(
 
         let mut emitted_this_tick = 0_i64;
         if !frame.is_empty() {
+            if capture {
+                microphone_gate.set_threshold_db(f32::from_bits(
+                    state.gate_threshold_db.load(Ordering::Relaxed),
+                ));
+                microphone_gate.process(&mut frame);
+            }
+            let gated_rms =
+                (frame.iter().map(|v| v * v).sum::<f32>() / frame.len().max(1) as f32).sqrt();
+            let previous_gated = f32::from_bits(state.gated_rms.load(Ordering::Relaxed));
+            state.gated_rms.store(
+                gated_rms.max(previous_gated * 0.80).to_bits(),
+                Ordering::Relaxed,
+            );
             state
                 .stats
                 .worker_ticks_with_pcm
@@ -928,6 +1018,10 @@ fn worker_loop(
             loop {
                 match encoder.poll_packet() {
                     Ok(Some(packet)) => {
+                        if !state.transmit_enabled.load(Ordering::Relaxed) {
+                            state.speaking.store(false, Ordering::Relaxed);
+                            continue;
+                        }
                         state.speaking.store(
                             !packet.flags.contains(PacketFlags::END_OF_TALKSPURT),
                             Ordering::Relaxed,
@@ -1019,7 +1113,10 @@ fn worker_loop(
     }
     // Stop is a speech boundary, not packet loss. Discard pending PCM and keep
     // the next sequence/timestamp so a later capture does not replay old IDs.
-    if let Some(packet) = encoder.finish_talkspurt() {
+    if let Some(packet) = encoder
+        .finish_talkspurt()
+        .filter(|_| state.transmit_enabled.load(Ordering::Relaxed))
+    {
         if let Some(target) = loopback_target {
             let _ = target.enqueue_now(packet.clone());
         }

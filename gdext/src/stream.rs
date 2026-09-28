@@ -62,6 +62,7 @@ struct SharedStreamState {
     concealed_samples: AtomicU64,
     mixed_output_frames: AtomicU64,
     non_silent_output_frames: AtomicU64,
+    output_rms_bits: AtomicU32,
     consecutive_failures: AtomicU32,
     intentional_silence: AtomicBool,
     playout_paused: AtomicBool,
@@ -103,6 +104,7 @@ impl SharedStreamState {
             concealed_samples: AtomicU64::new(0),
             mixed_output_frames: AtomicU64::new(0),
             non_silent_output_frames: AtomicU64::new(0),
+            output_rms_bits: AtomicU32::new(0.0f32.to_bits()),
             consecutive_failures: AtomicU32::new(0),
             intentional_silence: AtomicBool::new(false),
             playout_paused: AtomicBool::new(false),
@@ -140,6 +142,8 @@ impl SharedStreamState {
         self.concealed_samples.store(0, Ordering::Relaxed);
         self.mixed_output_frames.store(0, Ordering::Relaxed);
         self.non_silent_output_frames.store(0, Ordering::Relaxed);
+        self.output_rms_bits
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.intentional_silence.store(false, Ordering::Relaxed);
         self.playout_paused.store(false, Ordering::Relaxed);
@@ -522,6 +526,10 @@ impl AudioStreamNetwork {
 }
 
 impl AudioStreamNetwork {
+    pub fn output_rms(&self) -> f32 {
+        f32::from_bits(self.shared.output_rms_bits.load(Ordering::Relaxed))
+    }
+
     fn enqueue_packet(&mut self, packet: VoicePacket, arrival: PacketArrival) -> bool {
         self.shared.enqueue_packet(packet, arrival)
     }
@@ -607,6 +615,9 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
         // marker has drained. Network ingress wakes this path by queueing a packet.
         if self.shared.playout_paused.load(Ordering::Relaxed) && self.shared.queue.is_empty() {
             self.shared
+                .output_rms_bits
+                .store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.shared
                 .mixed_output_frames
                 .fetch_add(frame_count as u64, Ordering::Relaxed);
             self.playback_position_frames = self
@@ -627,6 +638,14 @@ impl IAudioStreamPlaybackResampled for AudioStreamNetworkPlayback {
 
         self.drain_packets_into_receiver();
         self.fill_output_frames(out);
+        let rms = if out.is_empty() {
+            0.0
+        } else {
+            (out.iter().map(|frame| frame.left * frame.left).sum::<f32>() / out.len() as f32).sqrt()
+        };
+        self.shared
+            .output_rms_bits
+            .store(rms.to_bits(), Ordering::Relaxed);
         self.shared
             .mixed_output_frames
             .fetch_add(frame_count as u64, Ordering::Relaxed);
