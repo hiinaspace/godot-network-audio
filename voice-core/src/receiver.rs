@@ -30,6 +30,10 @@ pub struct ReceiverStats {
     pub concealed_samples: u64,
     pub concealment_events: u64,
     pub silent_concealed_samples: u64,
+    /// Samples NetEq actually produced (excludes intentional silence and resume prebuffer).
+    pub neteq_output_samples: u64,
+    /// Talkspurt-start flushes of the NetEq buffer (diagnostic).
+    pub talkspurt_flushes: u64,
     pub late_packets_discarded: u64,
     pub inserted_samples_for_deceleration: u64,
     pub removed_samples_for_acceleration: u64,
@@ -49,6 +53,7 @@ pub struct VoiceReceiver {
     intentional_silence: bool,
     end_of_talkspurt_seq: Option<u16>,
     resuming_talkspurt: bool,
+    talkspurt_flushes: u64,
     resumed_packet_count: u32,
     last_media_seq: Option<u16>,
     last_media_timestamp: Option<u32>,
@@ -87,6 +92,7 @@ impl VoiceReceiver {
             intentional_silence: false,
             end_of_talkspurt_seq: None,
             resuming_talkspurt: false,
+            talkspurt_flushes: 0,
             resumed_packet_count: 0,
             last_media_seq: None,
             last_media_timestamp: None,
@@ -132,6 +138,7 @@ impl VoiceReceiver {
             || timestamp_discontinuity
         {
             self.inner.flush();
+            self.talkspurt_flushes += 1;
             self.pending_silence = false;
             self.intentional_silence = false;
             self.end_of_talkspurt_seq = None;
@@ -235,6 +242,8 @@ impl VoiceReceiver {
             concealed_samples: stats.lifetime.concealed_samples,
             concealment_events: stats.lifetime.concealment_events,
             silent_concealed_samples: stats.lifetime.silent_concealed_samples,
+            neteq_output_samples: stats.lifetime.jitter_buffer_emitted_count,
+            talkspurt_flushes: self.talkspurt_flushes,
             late_packets_discarded: stats.lifetime.late_packets_discarded,
             inserted_samples_for_deceleration: stats.lifetime.inserted_samples_for_deceleration,
             removed_samples_for_acceleration: stats.lifetime.removed_samples_for_acceleration,
