@@ -8,14 +8,6 @@ pub enum Error {
     InvalidPacket(&'static str),
     #[error("opus error: {0}")]
     Opus(String),
-    #[error("neteq error: {0}")]
-    NetEq(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<neteq::NetEqError> for Error {
-    fn from(value: neteq::NetEqError) -> Self {
-        Self::NetEq(value.to_string())
-    }
-}

@@ -16,6 +16,12 @@ pub struct VoiceEncoderConfig {
     pub bitrate_bps: i32,
     pub enable_dtx: bool,
     pub denoise: bool,
+    /// Opus in-band FEC (LBRR): each packet also carries a low-rate copy of the frame before
+    /// it, which a receiver can use when exactly that earlier packet is lost. Off by default.
+    pub inband_fec: bool,
+    /// Expected packet loss in percent (0..=100), which tunes how much LBRR the encoder spends
+    /// when `inband_fec` is on. Ignored when it is off.
+    pub packet_loss_perc: i32,
 }
 
 impl Default for VoiceEncoderConfig {
@@ -26,6 +32,8 @@ impl Default for VoiceEncoderConfig {
             bitrate_bps: 16_000,
             enable_dtx: true,
             denoise: false,
+            inband_fec: false,
+            packet_loss_perc: 0,
         }
     }
 }
@@ -38,6 +46,7 @@ pub struct VoiceEncoder {
     timestamp: u32,
     speaking: bool,
     enable_dtx: bool,
+    inband_fec: bool,
 }
 
 impl VoiceEncoder {
@@ -65,6 +74,13 @@ impl VoiceEncoder {
             .set_dtx(config.enable_dtx)
             .map_err(|e| Error::Opus(format!("set dtx: {e}")))?;
 
+        encoder
+            .set_inband_fec(config.inband_fec)
+            .map_err(|e| Error::Opus(format!("set inband fec: {e}")))?;
+        encoder
+            .set_packet_loss_perc(config.packet_loss_perc.clamp(0, 100) as u8)
+            .map_err(|e| Error::Opus(format!("set packet loss: {e}")))?;
+
         Ok(Self {
             encoder,
             resampler: InputResampler::new(config.input_sample_rate, 48_000)?,
@@ -73,6 +89,7 @@ impl VoiceEncoder {
             timestamp: 0,
             speaking: false,
             enable_dtx: config.enable_dtx,
+            inband_fec: config.inband_fec,
         })
     }
 
@@ -112,6 +129,9 @@ impl VoiceEncoder {
         payload.truncate(packet_len);
 
         let mut flags = PacketFlags::default();
+        if self.inband_fec {
+            flags.set(PacketFlags::FEC_INCLUDED, true);
+        }
         if !self.speaking {
             flags.set(PacketFlags::START_OF_TALKSPURT, true);
             self.speaking = true;

@@ -74,11 +74,6 @@ impl VoicePacket {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketArrival {
-    pub received_at_mono_us: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,84 +1,86 @@
-use std::convert::TryInto;
+//! Opus decoding for one 20 ms / 48 kHz / mono slot at a time, with the three ways a slot can
+//! be produced: from its own packet, from the next packet's in-band FEC, or by concealment.
 
 use audiopus::coder::{Decoder as OpusDecoder, GenericCtl};
+use audiopus::packet::{nb_channels, nb_samples, Packet};
+use audiopus::MutSignals;
 use audiopus::{Channels, SampleRate};
 
 use crate::error::{Error, Result};
 
+/// Samples in one slot: 20 ms at 48 kHz.
+pub const SLOT_SAMPLES: usize = 960;
+
+/// Check that `payload` is exactly one 20 ms, 48 kHz, mono Opus frame (CONTRACTS section 6).
+pub fn validate_payload(payload: &[u8]) -> Result<()> {
+    let packet =
+        Packet::try_from(payload).map_err(|_| Error::InvalidPacket("empty opus payload"))?;
+    let samples = nb_samples(packet, SampleRate::Hz48000)
+        .map_err(|_| Error::InvalidPacket("undecodable opus packet"))?;
+    if samples != SLOT_SAMPLES {
+        return Err(Error::InvalidPacket("opus packet is not 20 ms"));
+    }
+    let packet = Packet::try_from(payload).expect("checked above");
+    match nb_channels(packet) {
+        Ok(Channels::Mono) => Ok(()),
+        _ => Err(Error::InvalidPacket("opus packet is not mono")),
+    }
+}
+
+/// Whether the packet carries LBRR (in-band FEC) data for the frame before it.
+pub fn payload_has_fec(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    // SAFETY: pointer and length describe the live slice.
+    unsafe { audiopus::ffi::opus_packet_has_lbrr(payload.as_ptr(), payload.len() as i32) == 1 }
+}
+
 pub struct OpusAudioDecoder {
     inner: OpusDecoder,
-    sample_rate: u32,
-    channels: u8,
 }
 
 impl OpusAudioDecoder {
-    pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        let sample_rate = match sample_rate {
-            8_000 => SampleRate::Hz8000,
-            12_000 => SampleRate::Hz12000,
-            16_000 => SampleRate::Hz16000,
-            24_000 => SampleRate::Hz24000,
-            48_000 => SampleRate::Hz48000,
-            _ => return Err(Error::UnsupportedConfig("unsupported opus sample rate")),
-        };
-        let channels = match channels {
-            1 => Channels::Mono,
-            2 => Channels::Stereo,
-            _ => return Err(Error::UnsupportedConfig("unsupported opus channel count")),
-        };
-
-        let inner = OpusDecoder::new(sample_rate, channels)
+    /// A 48 kHz mono decoder.
+    pub fn new() -> Result<Self> {
+        let inner = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)
             .map_err(|e| Error::Opus(format!("decoder init: {e}")))?;
-
-        Ok(Self {
-            inner,
-            sample_rate: match sample_rate {
-                SampleRate::Hz8000 => 8_000,
-                SampleRate::Hz12000 => 12_000,
-                SampleRate::Hz16000 => 16_000,
-                SampleRate::Hz24000 => 24_000,
-                SampleRate::Hz48000 => 48_000,
-            },
-            channels: match channels {
-                Channels::Mono => 1,
-                Channels::Stereo => 2,
-                Channels::Auto => unreachable!("auto channel count is not valid here"),
-            },
-        })
-    }
-}
-
-impl neteq::codec::AudioDecoder for OpusAudioDecoder {
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        Ok(Self { inner })
     }
 
-    fn channels(&self) -> u8 {
-        self.channels
+    /// Decode the frame in `payload` into `out` (exactly [`SLOT_SAMPLES`] long).
+    pub fn decode(&mut self, payload: &[u8], out: &mut [f32]) -> Result<usize> {
+        self.run(Some(payload), out, false)
     }
 
-    fn decode(&mut self, encoded: &[u8]) -> neteq::Result<Vec<f32>> {
-        let max_samples_per_channel = (self.sample_rate as usize * 120) / 1000;
-        let mut out = vec![0.0f32; max_samples_per_channel * self.channels as usize];
-        let decoded = self
-            .inner
-            .decode_float(
-                Some(encoded.try_into().map_err(|e| {
-                    neteq::NetEqError::DecoderError(format!("invalid opus packet: {e}"))
-                })?),
-                (&mut out).try_into().map_err(|e| {
-                    neteq::NetEqError::DecoderError(format!("invalid output buffer: {e}"))
-                })?,
-                false,
-            )
-            .map_err(|e| neteq::NetEqError::DecoderError(format!("Opus decode: {e}")))?;
-        out.truncate(decoded * self.channels as usize);
-        Ok(out)
+    /// Recover the frame *before* `next_payload` from its LBRR data. Call this, then
+    /// [`decode`](Self::decode) the same payload for its own frame.
+    pub fn decode_fec(&mut self, next_payload: &[u8], out: &mut [f32]) -> Result<usize> {
+        self.run(Some(next_payload), out, true)
     }
 
-    fn reset(&mut self) -> neteq::Result<()> {
+    /// Opus packet-loss concealment for one lost frame. Opus fades its own output when
+    /// called repeatedly.
+    pub fn conceal(&mut self, out: &mut [f32]) -> Result<usize> {
+        self.run(None, out, false)
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
         self.inner
             .reset_state()
-            .map_err(|e| neteq::NetEqError::DecoderError(format!("Opus reset: {e}")))
+            .map_err(|e| Error::Opus(format!("reset: {e}")))
+    }
+
+    fn run(&mut self, payload: Option<&[u8]>, out: &mut [f32], fec: bool) -> Result<usize> {
+        debug_assert_eq!(out.len(), SLOT_SAMPLES);
+        let input = match payload {
+            Some(p) => Some(Packet::try_from(p).map_err(|_| Error::InvalidPacket("empty"))?),
+            None => None,
+        };
+        let output = MutSignals::try_from(out)
+            .map_err(|e| Error::Opus(format!("output buffer: {e}")))?;
+        self.inner
+            .decode_float(input, output, fec)
+            .map_err(|e| Error::Opus(format!("decode: {e}")))
     }
 }

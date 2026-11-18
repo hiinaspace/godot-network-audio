@@ -4,14 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The offline fixture harness (simulated-clock impairment runs) and its wav output. Not part
+# of the production surface: the room client does not enable it.
+test-support = ["dep:hound"]
+
 [dependencies]
 audiopus.workspace = true
-hound.workspace = true
-neteq.workspace = true
+hound = { workspace = true, optional = true }
 thiserror.workspace = true
-web-time.workspace = true
 
 [dev-dependencies]
+libc = "0.2"
 anyhow.workspace = true
-libc.workspace = true
 serde_json.workspace = true
+voice-core = { path = ".", features = ["test-support"] }
+

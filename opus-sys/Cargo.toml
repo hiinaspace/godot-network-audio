@@ -1,0 +1,15 @@
+[package]
+name = "audiopus_sys"
+# Drop-in for crates.io audiopus_sys 0.2.2 (same bindings), patched in with [patch.crates-io].
+# 0.2.3 satisfies audiopus' `^0.2.2`. Differences: libopus 1.5.2 is vendored (opus/) and always
+# built from source and linked statically; no pkg-config, no system libopus, no env switches.
+version = "0.2.3"
+edition = "2018"
+description = "audiopus_sys with libopus 1.5.2 vendored and statically linked"
+license = "ISC"
+publish = false
+links = "opus"
+build = "build.rs"
+
+[build-dependencies]
+cmake = "0.1"
