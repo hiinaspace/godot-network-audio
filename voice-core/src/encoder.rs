@@ -171,6 +171,30 @@ impl VoiceEncoder {
         })
     }
 
+    /// End transmission after encoding everything already queued: the partial frame in
+    /// `pending_pcm` is zero-padded to a frame boundary and encoded before the END marker.
+    ///
+    /// With a non-48 kHz input the resampler's lag leaves nearly a whole frame queued at any
+    /// frame boundary; `finish_talkspurt` throws that away, which cuts a fade-out short and
+    /// leaves the packet clock a frame behind the capture clock.
+    pub fn finish_talkspurt_flushed(&mut self) -> Result<Vec<VoicePacket>> {
+        let mut out = Vec::new();
+        let rem = self.pending_pcm.len() % FRAME_SAMPLES_48K_MONO;
+        if rem != 0 {
+            let n = self.pending_pcm.len() + FRAME_SAMPLES_48K_MONO - rem;
+            self.pending_pcm.resize(n, 0.0);
+        }
+        while self.pending_pcm.len() >= FRAME_SAMPLES_48K_MONO {
+            if let Some(p) = self.poll_packet()? {
+                out.push(p);
+            }
+        }
+        if let Some(end) = self.finish_talkspurt() {
+            out.push(end);
+        }
+        Ok(out)
+    }
+
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
         self.speaking = false;
