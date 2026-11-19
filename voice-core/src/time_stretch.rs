@@ -566,7 +566,23 @@ mod tests {
         assert!(max_step(&out) <= max_step(&input) * 1.3);
     }
 
+    /// CPU time this thread has used, in microseconds. Wall-clock time would make the
+    /// assertion below a measurement of the host's load, not of the search.
+    fn thread_cpu_us() -> f64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid out-pointer; CLOCK_THREAD_CPUTIME_ID exists on Linux.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+    }
+
     /// Cost of the correlation search at 48 kHz, to decide whether it needs downsampling.
+    /// It failed once under a load average of ~11 with a wall-clock 5 ms bound in a debug
+    /// build: the bound was on the scheduler as much as on the code. CPU time of this
+    /// thread does not move with load; the bound is 5 ms per op for an optimised build and
+    /// 10x that for an unoptimised one (the search is ~330 us optimised).
     #[test]
     fn search_cost_is_small() {
         let input = voiced(1440);
@@ -574,14 +590,15 @@ mod tests {
         let mut acc = Accelerate::new(48_000, 1);
         let mut out = vec![0.0; 1440];
         let n = 200;
-        let t = std::time::Instant::now();
+        let t = thread_cpu_us();
         for _ in 0..n {
             pe.process(&input, &mut out, false);
             acc.process(&input, &mut out[..960], false);
         }
-        let per = t.elapsed().as_secs_f64() * 1e6 / (2.0 * n as f64);
-        println!("time-stretch search: {per:.0} us per op");
+        let per = (thread_cpu_us() - t) / (2.0 * n as f64);
+        println!("time-stretch search: {per:.0} us of CPU per op");
         // A 20 ms block budget is 20,000 us; a handful of ops per second per peer.
-        assert!(per < 5_000.0, "{per} us");
+        let bound = if cfg!(debug_assertions) { 50_000.0 } else { 5_000.0 };
+        assert!(per < bound, "{per} us of CPU per op (bound {bound})");
     }
 }
