@@ -14,6 +14,10 @@ pub mod time_stretch;
 #[cfg(feature = "test-support")]
 pub mod fixture_harness;
 
+/// The previous NetEq receiver, for the old Godot client only (feature `legacy-neteq`).
+#[cfg(feature = "legacy-neteq")]
+pub mod legacy;
+
 pub use decoder::OpusAudioDecoder;
 pub use encoder::{VoiceEncoder, VoiceEncoderConfig};
 pub use error::{Error, Result};
@@ -21,6 +25,9 @@ pub use packet::{PacketFlags, VoicePacket};
 pub use playout::{
     PacketObservation, PlayoutConfig, PlayoutReceiver, PlayoutStats, PushOutcome,
 };
+
+#[cfg(feature = "legacy-neteq")]
+pub use legacy::{PacketArrival, ReceiverStats, VoiceReceiver};
 
 /// The linked libopus version string, e.g. `"libopus 1.5.2"`.
 pub fn opus_version() -> &'static str {

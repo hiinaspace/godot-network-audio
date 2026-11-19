@@ -25,6 +25,8 @@ hound = "3.5.1"
 iroh = "1.1.0"
 iroh-base = "1.1.0"
 libc = "0.2"
+# Only for the legacy-neteq feature (the old Godot client's receiver).
+neteq = { version = "=0.9.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.17"
@@ -37,3 +39,5 @@ web-time = "1.1.0"
 [patch.crates-io]
 # One libopus everywhere: 1.5.2, vendored in opus-sys/ and linked statically (never the system's).
 audiopus_sys = { path = "opus-sys" }
+# Old receiver (legacy-neteq feature): the same NetEq fork the pre-timeline build used.
+neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "69c6ccb08afe56d0d1b1cd9e5a7de011679fa152" }

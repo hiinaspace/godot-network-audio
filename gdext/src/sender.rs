@@ -509,6 +509,9 @@ impl NetworkAudioSender {
             bitrate_bps: self.bitrate_bps,
             enable_dtx: self.enable_dtx,
             denoise: self.denoise,
+            // The old client never used in-band FEC; keep its encoder output unchanged.
+            inband_fec: false,
+            packet_loss_perc: 0,
         };
 
         match LocalSendPipeline::new(

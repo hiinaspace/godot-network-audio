@@ -21,4 +21,4 @@ iroh = { workspace = true, optional = true }
 iroh-base = { workspace = true, optional = true }
 godot_network_audio_iroh = { path = "../iroh-sidecar", optional = true }
 tokio = { workspace = true, optional = true }
-voice-core = { path = "../voice-core" }
+voice-core = { path = "../voice-core", features = ["legacy-neteq"] }

@@ -8,11 +8,16 @@ license.workspace = true
 # The offline fixture harness (simulated-clock impairment runs) and its wav output. Not part
 # of the production surface: the room client does not enable it.
 test-support = ["dep:hound"]
+# The previous NetEq receiver (voice_core::legacy), used only by the old Godot client (gdext),
+# gdext-iroh, voice-mesh-bench and the legacy examples. prim-voice must not enable it.
+legacy-neteq = ["dep:neteq", "dep:web-time", "dep:hound"]
 
 [dependencies]
 audiopus.workspace = true
 hound = { workspace = true, optional = true }
 thiserror.workspace = true
+neteq = { workspace = true, optional = true }
+web-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 libc = "0.2"
@@ -20,3 +25,11 @@ anyhow.workspace = true
 serde_json.workspace = true
 voice-core = { path = ".", features = ["test-support"] }
 
+
+[[example]]
+name = "legacy_fixture_harness"
+required-features = ["legacy-neteq"]
+
+[[example]]
+name = "legacy_fixture_sweep"
+required-features = ["legacy-neteq"]

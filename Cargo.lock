@@ -2042,6 +2042,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "neteq"
+version = "0.9.1"
+source = "git+https://github.com/hiinaspace/videocall-rs.git?rev=69c6ccb08afe56d0d1b1cd9e5a7de011679fa152#69c6ccb08afe56d0d1b1cd9e5a7de011679fa152"
+dependencies = [
+ "log",
+ "ringbuf",
+ "serde",
+ "thiserror 1.0.69",
+ "web-time",
+]
+
+[[package]]
 name = "netlink-packet-core"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2778,6 +2790,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ringbuf"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79abed428d1fd2a128201cec72c5f6938e2da607c6f3745f769fabea399d950a"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -3717,9 +3738,11 @@ dependencies = [
  "audiopus",
  "hound",
  "libc",
+ "neteq",
  "serde_json",
  "thiserror 2.0.20",
  "voice-core",
+ "web-time",
 ]
 
 [[package]]
