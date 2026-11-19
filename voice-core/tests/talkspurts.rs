@@ -108,4 +108,38 @@ fn consecutive_loss_beyond_the_cap_goes_idle_then_resumes() {
     let s = rx.stats();
     assert!(s.plc_samples <= 7 * 960, "PLC ran {} samples", s.plc_samples);
     assert!(s.talkspurts >= 2, "talkspurts {}", s.talkspurts);
+    // 25 slots lost: the cap is 6 concealed frames, the last of them the fade-out; the other 19
+    // are time that is gone, and the stats must say so (they used to read as nothing at all).
+    assert_eq!(s.plc_samples, 5 * 960, "plc");
+    assert_eq!(s.fade_samples, 960 + 960, "fade: one at the cap, one at the end of the stream");
+    assert_eq!(s.lost_unconcealed_samples, 19 * 960, "lost, unconcealed");
+    assert_eq!(s.silence_samples, 0, "silence_samples is the sender's pauses, not losses");
+}
+
+/// -55 dBFS room noise in the pauses: Opus goes to DTX there and sends one refresh packet per
+/// 400 ms. Each is a lone 20 ms packet; played, it would be a 2.5 Hz tick on digital silence.
+#[test]
+fn dtx_refreshes_in_a_noise_floor_are_not_played_as_blips() {
+    let mut sig = voiced_signal(1.0, 0.3);
+    sig.extend(noise(48_000 * 4, -55.0, 1));
+    sig.extend(voiced_signal(0.6, 0.3));
+    sig.extend(noise(48_000 * 4, -55.0, 2));
+    let packets = encode_stream(&sig, VoiceEncoderConfig::default()).unwrap();
+    let events = lossy_events(&packets, |_| false);
+    let mut rx = new_rx();
+    let run = run(&mut rx, &events, &RunConfig::until(run_end_us(&packets)));
+    let s = rx.stats();
+    assert!(s.dtx_refreshes >= 6, "only {} refreshes: the signal never entered DTX", s.dtx_refreshes);
+    assert_eq!(s.talkspurts, 2);
+    // Opus keeps coding the noise as speech for ~0.8 s (its DTX hangover) and then sends one
+    // refresh per 400 ms: refreshes are at input 2.14, 2.56, ... 4.66 s and 6.64 s on. Output lags
+    // the input by the 1 s start plus ~0.1 s. Look from just after the hangover's fade to just
+    // before the next onset (input 5.0 s), and in the second pause.
+    for (from, to) in [(2.95, 5.9), (7.45, 10.4)] {
+        let pause = &run.output[(from * 48_000.0) as usize..(to * 48_000.0) as usize];
+        let nonzero = pause.iter().filter(|v| **v != 0.0).count();
+        assert_eq!(nonzero, 0, "{nonzero} non-zero samples in {from}..{to} s: refreshes were played");
+    }
+    // And the receiver kept decoding them (decoder state), it only did not play them.
+    assert!(s.packets_decoded as usize >= packets.iter().filter(|p| !p.payload.is_empty()).count() - 2);
 }

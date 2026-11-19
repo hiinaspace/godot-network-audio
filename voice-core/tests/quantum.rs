@@ -70,7 +70,7 @@ fn quantum_1024_conceals_exactly_the_scripted_losses_and_stays_continuous() {
         assert_eq!(s.plc_samples, lost * 960, "loss {pct} %: plc samples");
         assert_eq!(s.late, 0);
         let step = max_step(&lossy.audio);
-        let clean_step = max_step(&clean.audio);
+        let clean_step = max_step(interior(&clean.audio));
         assert!(step <= clean_step * 1.5, "{pct} %: step {step:.4} vs {clean_step:.4}");
     }
 }

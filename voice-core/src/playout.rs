@@ -16,6 +16,12 @@
 //! Talkspurt START/END flags are hints: an END marker lets the receiver stop concealing at
 //! once, but nothing depends on it.
 //!
+//! Where audio ends (END marker, DTX gap, the PLC cap) one concealed frame is ramped to zero
+//! instead of stepping to digital silence (`fade_samples`; the cap counts it as the last
+//! concealed frame). A run of exactly one packet followed by END or a gap is a DTX comfort-noise
+//! refresh: decoded to keep the decoder's state, played as zeros. Time lost past the cap is
+//! `lost_unconcealed_samples`.
+//!
 //! The receiver owns no clock. Every time it sees (`daemon_arrival_us`, `local_us`) is passed in
 //! by the caller; with injected times a simulation is exact (see `fixture_harness`).
 //!
@@ -117,8 +123,19 @@ pub struct PlayoutStats {
     pub plc_samples: u64,
     /// Of `output_samples`, recovered from the next packet's in-band FEC.
     pub fec_samples: u64,
-    /// Digital silence inside a talkspurt's timeline (a DTX gap or lost run past the PLC bound).
+    /// Digital silence inside a talkspurt's timeline: a DTX gap or END pause, and DTX refreshes
+    /// (decoded for the decoder's state, played as zeros). Not lost time: see
+    /// `lost_unconcealed_samples`.
     pub silence_samples: u64,
+    /// Samples of fade-out handed out where audio ended (END marker, DTX gap, PLC cap): one
+    /// concealed slot ramped to zero so the waveform never steps to digital silence. Not part of
+    /// `output_samples` or `plc_samples`.
+    pub fade_samples: u64,
+    /// Samples of media time that were lost and not concealed because the run was longer than
+    /// `plc_max_ms`: zeros inside the timeline, plus the packets missing before a talkspurt that
+    /// resumed after the receiver had gone idle on such a run (by `seq`). Separate from
+    /// `silence_samples`, which is the sender's own pauses.
+    pub lost_unconcealed_samples: u64,
     /// Zeros handed out while idle (no talkspurt).
     pub idle_samples: u64,
     pub packets_in: u64,
@@ -181,6 +198,10 @@ enum Kind {
     Normal,
     Fec,
     Plc,
+    /// One concealed frame ramped to zero where audio ended.
+    Fade,
+    /// Time lost past the PLC cap, played as zeros.
+    Lost,
     Silence,
 }
 
@@ -216,6 +237,16 @@ pub struct PlayoutReceiver {
     end_ext: Option<i64>,
     onset_wait_samples: usize,
     onset_waited: bool,
+    /// The start that was forced by waiting had one buffered packet only: if nothing follows it
+    /// that packet is a DTX refresh.
+    lone_start: bool,
+    /// The last slot put into `raw` was audible (decoded, FEC or PLC): ending it needs a fade.
+    live: bool,
+    /// Playout went idle on a loss run past the PLC cap: the packets missing before the next
+    /// talkspurt are time lost without concealment.
+    lost_idle: bool,
+    /// One slot of the old timeline to cross-fade into the first slot after a skip.
+    xfade: Option<Vec<f32>>,
     run_packets: u32,
     run_counted: bool,
     silence_run: u32,
@@ -266,6 +297,10 @@ impl PlayoutReceiver {
             end_ext: None,
             onset_wait_samples: 0,
             onset_waited: false,
+            lone_start: false,
+            live: false,
+            lost_idle: false,
+            xfade: None,
             run_packets: 0,
             run_counted: false,
             silence_run: 0,
@@ -309,6 +344,10 @@ impl PlayoutReceiver {
 
         if is_marker {
             self.stats.markers += 1;
+            // Idle with nothing to end: a marker has no talkspurt to belong to.
+            if self.state == State::Idle && !self.has_audio_buffered() {
+                return PushOutcome::Marker;
+            }
             // A marker behind the cursor describes a slot already settled.
             if self.cursor_known() && ext < self.cursor {
                 return PushOutcome::Marker;
@@ -330,6 +369,12 @@ impl PlayoutReceiver {
 
         // The estimator sees every distinct packet, late ones included: they are exactly the
         // evidence that the buffer was too shallow.
+        // Older than anything remembered: a replay or a stray, and its apparent delay says
+        // nothing about the network now. Dropped without feeding the estimator.
+        if self.cursor_known() && ext < self.cursor - RECENT_PACKETS as i64 * SLOT {
+            self.stats.late += 1;
+            return PushOutcome::Late;
+        }
         let duplicate = self.buf.contains_key(&ext) || self.recent.contains(&ext);
         let target_before = self.est.target_ms();
         if !duplicate {
@@ -389,7 +434,7 @@ impl PlayoutReceiver {
             let rest = out.len() - filled;
             out[filled..].fill(0.0);
             self.stats.idle_samples += rest as u64;
-            if self.state == State::Idle && !self.buf.is_empty() {
+            if self.state == State::Idle && self.has_audio_buffered() {
                 self.onset_wait_samples += rest;
             }
         }
@@ -417,9 +462,12 @@ impl PlayoutReceiver {
     /// skip pulling, decoding-side work and HRTF rendering for this peer until the next packet.
     /// (Pulling while idle is still valid and returns zeros.)
     pub fn is_idle(&self) -> bool {
-        self.state == State::Idle
-            && self.out_pos >= self.out.len()
-            && !self.buf.values().any(|e| !e.payload.is_empty())
+        self.state == State::Idle && self.out_pos >= self.out.len() && !self.has_audio_buffered()
+    }
+
+    /// A packet with audio (not just an END marker) is waiting in the buffer.
+    fn has_audio_buffered(&self) -> bool {
+        self.buf.values().any(|e| !e.payload.is_empty())
     }
 
     pub fn stats(&self) -> PlayoutStats {
@@ -453,6 +501,10 @@ impl PlayoutReceiver {
         self.end_ext = None;
         self.onset_wait_samples = 0;
         self.onset_waited = false;
+        self.lone_start = false;
+        self.live = false;
+        self.lost_idle = false;
+        self.xfade = None;
         self.run_packets = 0;
         self.run_counted = false;
         self.silence_run = 0;
@@ -483,8 +535,11 @@ impl PlayoutReceiver {
         ext
     }
 
-    /// The buffer delay the level control aims for, in whole slots of media between the
-    /// playout position and the end of the newest packet: `floor(target / 20 ms) + 1`.
+    /// The buffer depth the level control aims for, in slots of media from the playout position
+    /// to the end of the newest packet: `floor(target / 20 ms) + 2`. One of the two extra slots
+    /// is the slot being played (the span counts from the next sample out, not from the end of the
+    /// slot in progress); the other is because a stretch needs 1.5 slots in hand, so a buffer of
+    /// exactly `target` of waiting time could not be shortened or lengthened.
     fn target_slots(&self) -> i64 {
         (self.est.target_ms() / 20.0).floor() as i64 + 2
     }
@@ -522,6 +577,15 @@ impl PlayoutReceiver {
         // Decode far enough ahead for the block. A stretch needs 30 ms of cleanly decoded
         // audio; if the next slot isn't a real packet, no stretch.
         self.fill_raw(SLOT_SAMPLES, false);
+        if let Some(old) = self.xfade.take() {
+            if self.raw.len() >= SLOT_SAMPLES {
+                // After a skip: the old timeline's next slot fades out as the new one fades in.
+                for (i, (n, o)) in self.raw.iter_mut().zip(old.iter()).enumerate() {
+                    let w = (i as f32 + 0.5) / SLOT_SAMPLES as f32;
+                    *n = *o * (1.0 - w) + *n * w;
+                }
+            }
+        }
         let mut do_accel = false;
         let mut do_expand = false;
         if stretch.is_some() {
@@ -650,6 +714,8 @@ impl PlayoutReceiver {
                 self.stats.output_samples += n;
                 self.stats.plc_samples += n;
             }
+            Kind::Fade => self.stats.fade_samples += n,
+            Kind::Lost => self.stats.lost_unconcealed_samples += n,
             Kind::Silence => self.stats.silence_samples += n,
         }
     }
@@ -674,13 +740,16 @@ impl PlayoutReceiver {
         }
     }
 
-    /// After a lasting delay step the buffer can hold more than `max_delay_ms`; jump forward
-    /// rather than play it all.
+    /// After a lasting delay step the buffer can hold far more than the target: jump forward
+    /// rather than play it all. Level control (Accelerate, fast mode at `target + 4` slots) is
+    /// the normal way down and has to get its chance first, so the jump only fires six slots
+    /// beyond the largest target there can be (`max_delay_ms / 20 + 2`). It cross-fades from the
+    /// old timeline's next slot into the new one, so it is not a splice.
     fn skip_excess_delay(&mut self) {
         let Some(h) = self.highest_ext else { return };
         let pos = self.cursor - self.raw.len() as i64;
-        let max = self.cfg.max_delay_ms as i64 * SAMPLES_PER_MS + 2 * SLOT;
-        if h - pos <= max {
+        let limit_slots = (self.cfg.max_delay_ms / 20) as i64 + 2 + 6;
+        if h + SLOT - pos <= limit_slots * SLOT {
             return;
         }
         // Resume half way into the allowed delay, on a packet boundary.
@@ -689,17 +758,30 @@ impl PlayoutReceiver {
             return;
         };
         let to_seq = e.seq;
+        // One slot of what would have played next, to fade out under the new audio.
+        self.fill_raw(SLOT_SAMPLES, false);
+        let pos = self.cursor - self.raw.len() as i64;
+        if self.state != State::Playing {
+            return;
+        }
+        if self.raw.len() >= SLOT_SAMPLES {
+            self.xfade = Some(self.raw[..SLOT_SAMPLES].to_vec());
+        }
         self.stats.skipped_samples += (to - pos).max(0) as u64;
         let keys: Vec<i64> = self.buf.range(..to).map(|(k, _)| *k).collect();
         for k in keys {
             self.buf.remove(&k);
         }
+        // The decoder's history is of the old position: a cold start gives a clean attack where
+        // the stale state would ring.
+        let _ = self.dec.reset();
         self.raw.clear();
         self.raw_kinds.clear();
         self.cursor = to;
         self.last_end = to;
         self.last_seq = to_seq.wrapping_sub(1);
         self.conceal_run = 0;
+        self.slots_in_run = 0;
     }
 
     // ---- talkspurt start --------------------------------------------------------------------
@@ -725,6 +807,17 @@ impl PlayoutReceiver {
             return false;
         }
         self.onset_waited = n_start > 1 && self.onset_wait_samples > 0;
+        self.lone_start = span_slots == 1;
+        self.onset_wait_samples = 0;
+        if self.lost_idle {
+            // Packets missing between the last played slot and this one: time lost past the cap.
+            let dist = first_seq.wrapping_sub(self.last_seq);
+            if dist > 1 && dist < 1 << 15 {
+                self.stats.lost_unconcealed_samples += (dist as u64 - 1) * SLOT_SAMPLES as u64;
+            }
+            self.lost_idle = false;
+        }
+        self.live = false;
         // Markers older than the first packet belong to the previous talkspurt.
         let stale: Vec<i64> = self.buf.range(..first).map(|(k, _)| *k).collect();
         for k in stale {
@@ -765,6 +858,7 @@ impl PlayoutReceiver {
             Some(last) if last.1 == kind => last.0 += slot.len(),
             _ => self.raw_kinds.push_back((slot.len(), kind)),
         }
+        self.live = matches!(kind, Kind::Normal | Kind::Fec | Kind::Plc);
         self.cursor += SLOT;
         self.slots_in_run += 1;
     }
@@ -805,6 +899,11 @@ impl PlayoutReceiver {
                     self.stats.prebuffers += 1;
                 }
             }
+            // A run of one packet that nothing follows (an END marker, or a DTX gap) is the
+            // sender's comfort-noise refresh. Decoded to keep the decoder's state, but played as
+            // digital silence: an isolated 20 ms blip every 400 ms is a tick, not noise.
+            let refresh = self.run_packets == 1 && self.is_lone_packet(c, entry.seq);
+            self.lone_start = false;
             self.stats.packets_decoded += 1;
             self.recent.push_back(c);
             if self.recent.len() > RECENT_PACKETS {
@@ -815,11 +914,28 @@ impl PlayoutReceiver {
             if self.end_ext.is_some_and(|e| e <= c) {
                 self.end_ext = None;
             }
-            self.push_raw(&slot, Kind::Normal);
+            if refresh {
+                slot.fill(0.0);
+                self.push_raw(&slot, Kind::Silence);
+                self.slots_in_run = 0;
+            } else {
+                self.push_raw(&slot, Kind::Normal);
+            }
             return;
         }
 
         self.decide_missing(c);
+    }
+
+    /// Is the packet `seq` at `c`, first of its run, alone: followed by an END marker or a DTX
+    /// gap (a later packet with the next `seq`) rather than by more speech or by a loss? With
+    /// nothing later buffered it is alone only when the start was forced on this one packet.
+    fn is_lone_packet(&self, c: i64, seq: u16) -> bool {
+        match self.buf.range(c + SLOT..).next() {
+            Some((&k, e)) if k == c + SLOT => e.payload.is_empty(),
+            Some((_, e)) => e.payload.is_empty() || e.seq.wrapping_sub(seq) == 1,
+            None => self.lone_start,
+        }
     }
 
     /// Slot `c` has no packet of its own: recover it from FEC, conceal it, or let it be silent.
@@ -849,9 +965,11 @@ impl PlayoutReceiver {
             }
         }
 
-        if self.slot_is_loss(next.map(|(k, s, _)| (k, s)))
-            && self.conceal_run < self.cfg.plc_max_ms / 20
-        {
+        let is_loss = self.slot_is_loss(next.map(|(k, s, _)| (k, s)));
+        let cap = self.cfg.plc_max_ms / 20;
+        // The last concealed frame of an audible run is the fade-out: the cap counts it.
+        let last_is_fade = self.live && self.conceal_run + 1 >= cap;
+        if is_loss && self.conceal_run < cap && !last_is_fade {
             let mut slot = [0.0f32; SLOT_SAMPLES];
             if self.dec.conceal(&mut slot).is_err() {
                 self.stats.decode_errors += 1;
@@ -865,6 +983,25 @@ impl PlayoutReceiver {
             return;
         }
 
+        // Audio ends here (END marker, DTX gap, or the PLC cap): one more concealed frame,
+        // ramped to zero, instead of a step.
+        if self.live {
+            let mut slot = [0.0f32; SLOT_SAMPLES];
+            if self.dec.conceal(&mut slot).is_err() {
+                slot.fill(0.0);
+            }
+            for (i, v) in slot.iter_mut().enumerate() {
+                *v *= 1.0 - (i as f32 + 0.5) / SLOT_SAMPLES as f32;
+            }
+            self.last_end = c + SLOT;
+            if is_loss {
+                self.conceal_run += 1;
+                self.last_seq = self.last_seq.wrapping_add(1);
+            }
+            self.push_raw(&slot, Kind::Fade);
+            return;
+        }
+
         // Silence. With a later packet already buffered the timeline keeps running through the
         // gap; with none there is nothing to wait for: go idle.
         if next.is_some() {
@@ -874,11 +1011,12 @@ impl PlayoutReceiver {
             }
             self.last_end = c + SLOT;
             let slot = [0.0f32; SLOT_SAMPLES];
-            self.push_raw(&slot, Kind::Silence);
+            self.push_raw(&slot, if is_loss { Kind::Lost } else { Kind::Silence });
             // Silence is not part of a stretchable run.
             self.slots_in_run = 0;
         } else {
             self.go_idle(c);
+            self.lost_idle = is_loss;
         }
     }
 

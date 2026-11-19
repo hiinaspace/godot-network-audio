@@ -58,3 +58,25 @@ pub fn active_range(run: &Run) -> (usize, usize) {
 pub fn voiced_packets(seconds: f32, cfg: VoiceEncoderConfig) -> Vec<VoicePacket> {
     encode_stream(&voiced_signal(seconds, 0.3), cfg).unwrap()
 }
+
+/// The audible part of `x` with the last slot trimmed: first to last non-zero sample minus one
+/// slot. The lossless decode ends where the stream does, and that edge is not a "step inside
+/// the speech" (it is the end-of-stream cut), so it must not set the continuity yardstick.
+pub fn interior(x: &[f32]) -> &[f32] {
+    let first = x.iter().position(|v| *v != 0.0).unwrap_or(0);
+    let last = x.iter().rposition(|v| *v != 0.0).unwrap_or(0);
+    let end = last.saturating_sub(SLOT_SAMPLES).max(first);
+    &x[first..end]
+}
+
+/// Deterministic white noise of the given RMS level in dBFS.
+pub fn noise(n: usize, dbfs: f32, seed: u32) -> Vec<f32> {
+    let amp = 10f32.powf(dbfs / 20.0) * 3f32.sqrt(); // uniform [-a, a] has rms a / sqrt(3)
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            amp * ((x >> 8) as f32 / (1u32 << 23) as f32 - 1.0)
+        })
+        .collect()
+}

@@ -30,10 +30,12 @@ fn run_with_drops(cfg: PlayoutConfig, enc: VoiceEncoderConfig, drop: impl Fn(usi
 }
 
 
-/// Max step of the lossless decode, as the continuity yardstick.
+/// Max step of the lossless decode, as the continuity yardstick. Measured on the interior
+/// (first to last non-zero sample minus one slot): the lossless run ends with the stream, and
+/// that edge is not a step inside the speech.
 fn clean_max_step() -> (f32, Outcome) {
     let clean = run_with_drops(PlayoutConfig::default(), VoiceEncoderConfig::default(), |_| false);
-    (max_step(&clean.active), clean)
+    (max_step(interior(&clean.active)), clean)
 }
 
 #[test]
@@ -147,7 +149,7 @@ fn fec_recovers_single_losses_when_the_sender_sends_it() {
     assert_eq!(s.output_samples + s.accelerate_samples, lossy.slots as u64 * 960 + s.preemptive_samples);
     let clean = run_with_drops(cfg, enc, |_| false);
     assert!(
-        max_step(&lossy.active) <= max_step(&clean.active) * 1.5,
+        max_step(&lossy.active) <= max_step(interior(&clean.active)) * 1.5,
         "FEC recovery is discontinuous"
     );
 }
