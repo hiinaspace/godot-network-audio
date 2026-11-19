@@ -194,7 +194,7 @@ fn cmd_play(a: &[String]) -> Result<()> {
             "receiver": "new PlayoutReceiver", "opus": voice_core::opus_version(),
             "output_samples": s.output_samples, "plc_samples": s.plc_samples, "fec_samples": s.fec_samples,
             "concealed_pct": s.concealed_pct(),
-            "silence_samples": s.silence_samples, "packets_in": s.packets_in, "packets_decoded": s.packets_decoded,
+            "silence_samples": s.silence_samples, "fade_samples": s.fade_samples, "lost_unconcealed_samples": s.lost_unconcealed_samples, "skipped_samples": s.skipped_samples, "packets_in": s.packets_in, "packets_decoded": s.packets_decoded,
             "late": s.late, "accelerate_ops": s.accelerate_ops, "preemptive_ops": s.preemptive_ops,
             "accelerate_samples": s.accelerate_samples, "preemptive_samples": s.preemptive_samples,
             "talkspurts": s.talkspurts, "dtx_refreshes": s.dtx_refreshes, "prebuffers": s.prebuffers,
